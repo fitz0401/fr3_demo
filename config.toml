@@ -1,0 +1,45 @@
+# Shared settings for fr3-teleop, fr3-collect, and fr3-camera-rviz.
+# Command-line arguments can override any value for one run.
+version = 1
+
+[robot]
+server_ip = "172.16.0.20"
+control_port = 5555
+
+[gripper]
+port = 5559
+type = "robotiq"
+enabled = true
+
+[joystick]
+device = "/dev/input/js0"
+# feedback_event may be added if auto-detection is not desired, for example:
+# feedback_event = "/dev/input/event22"
+
+[cameras]
+external_serial = "047322071010"
+wrist_serial = "309622300781"
+fps = 30
+
+[recording]
+data_dir = "data/raw"
+fps = 15.0
+
+[teleop]
+linear_speed = 0.08
+angular_speed = 0.35
+stream_rate = 30.0
+watchdog_ms = 250
+max_joint_speed = 0.35
+max_joint_acceleration = 1.5
+deadzone = 0.12
+frame = "base"
+command_period = 0.12
+
+[home]
+speed = 0.20
+timeout = 15.0
+
+[workspace]
+min = [0.10, -0.60, 0.05]
+max = [0.80, 0.60, 1.00]
