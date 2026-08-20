@@ -2,9 +2,11 @@
 
 This package connects the current FR3 workstation to Physical Intelligence's
 official `pi05_droid` policy. The workstation owns the RealSense devices and
-Bamboo robot connection; `10.38.32.253` only performs GPU inference. The default
-transport is direct ZMQ because these two machines have routed application
-connectivity even though the managed SSH gateway denies forwarding to the GPU.
+Bamboo robot connection; the GPU workstation whose primary address is
+`10.38.32.253` only performs GPU inference. Its dedicated robot-LAN adapter is
+configured as `172.16.0.30/24`, alongside this workstation at `172.16.0.3/24`.
+The default transport is direct ZMQ over that un-routed link because the managed
+SSH gateway and the routed campus subnets deny forwarding to the GPU.
 The official OpenPI WebSocket transport remains selectable as a fallback.
 
 The exact request fields are:
@@ -37,6 +39,25 @@ bash fr3_pi05/remote/audit_host.sh
 Send the audit output back before installing anything. It checks
 both GPUs, active GPU processes, disk space, `uv`/Conda, candidate OpenPI trees,
 checkpoint caches, and port 8000 without changing the host.
+
+Configure the GPU workstation's dedicated adapter once. This interface must not
+have a gateway or DNS setting, so it cannot replace or disturb the primary
+campus connection:
+
+```bash
+sudo nmcli connection add \
+  type ethernet ifname enxbe3af2b6059f con-name fr3-robot-lan \
+  ipv4.method manual ipv4.addresses 172.16.0.30/24 ipv4.never-default yes \
+  ipv6.method link-local connection.autoconnect yes
+sudo nmcli connection up fr3-robot-lan
+ip -4 -brief address show dev enxbe3af2b6059f
+ping -c 3 172.16.0.3
+```
+
+If `fr3-robot-lan` already exists, do not add a duplicate; use `sudo nmcli
+connection modify fr3-robot-lan ...` with the same IPv4 values, then bring it
+up. From the robot workstation, `ping -c 3 172.16.0.30` must work before a
+policy server is started.
 
 This deployment uses two checkpoints already managed on the GPU host and never
 downloads checkpoint weights itself:
@@ -89,8 +110,8 @@ default to `$HOME/.cache/fr3_pi05`. Override `OPENPI_DATA_HOME` and
 --with pyzmq` supplies only the transport dependency without changing OpenPI's
 lock file or downloading model weights.
 
-The normal mode has this workstation connect to the GPU. If the inter-subnet
-ACL continues to reject that direction but permits GPU-to-workstation TCP, set
+The normal mode has this workstation connect directly to `172.16.0.30`. If a
+different deployment filters that direction but permits GPU-to-workstation TCP, set
 `pi05.zmq_mode = "bind"` in `config.toml` and start the GPU process with an
 outbound endpoint:
 
@@ -132,7 +153,7 @@ source /opt/ros/humble/setup.bash
 
 All transport, direction, host, port, camera, Bamboo, rate, and safety values live in the
 shared `config.toml` under `[pi05]`. The default is `transport = "zmq"`, host
-`10.38.32.253`, and checkpoint `pi05_droid`. Ports are selected automatically:
+`172.16.0.30`, and checkpoint `pi05_droid`. Ports are selected automatically:
 8000 for `pi05_droid`, 8001 for `custom_droid`. With the selected GPU ZMQ server
 ready, first run the network-only metadata check. It does not open the cameras
 or Bamboo:
