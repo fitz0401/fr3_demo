@@ -20,6 +20,8 @@ device = "/dev/input/js0"
 external_serial = "047322071010"
 wrist_serial = "309622300781"
 fps = 30
+# The wrist camera is mounted vertically inverted on this FR3.
+wrist_vertical_flip = true
 
 [recording]
 data_dir = "data/raw"

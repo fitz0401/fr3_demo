@@ -16,7 +16,7 @@ _SCHEMA: dict[str, set[str]] = {
     "robot": {"server_ip", "control_port"},
     "gripper": {"port", "type", "enabled"},
     "joystick": {"device", "feedback_event"},
-    "cameras": {"external_serial", "wrist_serial", "fps"},
+    "cameras": {"external_serial", "wrist_serial", "fps", "wrist_vertical_flip"},
     "recording": {"data_dir", "fps"},
     "teleop": {
         "linear_speed",
@@ -115,6 +115,7 @@ def teleop_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "external_camera_serial": cameras.get("external_serial"),
         "wrist_camera_serial": cameras.get("wrist_serial"),
         "camera_fps": cameras.get("fps"),
+        "wrist_vertical_flip": cameras.get("wrist_vertical_flip"),
         "data_dir": recording.get("data_dir"),
         "record_fps": recording.get("fps"),
         "linear_speed": teleop.get("linear_speed"),
@@ -142,6 +143,7 @@ def camera_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "external_camera_serial": cameras.get("external_serial"),
         "wrist_camera_serial": cameras.get("wrist_serial"),
         "camera_fps": cameras.get("fps"),
+        "wrist_vertical_flip": cameras.get("wrist_vertical_flip"),
     }
     return {key: value for key, value in mapping.items() if value is not None}
 
@@ -168,6 +170,7 @@ def pi05_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "external_camera_serial": cameras.get("external_serial"),
         "wrist_camera_serial": cameras.get("wrist_serial"),
         "camera_fps": cameras.get("fps"),
+        "wrist_vertical_flip": cameras.get("wrist_vertical_flip"),
         "workspace_min": workspace.get("min"),
         "workspace_max": workspace.get("max"),
         "policy_host": pi05.get("server_host"),

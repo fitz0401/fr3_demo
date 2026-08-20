@@ -147,6 +147,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--external-camera-serial")
     parser.add_argument("--wrist-camera-serial")
     parser.add_argument("--camera-fps", type=int, default=30)
+    parser.add_argument(
+        "--wrist-vertical-flip",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="flip wrist images top-to-bottom before RViz, recording, and policy inference",
+    )
     parser.add_argument("--joystick", default="/dev/input/js0", help="Back button is the software abort")
     parser.add_argument("--control-hz", type=float, default=15.0)
     parser.add_argument("--stream-hz", type=float, default=30.0)
@@ -364,6 +370,7 @@ def run(args: argparse.Namespace) -> int:
             args.external_camera_serial,
             args.wrist_camera_serial,
             fps=args.camera_fps,
+            wrist_vertical_flip=args.wrist_vertical_flip,
         ).start()
         print(f"Cameras ready: {cameras.serials}")
         policy = InferenceWorker(

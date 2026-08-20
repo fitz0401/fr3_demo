@@ -17,6 +17,12 @@ The exact request fields are:
 - `observation/gripper_position`: one normalized opening value;
 - `prompt`: the operator's language instruction.
 
+The installed wrist camera is vertically inverted. The shared
+`cameras.wrist_vertical_flip = true` setting flips it top-to-bottom before
+policy inference, RViz publication, and future demonstration recording. The
+exterior image is not changed. Use `--no-wrist-vertical-flip` only for a
+temporary run after physically remounting the camera.
+
 The client accepts both the official 15x8 and custom 16x8 responses, executes
 only the configured first eight actions, and interprets each row as seven joint
 velocities plus one gripper-position target. It runs at the DROID dataset rate
@@ -200,6 +206,23 @@ Only after both checks look correct, enable motion:
 
 ```bash
 fr3-pi05-run --execute --prompt "pick up the red block"
+```
+
+For a different language instruction every run, omit `--prompt`:
+
+```bash
+source /opt/ros/humble/setup.bash
+cd /home/u0161364/fr3_demo
+source .venv/bin/activate
+fr3-pi05-run --checkpoint pi05_droid --execute
+```
+
+The program first asks `Language instruction:` and then requires typing
+`EXECUTE`. For a repeatable scripted instruction, pass it explicitly:
+
+```bash
+fr3-pi05-run --checkpoint pi05_droid --execute \
+  --prompt "place the object into the container"
 ```
 
 The program requires typing `EXECUTE`. During motion, Back on the joystick,

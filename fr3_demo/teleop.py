@@ -283,6 +283,12 @@ def _create_parser() -> argparse.ArgumentParser:
         help="RealSense serial for wrist_image (or FR3_WRIST_CAMERA_SERIAL)",
     )
     parser.add_argument("--camera-fps", type=int, default=30)
+    parser.add_argument(
+        "--wrist-vertical-flip",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="flip wrist images top-to-bottom for an inverted camera mount",
+    )
     parser.add_argument("--record-fps", type=float, default=15.0, help="synchronized dataset sampling rate")
     parser.add_argument("--feedback-event", help="force-feedback event device; auto-detected by default")
     parser.add_argument("--verbose", action="store_true")
@@ -387,6 +393,7 @@ def run(args: argparse.Namespace) -> int:
                 args.external_camera_serial,
                 args.wrist_camera_serial,
                 fps=args.camera_fps,
+                wrist_vertical_flip=args.wrist_vertical_flip,
             ).start()
             collector = DemoCollector(
                 cameras,

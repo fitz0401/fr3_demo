@@ -52,6 +52,11 @@ def rviz_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--external-camera-serial")
     parser.add_argument("--wrist-camera-serial")
     parser.add_argument("--camera-fps", type=int, default=30)
+    parser.add_argument(
+        "--wrist-vertical-flip",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--no-rviz", action="store_true", help="publish topics without launching RViz")
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--config", type=Path, default=default_config_path())
@@ -82,6 +87,7 @@ def rviz_main(argv: list[str] | None = None) -> int:
         args.external_camera_serial,
         args.wrist_camera_serial,
         fps=args.camera_fps,
+        wrist_vertical_flip=args.wrist_vertical_flip,
     ).start()
     rclpy.init()
     node = Node("fr3_demo_camera_preview")

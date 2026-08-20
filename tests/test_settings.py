@@ -23,6 +23,7 @@ enabled = false
 external_serial = "external"
 wrist_serial = "wrist"
 fps = 15
+wrist_vertical_flip = true
 [workspace]
 min = [0.1, -0.2, 0.3]
 max = [0.7, 0.2, 0.9]
@@ -50,6 +51,9 @@ open_loop_horizon = 8
             self.assertEqual(cameras["external_camera_serial"], "external")
             self.assertEqual(cameras["wrist_camera_serial"], "wrist")
             self.assertEqual(cameras["camera_fps"], 15)
+            self.assertTrue(cameras["wrist_vertical_flip"])
+            self.assertTrue(teleop["wrist_vertical_flip"])
+            self.assertTrue(pi05["wrist_vertical_flip"])
             self.assertEqual(pi05["policy_host"], "gpu")
             self.assertEqual(pi05["transport"], "zmq")
             self.assertEqual(pi05["checkpoint"], "custom_droid")
