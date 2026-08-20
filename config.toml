@@ -19,7 +19,11 @@ device = "/dev/input/js0"
 [cameras]
 external_serial = "047322071010"
 wrist_serial = "309622300781"
-fps = 30
+# DROID release images are 16:9 at 15 Hz. These modes also expose the cameras'
+# wider horizontal color FOV instead of the cropped 640x480 modes.
+width = 1280
+height = 720
+fps = 15
 # The wrist camera is mounted vertically inverted on this FR3.
 wrist_vertical_flip = true
 

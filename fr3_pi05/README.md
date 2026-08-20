@@ -23,6 +23,14 @@ policy inference, RViz publication, and future demonstration recording. The
 exterior image is not changed. Use `--no-wrist-vertical-flip` only for a
 temporary run after physically remounting the camera.
 
+Both RealSense color streams use 1280x720 at 15 Hz. This matches the DROID RLDS
+16:9 aspect ratio and collection rate before OpenPI's official 224x224 padded
+resize. In the cameras' calibrated modes, switching from 640x480 to 1280x720
+widens the D456 wrist color view from about 79.3° to 89.7° horizontally and the
+D435I exterior view from about 55.6° to 70.2°. The wrist view is therefore close
+to the wide ZED Mini geometry used by DROID, although the RealSense setup is not
+an exact replacement for DROID's stereo hardware.
+
 The client accepts both the official 15x8 and custom 16x8 responses, executes
 only the configured first eight actions, and interprets each row as seven joint
 velocities plus one gripper-position target. It runs at the DROID dataset rate

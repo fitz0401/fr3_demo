@@ -13,6 +13,14 @@ from fr3_demo.cameras import RealSensePair, discover_realsense
 from fr3_demo.settings import camera_defaults, default_config_path, load_config
 
 
+def _rviz_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for key in tuple(environment):
+        if key.startswith(("SNAP", "GTK_", "GIO_")) or key == "LD_PRELOAD":
+            environment.pop(key, None)
+    return environment
+
+
 def list_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="List connected Intel RealSense cameras.")
     parser.parse_args(argv)
@@ -52,6 +60,8 @@ def rviz_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--external-camera-serial")
     parser.add_argument("--wrist-camera-serial")
     parser.add_argument("--camera-fps", type=int, default=30)
+    parser.add_argument("--camera-width", type=int, default=640)
+    parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument(
         "--wrist-vertical-flip",
         action=argparse.BooleanOptionalAction,
@@ -86,6 +96,8 @@ def rviz_main(argv: list[str] | None = None) -> int:
     cameras = RealSensePair(
         args.external_camera_serial,
         args.wrist_camera_serial,
+        width=args.camera_width,
+        height=args.camera_height,
         fps=args.camera_fps,
         wrist_vertical_flip=args.wrist_vertical_flip,
     ).start()
@@ -104,23 +116,29 @@ def rviz_main(argv: list[str] | None = None) -> int:
     if not args.no_rviz:
         config = resources.files("fr3_demo").joinpath("config/cameras.rviz")
         with resources.as_file(config) as config_path:
-            rviz_process = subprocess.Popen(["rviz2", "-d", str(config_path)])
+            rviz_process = subprocess.Popen(
+                ["rviz2", "-d", str(config_path)],
+                env=_rviz_environment(),
+            )
 
-    print("Publishing /fr3_demo/exterior_image_left and /fr3_demo/wrist_image. Press Ctrl+C to stop.")
+    print(
+        f"Publishing {args.camera_width}x{args.camera_height}@{args.camera_fps} Hz camera views; "
+        f"wrist_vertical_flip={args.wrist_vertical_flip}. Press Ctrl+C to stop."
+    )
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
-        cameras.close()
         if rviz_process is not None:
             rviz_process.terminate()
             try:
                 rviz_process.wait(timeout=3.0)
             except subprocess.TimeoutExpired:
                 rviz_process.kill()
+        node.destroy_node()
+        rclpy.shutdown()
+        cameras.close()
     return 0
 
 

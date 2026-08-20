@@ -6,6 +6,7 @@ import numpy as np
 from fr3_demo.kinematics import JOINT_UPPER, WorkspaceBounds
 from fr3_pi05.policy import (
     SafetyViolation,
+    _resize,
     build_droid_observation,
     predict_joint_path,
     safe_joint_velocity,
@@ -40,6 +41,16 @@ class Pi05PolicyTest(unittest.TestCase):
         actions = validate_action_chunk(response, minimum_horizon=8)
         self.assertEqual(actions.shape, (15, 8))
         self.assertTrue(np.all(actions == 1.0))
+
+    def test_droid_aspect_is_padded_without_stretching(self) -> None:
+        image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+        resized = _resize(image)
+
+        self.assertEqual(resized.shape, (224, 224, 3))
+        active_rows = np.flatnonzero(np.any(resized, axis=(1, 2)))
+        self.assertEqual(len(active_rows), 126)
+        self.assertEqual(active_rows[0], 49)
+        self.assertEqual(active_rows[-1], 174)
 
     def test_malformed_action_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, r"\[N, 8\]"):

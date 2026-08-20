@@ -147,6 +147,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--external-camera-serial")
     parser.add_argument("--wrist-camera-serial")
     parser.add_argument("--camera-fps", type=int, default=30)
+    parser.add_argument("--camera-width", type=int, default=640)
+    parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument(
         "--wrist-vertical-flip",
         action=argparse.BooleanOptionalAction,
@@ -211,6 +213,8 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         parser.error("prefetch-actions must be in [0, open-loop-horizon)")
     if args.max_steps < 1:
         parser.error("max-steps must be positive")
+    if args.camera_width < 1 or args.camera_height < 1 or args.camera_fps < 1:
+        parser.error("camera width, height, and fps must be positive")
     if args.transport != "zmq" and args.zmq_mode != "connect":
         parser.error("--zmq-mode bind is only valid with --transport zmq")
     return args
@@ -364,10 +368,16 @@ def run(args: argparse.Namespace) -> int:
         cameras = RealSensePair(
             args.external_camera_serial,
             args.wrist_camera_serial,
+            width=args.camera_width,
+            height=args.camera_height,
             fps=args.camera_fps,
             wrist_vertical_flip=args.wrist_vertical_flip,
         ).start()
-        print(f"Cameras ready: {cameras.serials}")
+        print(
+            f"Cameras ready: {cameras.serials}; "
+            f"{args.camera_width}x{args.camera_height}@{args.camera_fps} Hz; "
+            f"wrist_vertical_flip={args.wrist_vertical_flip}"
+        )
         policy = InferenceWorker(
             policy_host,
             args.policy_port,

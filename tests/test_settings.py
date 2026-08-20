@@ -22,6 +22,8 @@ enabled = false
 [cameras]
 external_serial = "external"
 wrist_serial = "wrist"
+width = 1280
+height = 720
 fps = 15
 wrist_vertical_flip = true
 [workspace]
@@ -51,6 +53,8 @@ open_loop_horizon = 8
             self.assertEqual(cameras["external_camera_serial"], "external")
             self.assertEqual(cameras["wrist_camera_serial"], "wrist")
             self.assertEqual(cameras["camera_fps"], 15)
+            self.assertEqual(cameras["camera_width"], 1280)
+            self.assertEqual(cameras["camera_height"], 720)
             self.assertTrue(cameras["wrist_vertical_flip"])
             self.assertTrue(teleop["wrist_vertical_flip"])
             self.assertTrue(pi05["wrist_vertical_flip"])

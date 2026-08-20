@@ -283,6 +283,8 @@ def _create_parser() -> argparse.ArgumentParser:
         help="RealSense serial for wrist_image (or FR3_WRIST_CAMERA_SERIAL)",
     )
     parser.add_argument("--camera-fps", type=int, default=30)
+    parser.add_argument("--camera-width", type=int, default=640)
+    parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument(
         "--wrist-vertical-flip",
         action=argparse.BooleanOptionalAction,
@@ -308,6 +310,8 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         "max_joint_speed",
         "max_joint_acceleration",
         "camera_fps",
+        "camera_width",
+        "camera_height",
         "record_fps",
     ):
         if getattr(args, name) <= 0:
@@ -392,6 +396,8 @@ def run(args: argparse.Namespace) -> int:
             cameras = RealSensePair(
                 args.external_camera_serial,
                 args.wrist_camera_serial,
+                width=args.camera_width,
+                height=args.camera_height,
                 fps=args.camera_fps,
                 wrist_vertical_flip=args.wrist_vertical_flip,
             ).start()
