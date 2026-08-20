@@ -29,6 +29,9 @@ wrist_vertical_flip = true
 [workspace]
 min = [0.1, -0.2, 0.3]
 max = [0.7, 0.2, 0.9]
+[home]
+speed = 0.18
+timeout = 20.0
 [pi05]
 transport = "zmq"
 checkpoint = "custom_droid"
@@ -58,6 +61,8 @@ open_loop_horizon = 8
             self.assertTrue(cameras["wrist_vertical_flip"])
             self.assertTrue(teleop["wrist_vertical_flip"])
             self.assertTrue(pi05["wrist_vertical_flip"])
+            self.assertEqual(pi05["home_speed"], 0.18)
+            self.assertEqual(pi05["home_timeout"], 20.0)
             self.assertEqual(pi05["policy_host"], "gpu")
             self.assertEqual(pi05["transport"], "zmq")
             self.assertEqual(pi05["checkpoint"], "custom_droid")

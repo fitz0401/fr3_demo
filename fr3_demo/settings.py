@@ -159,6 +159,7 @@ def pi05_defaults(config: dict[str, Any]) -> dict[str, Any]:
     gripper = config.get("gripper", {})
     joystick = config.get("joystick", {})
     cameras = config.get("cameras", {})
+    home = config.get("home", {})
     workspace = config.get("workspace", {})
     pi05 = config.get("pi05", {})
     checkpoint = pi05.get("checkpoint")
@@ -177,6 +178,8 @@ def pi05_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "camera_width": cameras.get("width"),
         "camera_height": cameras.get("height"),
         "wrist_vertical_flip": cameras.get("wrist_vertical_flip"),
+        "home_speed": home.get("speed"),
+        "home_timeout": home.get("timeout"),
         "workspace_min": workspace.get("min"),
         "workspace_max": workspace.get("max"),
         "policy_host": pi05.get("server_host"),

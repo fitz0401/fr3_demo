@@ -20,7 +20,7 @@ from fr3_demo.cameras import RealSensePair
 from fr3_demo.joystick import LinuxJoystick
 from fr3_demo.kinematics import WorkspaceBounds, forward_kinematics
 from fr3_demo.settings import default_config_path, load_config, pi05_defaults
-from fr3_demo.teleop import BambooRobot, Mapping
+from fr3_demo.teleop import HOME_JOINTS, BambooRobot, Mapping, stream_home
 from fr3_pi05.policy import (
     InferenceResult,
     InferenceWorker,
@@ -162,6 +162,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefetch-actions", type=int, default=4)
     parser.add_argument("--max-joint-speed", type=float, default=0.20)
     parser.add_argument("--max-joint-acceleration", type=float, default=1.0)
+    parser.add_argument("--home-speed", type=float, default=0.20)
+    parser.add_argument("--home-timeout", type=float, default=15.0)
+    parser.add_argument(
+        "--home",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="home before a rollout; use --no-home only when the robot is already deliberately positioned",
+    )
     parser.add_argument("--joint-margin", type=float, default=0.10)
     parser.add_argument("--watchdog-ms", type=int, default=250)
     parser.add_argument("--max-camera-age", type=float, default=0.25)
@@ -215,6 +223,8 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         parser.error("max-steps must be positive")
     if args.camera_width < 1 or args.camera_height < 1 or args.camera_fps < 1:
         parser.error("camera width, height, and fps must be positive")
+    if args.home_speed <= 0 or args.home_timeout <= 0:
+        parser.error("home speed and timeout must be positive")
     if args.transport != "zmq" and args.zmq_mode != "connect":
         parser.error("--zmq-mode bind is only valid with --transport zmq")
     return args
@@ -299,6 +309,26 @@ def _announce_execution(args: argparse.Namespace) -> None:
     print("Clear the workspace, keep a hand on the physical E-stop, and use Back to abort.")
 
 
+def _home_robot(robot: BambooRobot, args: argparse.Namespace, stopped: threading.Event) -> np.ndarray:
+    speed = min(args.home_speed, args.max_joint_speed)
+    print("\nAUTOMATIC HOMING WILL MOVE THE FR3.")
+    print(f"Homing to q={np.array2string(HOME_JOINTS, precision=3)} at up to {speed:.2f} rad/s...")
+    robot.start_stream(args.watchdog_ms, args.max_joint_speed, args.max_joint_acceleration)
+    try:
+        result = stream_home(
+            robot,
+            HOME_JOINTS,
+            speed,
+            args.home_timeout,
+            args.stream_hz,
+            stop_requested=stopped.is_set,
+        )
+    finally:
+        robot.stop_stream()
+    print(f"Homing complete: q={np.array2string(result, precision=3)}")
+    return result
+
+
 def run(args: argparse.Namespace) -> int:
     if args.offline:
         return _offline_check(args)
@@ -360,8 +390,11 @@ def run(args: argparse.Namespace) -> int:
         )
         state, q = _state(robot)
         print(f"Bamboo: q={np.array2string(q, precision=3)}; dq_norm={np.linalg.norm(state['dq']):.4f}")
-        if not robot.supports_streaming() and args.execute:
+        if not robot.supports_streaming() and (args.execute or (args.home and not args.check)):
             raise RuntimeError("The Bamboo controller does not support streaming execution")
+
+        if args.home and not args.check:
+            _home_robot(robot, args, stopped)
 
         gripper = GripperWorker(robot, not args.no_gripper)
         gripper.wait_ready()
