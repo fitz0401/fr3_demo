@@ -174,10 +174,10 @@ class RealSensePair:
             raise
         return self
 
-    def snapshot(self) -> dict[str, CameraFrame]:
+    def snapshot(self, max_age: float = 0.25) -> dict[str, CameraFrame]:
         return {
-            "exterior_image_left": self.exterior.snapshot(),
-            "wrist_image": self.wrist.snapshot(),
+            "exterior_image_left": self.exterior.snapshot(max_age),
+            "wrist_image": self.wrist.snapshot(max_age),
         }
 
     def close(self) -> None:

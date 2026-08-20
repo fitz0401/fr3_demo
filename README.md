@@ -14,6 +14,11 @@ box, joint limits, and velocity/acceleration caps.
 Controller and transport implementations live in Bamboo; this repository only
 contains the workstation-side teleoperation and demo-collection code.
 
+The repository also contains the guarded two-camera FR3 client and GPU-host
+launcher for the official OpenPI `pi05_droid` checkpoint. See
+[`fr3_pi05/README.md`](fr3_pi05/README.md) for server deployment, non-moving
+end-to-end checks, RViz trajectory visualization, and policy execution.
+
 ## Safety
 
 - Clear the workspace, inspect wrist-camera cabling, and keep the physical E-stop

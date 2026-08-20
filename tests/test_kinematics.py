@@ -8,6 +8,7 @@ from fr3_demo.kinematics import (
     WorkspaceBounds,
     forward_kinematics,
     geometric_jacobian,
+    link_positions,
     resolved_rate_step,
 )
 
@@ -57,6 +58,12 @@ class KinematicsTest(unittest.TestCase):
         tiny = WorkspaceBounds(tuple(pose[:3, 3] - 1e-6), tuple(pose[:3, 3] + 1e-6))
         with self.assertRaisesRegex(ValueError, "workspace"):
             resolved_rate_step(self.Q, np.array([0.1, 0, 0, 0, 0, 0]), 0.2, workspace=tiny)
+
+    def test_link_positions_include_base_and_eef(self) -> None:
+        positions = link_positions(self.Q)
+        self.assertEqual(positions.shape, (9, 3))
+        np.testing.assert_array_equal(positions[0], np.zeros(3))
+        np.testing.assert_allclose(positions[-1], forward_kinematics(self.Q)[:3, 3])
 
 
 if __name__ == "__main__":

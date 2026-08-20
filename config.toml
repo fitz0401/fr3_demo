@@ -43,3 +43,21 @@ timeout = 15.0
 [workspace]
 min = [0.10, -0.60, 0.05]
 max = [0.80, 0.60, 1.00]
+
+# Physical Intelligence pi0.5 DROID inference and guarded execution.
+[pi05]
+server_host = "10.38.32.253"
+server_port = 8000
+control_hz = 15.0
+stream_hz = 30.0
+open_loop_horizon = 8
+prefetch_actions = 4
+# Begin conservatively. DROID actions are joint velocities in rad/s.
+max_joint_speed = 0.20
+max_joint_acceleration = 1.0
+joint_margin = 0.10
+watchdog_ms = 250
+max_camera_age = 0.25
+max_inference_age = 3.0
+max_rollout_steps = 600
+rviz = true

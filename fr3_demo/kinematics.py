@@ -97,6 +97,13 @@ def forward_kinematics(q: FloatArray) -> FloatArray:
     return _chain(q)[0]
 
 
+def link_positions(q: FloatArray) -> FloatArray:
+    """Return base, seven joint origins, and EEF positions for visualization."""
+
+    end_pose, origins, _ = _chain(q)
+    return np.vstack([np.zeros(3), *origins, end_pose[:3, 3]])
+
+
 def geometric_jacobian(q: FloatArray) -> FloatArray:
     """Return the 6x7 geometric Jacobian in the robot base frame."""
 

@@ -24,6 +24,12 @@ convert = [
     "lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
     "Pillow>=10",
 ]
+pi05 = [
+    "msgpack>=1.0.5",
+    "Pillow>=10",
+    "pyrealsense2==2.55.1.6486",
+    "websockets>=14",
+]
 dev = [
     "pytest>=7",
     "ruff>=0.6",
@@ -36,12 +42,15 @@ fr3-camera-list = "fr3_demo.camera_rviz:list_main"
 fr3-camera-rviz = "fr3_demo.camera_rviz:rviz_main"
 fr3-annotate = "fr3_demo.annotate:main"
 fr3-convert = "fr3_demo.convert_lerobot:main"
+fr3-pi05-check = "fr3_pi05.runner:check_main"
+fr3-pi05-run = "fr3_pi05.runner:main"
 
 [tool.setuptools.packages.find]
-include = ["fr3_demo*"]
+include = ["fr3_demo*", "fr3_pi05*"]
 
 [tool.setuptools.package-data]
 fr3_demo = ["config/*.rviz"]
+fr3_pi05 = ["config/*.rviz", "remote/*.sh"]
 
 [tool.ruff]
 line-length = 120

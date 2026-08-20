@@ -1,0 +1,59 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Enabled: true
+      Name: Ground Grid
+      Plane: XY
+      Cell Size: 0.1
+      Color: 110; 110; 110
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: FR3 and pi0.5 trajectory
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /fr3_pi05/markers
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: Exterior Image Left
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /fr3_pi05/exterior_image_left
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: Wrist Image
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /fr3_pi05/wrist_image
+  Enabled: true
+  Global Options:
+    Background Color: 35; 35; 35
+    Fixed Frame: fr3_link0
+  Name: root
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 1.7
+      Focal Point:
+        X: 0.35
+        Y: 0.0
+        Z: 0.4
+      Pitch: 0.45
+      Yaw: 0.85
+Window Geometry:
+  Height: 950
+  Width: 1500
