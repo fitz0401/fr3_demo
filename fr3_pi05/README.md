@@ -217,19 +217,21 @@ source .venv/bin/activate
 fr3-pi05-run --checkpoint pi05_droid --execute
 ```
 
-The program first asks `Language instruction:` and then requires typing
-`EXECUTE`. For a repeatable scripted instruction, pass it explicitly:
+The program first asks `Language instruction:` and then arms automatically once
+the initial inference and safety preview pass. For a repeatable scripted
+instruction, pass it explicitly:
 
 ```bash
 fr3-pi05-run --checkpoint pi05_droid --execute \
   --prompt "place the object into the container"
 ```
 
-The program requires typing `EXECUTE`. During motion, Back on the joystick,
-Ctrl+C, a stale camera/chunk, invalid action, workspace violation, joint-margin
-violation, gripper failure, or joystick disconnect stops the arm command. The
-Bamboo watchdog remains the final software brake. Keep the physical E-stop in
-hand; this client does not provide scene or self-collision checking.
+There is no second typed confirmation: `--execute` is the explicit motion gate.
+During motion, Back on the joystick, Ctrl+C, a stale camera/chunk, invalid
+action, workspace violation, joint-margin violation, gripper failure, or
+joystick disconnect stops the arm command. The Bamboo watchdog remains the
+final software brake. Keep the physical E-stop in hand; this client does not
+provide scene or self-collision checking.
 
 ## RViz topics
 

@@ -173,7 +173,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--server-only", action="store_true", help="check policy transport/metadata without robot or cameras")
     parser.add_argument("--offline", action="store_true", help="validate configuration and math without hardware/network")
     parser.add_argument("--execute", action="store_true", help="allow policy actions to reach Bamboo")
-    parser.add_argument("--yes", action="store_true", help="skip the typed EXECUTE confirmation (for supervised scripts)")
     return parser
 
 
@@ -289,15 +288,11 @@ def _wait_result(worker: InferenceWorker, timeout: float = 60.0) -> InferenceRes
     raise RuntimeError(f"Timed out after {timeout:.0f}s waiting for pi0.5 inference")
 
 
-def _confirm_execution(args: argparse.Namespace) -> None:
-    if not args.execute or args.yes:
+def _announce_execution(args: argparse.Namespace) -> None:
+    if not args.execute:
         return
-    if not sys.stdin.isatty():
-        raise RuntimeError("Refusing non-interactive execution without --yes")
     print("\nPOLICY EXECUTION WILL MOVE THE FR3.")
     print("Clear the workspace, keep a hand on the physical E-stop, and use Back to abort.")
-    if input("Type EXECUTE to arm Bamboo streaming: ").strip() != "EXECUTE":
-        raise RuntimeError("Execution cancelled")
 
 
 def run(args: argparse.Namespace) -> int:
@@ -431,7 +426,7 @@ def run(args: argparse.Namespace) -> int:
             print("CHECK PASSED. Bamboo streaming was not started; the robot did not move.")
             return 0
 
-        _confirm_execution(args)
+        _announce_execution(args)
         if args.execute:
             joystick = LinuxJoystick(args.joystick).open()
             snapshot = joystick.snapshot()
