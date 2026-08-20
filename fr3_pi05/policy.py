@@ -156,10 +156,15 @@ class InferenceResult:
 class InferenceWorker:
     """Serialize blocking websocket inference away from the control loop."""
 
-    def __init__(self, host: str, port: int, horizon: int) -> None:
-        from fr3_pi05.protocol import OpenPiWebsocketClient
+    def __init__(self, host: str, port: int, horizon: int, transport: str = "zmq") -> None:
+        from fr3_pi05.protocol import OpenPiWebsocketClient, OpenPiZmqClient
 
-        self._policy = OpenPiWebsocketClient(host, port)
+        if transport == "zmq":
+            self._policy = OpenPiZmqClient(host, port)
+        elif transport == "websocket":
+            self._policy = OpenPiWebsocketClient(host, port)
+        else:
+            raise ValueError(f"Unsupported policy transport: {transport}")
         self._horizon = horizon
         self._requests: queue.Queue[tuple[dict[str, Any], float] | None] = queue.Queue(maxsize=1)
         self._results: queue.Queue[InferenceResult | Exception] = queue.Queue(maxsize=1)

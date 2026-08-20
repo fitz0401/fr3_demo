@@ -79,3 +79,47 @@ class OpenPiWebsocketClient:
 
     def close(self) -> None:
         self._connection.close()
+
+
+class OpenPiZmqClient:
+    """Request/reply client for the direct FR3 pi0.5 ZMQ server wrapper."""
+
+    def __init__(self, host: str, port: int, timeout_ms: int = 60_000) -> None:
+        try:
+            import zmq
+        except ImportError as error:
+            raise RuntimeError("pi0.5 ZMQ support is missing; run: pip install -e '.[pi05]'") from error
+        self._zmq = zmq
+        self._socket = zmq.Context.instance().socket(zmq.REQ)
+        self._socket.setsockopt(zmq.LINGER, 0)
+        self._socket.setsockopt(zmq.SNDTIMEO, 5_000)
+        self._socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        self._socket.connect(f"tcp://{host}:{port}")
+        response = self._request({"operation": "metadata"})
+        metadata = response.get("metadata")
+        if not isinstance(metadata, dict):
+            raise OpenPiProtocolError("ZMQ server returned invalid policy metadata")
+        self.metadata: dict[str, Any] = metadata
+
+    def _request(self, request: dict[str, Any]) -> dict[str, Any]:
+        try:
+            self._socket.send(packb(request))
+            payload = self._socket.recv()
+        except self._zmq.Again as error:
+            raise TimeoutError("Timed out communicating with the pi0.5 ZMQ server") from error
+        response = unpackb(payload)
+        if not isinstance(response, dict):
+            raise OpenPiProtocolError(f"ZMQ server returned {type(response).__name__}, expected a dictionary")
+        if not response.get("success", False):
+            raise OpenPiProtocolError(str(response.get("error", "Unknown pi0.5 ZMQ server error")))
+        return response
+
+    def infer(self, observation: dict[str, Any]) -> dict[str, Any]:
+        response = self._request({"operation": "infer", "observation": observation})
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise OpenPiProtocolError("ZMQ server returned an invalid inference result")
+        return result
+
+    def close(self) -> None:
+        self._socket.close(linger=0)

@@ -46,6 +46,7 @@ max = [0.80, 0.60, 1.00]
 
 # Physical Intelligence pi0.5 DROID inference and guarded execution.
 [pi05]
+transport = "zmq"
 server_host = "10.38.32.253"
 server_port = 8000
 control_hz = 15.0

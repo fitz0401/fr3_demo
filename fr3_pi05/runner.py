@@ -128,6 +128,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config", type=Path, default=default_config_path())
     parser.add_argument("--prompt", help="language instruction; prompted interactively when omitted")
+    parser.add_argument("--transport", choices=("zmq", "websocket"), default="zmq")
     parser.add_argument("--policy-host", default="10.38.32.253")
     parser.add_argument("--policy-port", type=int, default=8000)
     parser.add_argument("--server-ip", default="172.16.0.20", help="Bamboo controller host")
@@ -155,6 +156,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-rviz", action="store_true", help="do not publish ROS topics or launch RViz")
     parser.add_argument("--rviz-publish-only", action="store_true", help="publish ROS topics without launching RViz")
     parser.add_argument("--check", action="store_true", help="perform one inference and safety preview; never move")
+    parser.add_argument("--server-only", action="store_true", help="check policy transport/metadata without robot or cameras")
     parser.add_argument("--offline", action="store_true", help="validate configuration and math without hardware/network")
     parser.add_argument("--execute", action="store_true", help="allow policy actions to reach Bamboo")
     parser.add_argument("--yes", action="store_true", help="skip the typed EXECUTE confirmation (for supervised scripts)")
@@ -274,6 +276,26 @@ def _confirm_execution(args: argparse.Namespace) -> None:
 def run(args: argparse.Namespace) -> int:
     if args.offline:
         return _offline_check(args)
+    if args.server_only:
+        _check_port(args.policy_host, args.policy_port)
+        if args.transport == "zmq":
+            from fr3_pi05.protocol import OpenPiZmqClient
+
+            client = OpenPiZmqClient(args.policy_host, args.policy_port)
+        else:
+            from fr3_pi05.protocol import OpenPiWebsocketClient
+
+            client = OpenPiWebsocketClient(args.policy_host, args.policy_port)
+        try:
+            keys = ", ".join(sorted(client.metadata)) or "none"
+            print(
+                f"pi0.5 {args.transport} server ready at {args.policy_host}:{args.policy_port}; "
+                f"metadata keys: {keys}"
+            )
+        finally:
+            client.close()
+        print("No Bamboo or camera connection was opened; the robot did not move.")
+        return 0
     prompt = args.prompt or input("Language instruction: ").strip()
     if not prompt:
         raise RuntimeError("Language instruction cannot be empty")
@@ -315,8 +337,8 @@ def run(args: argparse.Namespace) -> int:
             fps=args.camera_fps,
         ).start()
         print(f"Cameras ready: {cameras.serials}")
-        policy = InferenceWorker(args.policy_host, args.policy_port, args.open_loop_horizon)
-        print(f"pi0.5 server connected at {args.policy_host}:{args.policy_port}")
+        policy = InferenceWorker(args.policy_host, args.policy_port, args.open_loop_horizon, args.transport)
+        print(f"pi0.5 {args.transport} server connected at {args.policy_host}:{args.policy_port}")
         if policy.metadata:
             print(f"Server metadata keys: {', '.join(sorted(policy.metadata))}")
         if not args.no_rviz:

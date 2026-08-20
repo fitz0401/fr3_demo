@@ -27,6 +27,7 @@ fps = 15
 min = [0.1, -0.2, 0.3]
 max = [0.7, 0.2, 0.9]
 [pi05]
+transport = "zmq"
 server_host = "gpu"
 server_port = 8001
 open_loop_horizon = 8
@@ -46,6 +47,7 @@ open_loop_horizon = 8
             self.assertEqual(cameras["wrist_camera_serial"], "wrist")
             self.assertEqual(cameras["camera_fps"], 15)
             self.assertEqual(pi05["policy_host"], "gpu")
+            self.assertEqual(pi05["transport"], "zmq")
             self.assertEqual(pi05["policy_port"], 8001)
             self.assertEqual(pi05["open_loop_horizon"], 8)
 

@@ -2,8 +2,10 @@
 
 This package connects the current FR3 workstation to Physical Intelligence's
 official `pi05_droid` policy. The workstation owns the RealSense devices and
-Bamboo robot connection; `10.38.32.253` only performs GPU inference over the
-OpenPI WebSocket protocol.
+Bamboo robot connection; `10.38.32.253` only performs GPU inference. The default
+transport is direct ZMQ because these two machines have routed application
+connectivity even though the managed SSH gateway denies forwarding to the GPU.
+The official OpenPI WebSocket transport remains selectable as a fallback.
 
 The exact request fields are:
 
@@ -18,72 +20,52 @@ configured first eight actions, and interprets each row as seven joint
 velocities plus one gripper-position target. It runs at the DROID dataset rate
 of 15 Hz and prefetches the next chunk while the current chunk is executing.
 
-## 1. GPU server
+## 1. GPU server from its local console
 
-SSH currently routes through `jump-l.icts.kuleuven.be`. This managed KU Leuven
-jump host does not accept a permanently registered personal public key: it
-requires a short-lived MFA SSH certificate. The `kmk` tool is already installed
-and configured for `u0161364` on this workstation. Activate and verify a
-certificate with:
-
-```bash
-kmk renew
-kmk check
-ssh-add -l
-ssh 10.38.32.253
-```
-
-`kmk renew` opens the KU Leuven MFA flow. Certificates are temporary, so renew
-again when `kmk check` reports that the certificate expired. If authentication
-then succeeds on `jump-l` but fails specifically on `10.38.32.253`, the GPU host
-itself must either trust KU Leuven SSH certificates or have the workstation's
-public key added to `~/.ssh/authorized_keys`; a plain key is never installed on
-the managed jump host.
-
-After access works, copy and run the read-only inventory:
+The KU Leuven certificate authenticates successfully on `jump-l`, but the
+gateway policy currently denies forwarding to `10.38.32.253`. SSH is therefore
+not needed for inference itself. From a terminal physically on the GPU machine,
+put the repository under the requested `fr3_pi05` directory:
 
 ```bash
-scp fr3_pi05/remote/audit_host.sh 10.38.32.253:/tmp/fr3_pi05_audit.sh
-ssh 10.38.32.253 'bash /tmp/fr3_pi05_audit.sh'
+mkdir -p ~/fr3_pi05
+cd ~/fr3_pi05
+git clone https://github.com/fitz0401/fr3_demo.git
+cd fr3_demo
+bash fr3_pi05/remote/audit_host.sh
 ```
 
-Do not start a download or installation until that output confirms whether an
-OpenPI checkout and `pi05_droid` cache already exist. With an existing checkout,
-copy the launcher and choose the idle A6000 index reported by `nvidia-smi`:
+Send the audit output back before installing or downloading anything. It checks
+both GPUs, active GPU processes, disk space, `uv`/Conda, candidate OpenPI trees,
+checkpoint caches, and port 8000 without changing the host.
+
+When an existing OpenPI checkout and checkpoint are confirmed, choose the idle
+A6000 index reported by `nvidia-smi` and start the direct ZMQ wrapper:
 
 ```bash
 CUDA_VISIBLE_DEVICES=<A6000_INDEX> \
-  fr3_pi05/remote/start_pi05_server.sh /absolute/path/to/openpi
+  bash fr3_pi05/remote/start_pi05_zmq_server.sh \
+  /absolute/path/to/openpi \
+  "$HOME/fr3_pi05/fr3_demo"
 ```
 
-The launcher runs this official command:
+The wrapper loads the official `pi05_droid` configuration and
+`gs://openpi-assets/checkpoints/pi05_droid`, then binds a ZMQ request/reply
+server on `0.0.0.0:8000`. `uv run --with pyzmq` supplies only the small transport
+dependency without changing OpenPI's lock file. The first checkpoint load can
+be much slower if its cache is incomplete.
 
-```bash
-uv run scripts/serve_policy.py --env DROID --port 8000
-```
-
-For a persistent supervised session after a foreground smoke test succeeds:
+After a foreground smoke test succeeds, a supervised persistent session can use:
 
 ```bash
 tmux new-session -d -s pi05_droid \
-  "CUDA_VISIBLE_DEVICES=<A6000_INDEX> /path/to/start_pi05_server.sh /path/to/openpi"
+  "CUDA_VISIBLE_DEVICES=<A6000_INDEX> bash $HOME/fr3_pi05/fr3_demo/fr3_pi05/remote/start_pi05_zmq_server.sh /path/to/openpi $HOME/fr3_pi05/fr3_demo"
 tmux capture-pane -pt pi05_droid
 ```
 
-The checkpoint selected by OpenPI is
-`gs://openpi-assets/checkpoints/pi05_droid`. The first launch may populate the
-local cache and can therefore be much slower than later starts.
-
-If TCP port 8000 remains blocked from the workstation, keep this in a second
-terminal:
-
-```bash
-fr3_pi05/remote/open_inference_tunnel.sh
-```
-
-Then set `pi05.server_host = "127.0.0.1"` in `config.toml`. The client traffic
-will travel through the authenticated SSH jump instead of exposing the policy
-port to the network.
+If an approved SSH path becomes available later, the stock OpenPI WebSocket
+launcher remains at `fr3_pi05/remote/start_pi05_server.sh`; select it locally
+with `pi05.transport = "websocket"`.
 
 ## 2. Workstation
 
@@ -96,8 +78,16 @@ python -m pip install -e '.[pi05]'
 source /opt/ros/humble/setup.bash
 ```
 
-All host, port, camera, Bamboo, rate, and safety values live in the shared
-`config.toml` under `[pi05]`. First run the non-moving end-to-end check:
+All transport, host, port, camera, Bamboo, rate, and safety values live in the
+shared `config.toml` under `[pi05]`. The default is `transport = "zmq"`, host
+`10.38.32.253`, port `8000`. With the GPU ZMQ server listening, first run the
+network-only metadata check. It does not open the cameras or Bamboo:
+
+```bash
+fr3-pi05-check --server-only
+```
+
+Then run the non-moving end-to-end check:
 
 ```bash
 fr3-pi05-check --prompt "pick up the red block"

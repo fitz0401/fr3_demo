@@ -32,6 +32,7 @@ _SCHEMA: dict[str, set[str]] = {
     "home": {"speed", "timeout"},
     "workspace": {"min", "max"},
     "pi05": {
+        "transport",
         "server_host",
         "server_port",
         "control_hz",
@@ -164,6 +165,7 @@ def pi05_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "workspace_max": workspace.get("max"),
         "policy_host": pi05.get("server_host"),
         "policy_port": pi05.get("server_port"),
+        "transport": pi05.get("transport"),
         "control_hz": pi05.get("control_hz"),
         "stream_hz": pi05.get("stream_hz"),
         "open_loop_horizon": pi05.get("open_loop_horizon"),

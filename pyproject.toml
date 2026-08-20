@@ -28,6 +28,7 @@ pi05 = [
     "msgpack>=1.0.5",
     "Pillow>=10",
     "pyrealsense2==2.55.1.6486",
+    "pyzmq>=22",
     "websockets>=14",
 ]
 dev = [
@@ -50,7 +51,7 @@ include = ["fr3_demo*", "fr3_pi05*"]
 
 [tool.setuptools.package-data]
 fr3_demo = ["config/*.rviz"]
-fr3_pi05 = ["config/*.rviz", "remote/*.sh"]
+fr3_pi05 = ["config/*.rviz", "remote/*.py", "remote/*.sh"]
 
 [tool.ruff]
 line-length = 120
