@@ -66,9 +66,14 @@ esac
 cd "$OPENPI_DIR"
 export PYTHONPATH="$FR3_DEMO_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
-MODEL_ROOT=$(dirname "$CHECKPOINT")
-export OPENPI_DATA_HOME=${OPENPI_DATA_HOME:-$MODEL_ROOT/.openpi_cache}
-export UV_CACHE_DIR=${UV_CACHE_DIR:-$MODEL_ROOT/.uv_cache}
+CACHE_ROOT=${XDG_CACHE_HOME:-$HOME/.cache}/fr3_pi05
+export OPENPI_DATA_HOME=${OPENPI_DATA_HOME:-$CACHE_ROOT/openpi}
+export UV_CACHE_DIR=${UV_CACHE_DIR:-$CACHE_ROOT/uv}
+mkdir -p "$OPENPI_DATA_HOME" "$UV_CACHE_DIR"
+if [ ! -w "$OPENPI_DATA_HOME" ] || [ ! -w "$UV_CACHE_DIR" ]; then
+  echo "Runtime cache is not writable; set OPENPI_DATA_HOME and UV_CACHE_DIR to writable paths." >&2
+  exit 2
+fi
 EXTRA_ARGS=()
 if [ -n "$CONNECT_ENDPOINT" ]; then
   case "$CONNECT_ENDPOINT" in

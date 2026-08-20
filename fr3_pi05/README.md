@@ -82,11 +82,12 @@ CUDA_VISIBLE_DEVICES=1 PORT=8001 \
   custom_droid
 ```
 
-The launcher refuses a missing local checkpoint path. It also moves OpenPI and
-uv caches beside the model under `/mnt/data/yurui/models`, avoiding the system
-disk, which was already 92% full. `uv run --with pyzmq` supplies only the small
-transport dependency without changing OpenPI's lock file or downloading model
-weights.
+The launcher refuses a missing local checkpoint path. The large models remain
+read-only under `/mnt/data/yurui`; small writable OpenPI and uv runtime caches
+default to `$HOME/.cache/fr3_pi05`. Override `OPENPI_DATA_HOME` and
+`UV_CACHE_DIR` if a larger writable cache location is available. `uv run
+--with pyzmq` supplies only the transport dependency without changing OpenPI's
+lock file or downloading model weights.
 
 The normal mode has this workstation connect to the GPU. If the inter-subnet
 ACL continues to reject that direction but permits GPU-to-workstation TCP, set
