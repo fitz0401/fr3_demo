@@ -15,8 +15,8 @@ The exact request fields are:
 - `observation/gripper_position`: one normalized opening value;
 - `prompt`: the operator's language instruction.
 
-The client accepts the current 15x8 checkpoint response, executes only the
-configured first eight actions, and interprets each row as seven joint
+The client accepts both the official 15x8 and custom 16x8 responses, executes
+only the configured first eight actions, and interprets each row as seven joint
 velocities plus one gripper-position target. It runs at the DROID dataset rate
 of 15 Hz and prefetches the next chunk while the current chunk is executing.
 
@@ -43,14 +43,20 @@ downloads checkpoint weights itself:
 
 | Local selection | GPU checkpoint | ZMQ port |
 | --- | --- | --- |
-| `pi05_droid` | `/mnt/data/yurui/models/pi05_droid` | 8000 |
+| `pi05_droid` | `/mnt/data/yurui/.cache/openpi/openpi-assets/checkpoints/pi05_droid` | 8000 |
 | `custom_droid` | `/mnt/data/yurui/models/pi05_custom_droid_14999` | 8001 |
 
-The official checkpoint was not complete at the time of the first audit and
-will be populated separately. The custom checkpoint must be launched with the
-exact training configuration name defined in the deployed `fitz0401/openpi`
-fork; verify that name before starting it. Do not guess between
-`pi05_droid` and `pi05_droid_finetune`, because their action horizons differ.
+The audit confirmed both checkpoints. The custom checkpoint is loaded through
+its own `serve_custom_droid.py`, including `gemma_2b_lora_r32`, its 16-step
+horizon, and `assets/fitz0401/custom_droid/norm_stats.json`. The launcher refuses
+to substitute stock DROID normalization statistics. Its mandatory
+`deploy.patch` must already be applied to the OpenPI checkout as described in
+the checkpoint's `DEPLOY.md`.
+
+Run only one policy at a time on the A6000. Each model needs roughly the large
+majority of that GPU's memory after JAX initialization; the separate ports make
+selection unambiguous but do not imply that both models should be resident
+simultaneously. Stop the current policy cleanly before switching checkpoints.
 
 When the OpenPI checkout and checkpoint structure are confirmed, choose the idle
 A6000 index reported by `nvidia-smi`. Start the official policy on port 8000:
@@ -60,12 +66,12 @@ CUDA_VISIBLE_DEVICES=1 PORT=8000 \
   bash fr3_pi05/remote/start_pi05_zmq_server.sh \
   /absolute/path/to/openpi \
   "$HOME/fr3_demo" \
-  /mnt/data/yurui/models/pi05_droid \
+  /mnt/data/yurui/.cache/openpi/openpi-assets/checkpoints/pi05_droid \
   pi05_droid
 ```
 
-Start the custom policy on port 8001 only after replacing
-`<CUSTOM_CONFIG_NAME>` with the name found in that OpenPI fork:
+After stopping the official policy, start the custom policy on port 8001 with
+its exact supplied loader:
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 PORT=8001 \
@@ -73,19 +79,38 @@ CUDA_VISIBLE_DEVICES=1 PORT=8001 \
   /absolute/path/to/openpi \
   "$HOME/fr3_demo" \
   /mnt/data/yurui/models/pi05_custom_droid_14999 \
-  <CUSTOM_CONFIG_NAME>
+  custom_droid
 ```
 
 The launcher refuses a missing local checkpoint path. It also moves OpenPI and
 uv caches beside the model under `/mnt/data/yurui/models`, avoiding the system
 disk, which was already 92% full. `uv run --with pyzmq` supplies only the small
-transport dependency without changing OpenPI's lock file.
+transport dependency without changing OpenPI's lock file or downloading model
+weights.
+
+The normal mode has this workstation connect to the GPU. If the inter-subnet
+ACL continues to reject that direction but permits GPU-to-workstation TCP, set
+`pi05.zmq_mode = "bind"` in `config.toml` and start the GPU process with an
+outbound endpoint:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PORT=8000 CONNECT_ENDPOINT=tcp://10.34.97.197:8000 \
+  bash fr3_pi05/remote/start_pi05_zmq_server.sh \
+  /mnt/data/yurui/openpi \
+  "$HOME/fr3_demo" \
+  /mnt/data/yurui/.cache/openpi/openpi-assets/checkpoints/pi05_droid \
+  pi05_droid
+```
+
+In reverse mode the request direction is unchanged: the workstation still
+sends observations and the GPU still returns actions. Only which host initiates
+the TCP connection changes.
 
 After a foreground smoke test succeeds, a supervised persistent session can use:
 
 ```bash
 tmux new-session -d -s pi05_droid \
-  "CUDA_VISIBLE_DEVICES=1 PORT=8000 bash $HOME/fr3_demo/fr3_pi05/remote/start_pi05_zmq_server.sh /path/to/openpi $HOME/fr3_demo /mnt/data/yurui/models/pi05_droid pi05_droid"
+  "CUDA_VISIBLE_DEVICES=1 PORT=8000 bash $HOME/fr3_demo/fr3_pi05/remote/start_pi05_zmq_server.sh /mnt/data/yurui/openpi $HOME/fr3_demo /mnt/data/yurui/.cache/openpi/openpi-assets/checkpoints/pi05_droid pi05_droid"
 tmux capture-pane -pt pi05_droid
 ```
 
@@ -104,11 +129,12 @@ python -m pip install -e '.[pi05]'
 source /opt/ros/humble/setup.bash
 ```
 
-All transport, host, port, camera, Bamboo, rate, and safety values live in the
+All transport, direction, host, port, camera, Bamboo, rate, and safety values live in the
 shared `config.toml` under `[pi05]`. The default is `transport = "zmq"`, host
 `10.38.32.253`, and checkpoint `pi05_droid`. Ports are selected automatically:
-8000 for `pi05_droid`, 8001 for `custom_droid`. With the selected GPU ZMQ server listening, first run the
-network-only metadata check. It does not open the cameras or Bamboo:
+8000 for `pi05_droid`, 8001 for `custom_droid`. With the selected GPU ZMQ server
+ready, first run the network-only metadata check. It does not open the cameras
+or Bamboo:
 
 ```bash
 fr3-pi05-check --server-only

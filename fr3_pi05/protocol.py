@@ -84,7 +84,14 @@ class OpenPiWebsocketClient:
 class OpenPiZmqClient:
     """Request/reply client for the direct FR3 pi0.5 ZMQ server wrapper."""
 
-    def __init__(self, host: str, port: int, timeout_ms: int = 60_000) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        timeout_ms: int = 60_000,
+        *,
+        connection_mode: str = "connect",
+    ) -> None:
         try:
             import zmq
         except ImportError as error:
@@ -94,7 +101,14 @@ class OpenPiZmqClient:
         self._socket.setsockopt(zmq.LINGER, 0)
         self._socket.setsockopt(zmq.SNDTIMEO, 5_000)
         self._socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
-        self._socket.connect(f"tcp://{host}:{port}")
+        endpoint = f"tcp://{host}:{port}"
+        if connection_mode == "connect":
+            self._socket.connect(endpoint)
+        elif connection_mode == "bind":
+            self._socket.bind(endpoint)
+        else:
+            self._socket.close(linger=0)
+            raise ValueError(f"Unsupported ZMQ connection mode: {connection_mode}")
         response = self._request({"operation": "metadata"})
         metadata = response.get("metadata")
         if not isinstance(metadata, dict):

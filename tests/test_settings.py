@@ -32,6 +32,8 @@ checkpoint = "custom_droid"
 server_host = "gpu"
 server_port = 8001
 server_ports = { pi05_droid = 8000, custom_droid = 8001 }
+zmq_mode = "bind"
+zmq_bind_host = "0.0.0.0"
 open_loop_horizon = 8
 """,
                 encoding="utf-8",
@@ -52,6 +54,8 @@ open_loop_horizon = 8
             self.assertEqual(pi05["transport"], "zmq")
             self.assertEqual(pi05["checkpoint"], "custom_droid")
             self.assertEqual(pi05["policy_port"], 8001)
+            self.assertEqual(pi05["zmq_mode"], "bind")
+            self.assertEqual(pi05["zmq_bind_host"], "0.0.0.0")
             self.assertEqual(pi05["open_loop_horizon"], 8)
 
     def test_unknown_key_is_rejected(self) -> None:

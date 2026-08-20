@@ -65,8 +65,8 @@ done | while IFS= read -r -d '' checkpoint; do
   find "$checkpoint" -maxdepth 3 -type f -printf '  %P\n' 2>/dev/null | head -n 40
 done
 
-echo "== port 8000 / server processes =="
-ss -ltnp 2>/dev/null | grep ':8000' || true
+echo "== ports 8000-8001 / server processes =="
+ss -ltnp 2>/dev/null | grep -E ':8000|:8001' || true
 ps -u "$(id -u)" -o pid,etime,args | grep -E 'serve_policy|openpi' | grep -v grep || true
 
 echo "== OpenPI process working directories =="

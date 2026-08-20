@@ -132,6 +132,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", choices=("pi05_droid", "custom_droid"), default="pi05_droid")
     parser.add_argument("--policy-host", default="10.38.32.253")
     parser.add_argument("--policy-port", type=int, default=8000)
+    parser.add_argument(
+        "--zmq-mode",
+        choices=("connect", "bind"),
+        default="connect",
+        help="connect to the GPU, or bind locally and let the GPU connect through a reverse route",
+    )
+    parser.add_argument("--zmq-bind-host", default="0.0.0.0")
     parser.add_argument("--server-ip", default="172.16.0.20", help="Bamboo controller host")
     parser.add_argument("--control-port", type=int, default=5555)
     parser.add_argument("--gripper-port", type=int, default=5559)
@@ -199,7 +206,15 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         parser.error("prefetch-actions must be in [0, open-loop-horizon)")
     if args.max_steps < 1:
         parser.error("max-steps must be positive")
+    if args.transport != "zmq" and args.zmq_mode != "connect":
+        parser.error("--zmq-mode bind is only valid with --transport zmq")
     return args
+
+
+def _policy_endpoint(args: argparse.Namespace) -> tuple[str, str]:
+    if args.transport == "zmq" and args.zmq_mode == "bind":
+        return args.zmq_bind_host, f"local tcp://{args.zmq_bind_host}:{args.policy_port} (GPU connects outward)"
+    return args.policy_host, f"{args.policy_host}:{args.policy_port}"
 
 
 def _state(robot: BambooRobot) -> tuple[dict[str, Any], np.ndarray]:
@@ -283,11 +298,17 @@ def run(args: argparse.Namespace) -> int:
     if args.offline:
         return _offline_check(args)
     if args.server_only:
-        _check_port(args.policy_host, args.policy_port)
+        policy_host, endpoint_label = _policy_endpoint(args)
+        if args.transport != "zmq" or args.zmq_mode == "connect":
+            _check_port(args.policy_host, args.policy_port)
         if args.transport == "zmq":
             from fr3_pi05.protocol import OpenPiZmqClient
 
-            client = OpenPiZmqClient(args.policy_host, args.policy_port)
+            client = OpenPiZmqClient(
+                policy_host,
+                args.policy_port,
+                connection_mode=args.zmq_mode,
+            )
         else:
             from fr3_pi05.protocol import OpenPiWebsocketClient
 
@@ -295,7 +316,7 @@ def run(args: argparse.Namespace) -> int:
         try:
             metadata = ", ".join(f"{key}={value}" for key, value in sorted(client.metadata.items())) or "none"
             print(
-                f"pi0.5 {args.transport} server ready at {args.policy_host}:{args.policy_port}; "
+                f"pi0.5 {args.transport} server ready at {endpoint_label}; "
                 f"metadata: {metadata}"
             )
         finally:
@@ -306,7 +327,9 @@ def run(args: argparse.Namespace) -> int:
     if not prompt:
         raise RuntimeError("Language instruction cannot be empty")
     workspace = WorkspaceBounds(tuple(args.workspace_min), tuple(args.workspace_max))
-    _check_port(args.policy_host, args.policy_port)
+    policy_host, endpoint_label = _policy_endpoint(args)
+    if args.transport != "zmq" or args.zmq_mode == "connect":
+        _check_port(args.policy_host, args.policy_port)
 
     robot: BambooRobot | None = None
     cameras: RealSensePair | None = None
@@ -343,9 +366,15 @@ def run(args: argparse.Namespace) -> int:
             fps=args.camera_fps,
         ).start()
         print(f"Cameras ready: {cameras.serials}")
-        policy = InferenceWorker(args.policy_host, args.policy_port, args.open_loop_horizon, args.transport)
+        policy = InferenceWorker(
+            policy_host,
+            args.policy_port,
+            args.open_loop_horizon,
+            args.transport,
+            args.zmq_mode,
+        )
         print(
-            f"pi0.5 {args.transport} server connected at {args.policy_host}:{args.policy_port} "
+            f"pi0.5 {args.transport} server connected at {endpoint_label} "
             f"(requested checkpoint: {args.checkpoint})"
         )
         if policy.metadata:

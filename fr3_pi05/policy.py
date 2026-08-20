@@ -156,11 +156,18 @@ class InferenceResult:
 class InferenceWorker:
     """Serialize blocking websocket inference away from the control loop."""
 
-    def __init__(self, host: str, port: int, horizon: int, transport: str = "zmq") -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        horizon: int,
+        transport: str = "zmq",
+        zmq_mode: str = "connect",
+    ) -> None:
         from fr3_pi05.protocol import OpenPiWebsocketClient, OpenPiZmqClient
 
         if transport == "zmq":
-            self._policy = OpenPiZmqClient(host, port)
+            self._policy = OpenPiZmqClient(host, port, connection_mode=zmq_mode)
         elif transport == "websocket":
             self._policy = OpenPiWebsocketClient(host, port)
         else:
