@@ -334,6 +334,12 @@ def _home_robot(robot: BambooRobot, args: argparse.Namespace, stopped: threading
     return result
 
 
+def _open_gripper(robot: BambooRobot) -> None:
+    print("\nOpening gripper for rollout startup...")
+    robot.open_gripper()
+    print("Gripper open.")
+
+
 def run(args: argparse.Namespace) -> int:
     if args.offline:
         return _offline_check(args)
@@ -400,6 +406,8 @@ def run(args: argparse.Namespace) -> int:
 
         if args.home and not args.check:
             _home_robot(robot, args, stopped)
+        if not args.check and not args.no_gripper:
+            _open_gripper(robot)
 
         gripper = GripperWorker(robot, not args.no_gripper)
         gripper.wait_ready()

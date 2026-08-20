@@ -212,8 +212,9 @@ fr3-pi05-check --offline --no-rviz --prompt test
 Next run a paced inference-only rollout. Cameras, live joint state, current
 kinematic robot, final predicted robot, and predicted EEF path are visible in
 RViz. By default, `fr3-pi05-run` first moves the arm to the configured home pose
-using a temporary watchdog-protected Bamboo stream; after homing, no policy
-action reaches Bamboo unless `--execute` is present:
+using a temporary watchdog-protected Bamboo stream, then opens the gripper. The
+gripper opening is blocking, so inference starts only after Bamboo confirms it.
+After startup, no policy action reaches Bamboo unless `--execute` is present:
 
 ```bash
 fr3-pi05-run --prompt "pick up the red block"
@@ -222,7 +223,9 @@ fr3-pi05-run --prompt "pick up the red block"
 Automatic homing uses `[home].speed` and `[home].timeout` from `config.toml` and
 the shared home pose `[-0.047, -0.735, -0.028, -2.278, -0.007, 1.578, 0.031]`.
 Use `--no-home` only when the arm has already been deliberately positioned.
-`fr3-pi05-check` remains strictly non-moving and never homes.
+Use `--no-gripper` to disable both startup and policy gripper control.
+`fr3-pi05-check` remains strictly non-moving: it neither homes nor opens the
+gripper.
 
 Only after both checks look correct, enable motion:
 

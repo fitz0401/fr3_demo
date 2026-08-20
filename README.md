@@ -17,7 +17,9 @@ contains the workstation-side teleoperation and demo-collection code.
 The repository also contains the guarded two-camera FR3 client and GPU-host
 launcher for the official OpenPI `pi05_droid` checkpoint. See
 [`fr3_pi05/README.md`](fr3_pi05/README.md) for server deployment, non-moving
-end-to-end checks, RViz trajectory visualization, and policy execution.
+end-to-end checks, RViz trajectory visualization, and policy execution. A
+normal `fr3-pi05-run` homes the arm and opens the gripper before inference;
+`fr3-pi05-check` performs neither motion.
 
 ## Safety
 

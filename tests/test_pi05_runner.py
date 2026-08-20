@@ -6,10 +6,17 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from fr3_demo.teleop import HOME_JOINTS
-from fr3_pi05.runner import _home_robot
+from fr3_pi05.runner import _home_robot, _open_gripper
 
 
 class Pi05RunnerTest(unittest.TestCase):
+    def test_startup_gripper_open_is_blocking(self) -> None:
+        robot = MagicMock()
+
+        _open_gripper(robot)
+
+        robot.open_gripper.assert_called_once_with()
+
     @patch("fr3_pi05.runner.stream_home")
     def test_home_uses_temporary_bamboo_stream(self, stream_home: MagicMock) -> None:
         stream_home.return_value = HOME_JOINTS.copy()
