@@ -2,10 +2,11 @@
 
 This package connects the current FR3 workstation to Physical Intelligence's
 official `pi05_droid` policy. The workstation owns the RealSense devices and
-Bamboo robot connection; the GPU workstation at `10.38.32.253` only performs
-GPU inference. The default transport is direct ZMQ. The managed SSH gateway and
-the routed campus subnets currently deny direct TCP in both directions, so the
-deployment still requires an approved ACL/overlay or a dedicated Ethernet link.
+Bamboo robot connection; the GPU workstation only performs GPU inference. Its
+`enp103s0` interface is `172.16.0.30/24`, directly reachable from this
+workstation's `eno1` at `172.16.0.3/24` with measured sub-millisecond latency.
+The default transport is direct ZMQ over this dedicated inference LAN; the
+GPU's separate `enp106s0` campus connection remains `10.38.32.253`.
 The official OpenPI WebSocket transport remains selectable as a fallback.
 
 The exact request fields are:
@@ -45,6 +46,16 @@ interfaces connected internally to each machine's BMC, despite their similar
 MAC-derived names. A dedicated link requires a real spare PCIe/USB Ethernet
 adapter on the GPU, connected directly to a real workstation NIC or to the same
 unisolated switch.
+
+The deployed GPU interface is configured persistently through NetworkManager:
+
+```text
+enp103s0: 172.16.0.30/24, no gateway, never-default
+eno1:     172.16.0.3/24
+```
+
+`ping -c 3 172.16.0.30` must succeed from the robot workstation before starting
+inference. Do not add a gateway or DNS server to the dedicated connection.
 
 This deployment uses two checkpoints already managed on the GPU host and never
 downloads checkpoint weights itself:
@@ -140,7 +151,7 @@ source /opt/ros/humble/setup.bash
 
 All transport, direction, host, port, camera, Bamboo, rate, and safety values live in the
 shared `config.toml` under `[pi05]`. The default is `transport = "zmq"`, host
-`10.38.32.253`, and checkpoint `pi05_droid`. Ports are selected automatically:
+`172.16.0.30`, and checkpoint `pi05_droid`. Ports are selected automatically:
 8000 for `pi05_droid`, 8001 for `custom_droid`. With the selected GPU ZMQ server
 ready, first run the network-only metadata check. It does not open the cameras
 or Bamboo:
