@@ -85,7 +85,14 @@ if [ -n "$CONNECT_ENDPOINT" ]; then
   esac
   EXTRA_ARGS+=(--connect-endpoint "$CONNECT_ENDPOINT")
 fi
-exec uv run --with pyzmq python \
+OPENPI_PYTHON="$OPENPI_DIR/.venv/bin/python"
+if [ -x "$OPENPI_PYTHON" ] && "$OPENPI_PYTHON" -c 'import msgpack, zmq' >/dev/null 2>&1; then
+  PYTHON_COMMAND=("$OPENPI_PYTHON")
+else
+  echo "OpenPI environment lacks msgpack/pyzmq; using an isolated uv overlay." >&2
+  PYTHON_COMMAND=(uv run --with pyzmq python)
+fi
+exec "${PYTHON_COMMAND[@]}" \
   "$FR3_DEMO_DIR/fr3_pi05/remote/serve_pi05_zmq.py" \
   --port "$PORT" \
   --loader "$LOADER" \

@@ -104,9 +104,11 @@ CUDA_VISIBLE_DEVICES=1 PORT=8001 \
 The launcher refuses a missing local checkpoint path. The large models remain
 read-only under `/mnt/data/yurui`; small writable OpenPI and uv runtime caches
 default to `$HOME/.cache/fr3_pi05`. Override `OPENPI_DATA_HOME` and
-`UV_CACHE_DIR` if a larger writable cache location is available. `uv run
---with pyzmq` supplies only the transport dependency without changing OpenPI's
-lock file or downloading model weights.
+`UV_CACHE_DIR` if a larger writable cache location is available. The launcher
+uses OpenPI's existing `.venv/bin/python` directly when it already contains
+`msgpack` and `pyzmq`; otherwise an isolated `uv --with pyzmq` overlay supplies
+only the transport dependency. Neither path changes OpenPI's lock file or
+downloads model weights.
 
 The normal mode has this workstation connect to the configured GPU address. If
 a deployment filters that direction but permits GPU-to-workstation TCP, set
