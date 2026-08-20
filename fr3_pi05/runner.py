@@ -129,6 +129,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=default_config_path())
     parser.add_argument("--prompt", help="language instruction; prompted interactively when omitted")
     parser.add_argument("--transport", choices=("zmq", "websocket"), default="zmq")
+    parser.add_argument("--checkpoint", choices=("pi05_droid", "custom_droid"), default="pi05_droid")
     parser.add_argument("--policy-host", default="10.38.32.253")
     parser.add_argument("--policy-port", type=int, default=8000)
     parser.add_argument("--server-ip", default="172.16.0.20", help="Bamboo controller host")
@@ -170,7 +171,8 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     bootstrap_args, _ = bootstrap.parse_known_args(raw)
     parser = _parser()
     try:
-        defaults = pi05_defaults(load_config(bootstrap_args.config))
+        config = load_config(bootstrap_args.config)
+        defaults = pi05_defaults(config)
     except (FileNotFoundError, OSError, TypeError, ValueError) as error:
         parser.error(str(error))
     environment = {
@@ -181,6 +183,10 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     defaults.update({key: value for key, value in environment.items() if value})
     parser.set_defaults(config=bootstrap_args.config, **defaults)
     args = parser.parse_args(raw)
+    if not any(token == "--policy-port" or token.startswith("--policy-port=") for token in raw):
+        server_ports = config.get("pi05", {}).get("server_ports", {})
+        if isinstance(server_ports, dict) and args.checkpoint in server_ports:
+            args.policy_port = int(server_ports[args.checkpoint])
     if not args.external_camera_serial or not args.wrist_camera_serial:
         parser.error("both camera serial numbers are required in config.toml or on the command line")
     if args.execute and args.check:
@@ -287,10 +293,10 @@ def run(args: argparse.Namespace) -> int:
 
             client = OpenPiWebsocketClient(args.policy_host, args.policy_port)
         try:
-            keys = ", ".join(sorted(client.metadata)) or "none"
+            metadata = ", ".join(f"{key}={value}" for key, value in sorted(client.metadata.items())) or "none"
             print(
                 f"pi0.5 {args.transport} server ready at {args.policy_host}:{args.policy_port}; "
-                f"metadata keys: {keys}"
+                f"metadata: {metadata}"
             )
         finally:
             client.close()
@@ -338,7 +344,10 @@ def run(args: argparse.Namespace) -> int:
         ).start()
         print(f"Cameras ready: {cameras.serials}")
         policy = InferenceWorker(args.policy_host, args.policy_port, args.open_loop_horizon, args.transport)
-        print(f"pi0.5 {args.transport} server connected at {args.policy_host}:{args.policy_port}")
+        print(
+            f"pi0.5 {args.transport} server connected at {args.policy_host}:{args.policy_port} "
+            f"(requested checkpoint: {args.checkpoint})"
+        )
         if policy.metadata:
             print(f"Server metadata keys: {', '.join(sorted(policy.metadata))}")
         if not args.no_rviz:

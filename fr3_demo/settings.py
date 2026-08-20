@@ -32,9 +32,11 @@ _SCHEMA: dict[str, set[str]] = {
     "home": {"speed", "timeout"},
     "workspace": {"min", "max"},
     "pi05": {
+        "checkpoint",
         "transport",
         "server_host",
         "server_port",
+        "server_ports",
         "control_hz",
         "stream_hz",
         "open_loop_horizon",
@@ -151,6 +153,9 @@ def pi05_defaults(config: dict[str, Any]) -> dict[str, Any]:
     cameras = config.get("cameras", {})
     workspace = config.get("workspace", {})
     pi05 = config.get("pi05", {})
+    checkpoint = pi05.get("checkpoint")
+    server_ports = pi05.get("server_ports", {})
+    selected_port = server_ports.get(checkpoint) if isinstance(server_ports, dict) else None
     mapping = {
         "server_ip": robot.get("server_ip"),
         "control_port": robot.get("control_port"),
@@ -164,7 +169,8 @@ def pi05_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "workspace_min": workspace.get("min"),
         "workspace_max": workspace.get("max"),
         "policy_host": pi05.get("server_host"),
-        "policy_port": pi05.get("server_port"),
+        "policy_port": selected_port or pi05.get("server_port"),
+        "checkpoint": checkpoint,
         "transport": pi05.get("transport"),
         "control_hz": pi05.get("control_hz"),
         "stream_hz": pi05.get("stream_hz"),

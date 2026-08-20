@@ -25,41 +25,67 @@ of 15 Hz and prefetches the next chunk while the current chunk is executing.
 The KU Leuven certificate authenticates successfully on `jump-l`, but the
 gateway policy currently denies forwarding to `10.38.32.253`. SSH is therefore
 not needed for inference itself. From a terminal physically on the GPU machine,
-put the repository under the requested `fr3_pi05` directory:
+update the repository already present at `~/fr3_demo` (or clone it there):
 
 ```bash
-mkdir -p ~/fr3_pi05
-cd ~/fr3_pi05
-git clone https://github.com/fitz0401/fr3_demo.git
+cd ~
+git clone https://github.com/fitz0401/fr3_demo.git fr3_demo
 cd fr3_demo
 bash fr3_pi05/remote/audit_host.sh
 ```
 
-Send the audit output back before installing or downloading anything. It checks
+Send the audit output back before installing anything. It checks
 both GPUs, active GPU processes, disk space, `uv`/Conda, candidate OpenPI trees,
 checkpoint caches, and port 8000 without changing the host.
 
-When an existing OpenPI checkout and checkpoint are confirmed, choose the idle
-A6000 index reported by `nvidia-smi` and start the direct ZMQ wrapper:
+This deployment uses two checkpoints already managed on the GPU host and never
+downloads checkpoint weights itself:
+
+| Local selection | GPU checkpoint | ZMQ port |
+| --- | --- | --- |
+| `pi05_droid` | `/mnt/data/yurui/models/pi05_droid` | 8000 |
+| `custom_droid` | `/mnt/data/yurui/models/pi05_custom_droid_14999` | 8001 |
+
+The official checkpoint was not complete at the time of the first audit and
+will be populated separately. The custom checkpoint must be launched with the
+exact training configuration name defined in the deployed `fitz0401/openpi`
+fork; verify that name before starting it. Do not guess between
+`pi05_droid` and `pi05_droid_finetune`, because their action horizons differ.
+
+When the OpenPI checkout and checkpoint structure are confirmed, choose the idle
+A6000 index reported by `nvidia-smi`. Start the official policy on port 8000:
 
 ```bash
-CUDA_VISIBLE_DEVICES=<A6000_INDEX> \
+CUDA_VISIBLE_DEVICES=1 PORT=8000 \
   bash fr3_pi05/remote/start_pi05_zmq_server.sh \
   /absolute/path/to/openpi \
-  "$HOME/fr3_pi05/fr3_demo"
+  "$HOME/fr3_demo" \
+  /mnt/data/yurui/models/pi05_droid \
+  pi05_droid
 ```
 
-The wrapper loads the official `pi05_droid` configuration and
-`gs://openpi-assets/checkpoints/pi05_droid`, then binds a ZMQ request/reply
-server on `0.0.0.0:8000`. `uv run --with pyzmq` supplies only the small transport
-dependency without changing OpenPI's lock file. The first checkpoint load can
-be much slower if its cache is incomplete.
+Start the custom policy on port 8001 only after replacing
+`<CUSTOM_CONFIG_NAME>` with the name found in that OpenPI fork:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PORT=8001 \
+  bash fr3_pi05/remote/start_pi05_zmq_server.sh \
+  /absolute/path/to/openpi \
+  "$HOME/fr3_demo" \
+  /mnt/data/yurui/models/pi05_custom_droid_14999 \
+  <CUSTOM_CONFIG_NAME>
+```
+
+The launcher refuses a missing local checkpoint path. It also moves OpenPI and
+uv caches beside the model under `/mnt/data/yurui/models`, avoiding the system
+disk, which was already 92% full. `uv run --with pyzmq` supplies only the small
+transport dependency without changing OpenPI's lock file.
 
 After a foreground smoke test succeeds, a supervised persistent session can use:
 
 ```bash
 tmux new-session -d -s pi05_droid \
-  "CUDA_VISIBLE_DEVICES=<A6000_INDEX> bash $HOME/fr3_pi05/fr3_demo/fr3_pi05/remote/start_pi05_zmq_server.sh /path/to/openpi $HOME/fr3_pi05/fr3_demo"
+  "CUDA_VISIBLE_DEVICES=1 PORT=8000 bash $HOME/fr3_demo/fr3_pi05/remote/start_pi05_zmq_server.sh /path/to/openpi $HOME/fr3_demo /mnt/data/yurui/models/pi05_droid pi05_droid"
 tmux capture-pane -pt pi05_droid
 ```
 
@@ -80,11 +106,19 @@ source /opt/ros/humble/setup.bash
 
 All transport, host, port, camera, Bamboo, rate, and safety values live in the
 shared `config.toml` under `[pi05]`. The default is `transport = "zmq"`, host
-`10.38.32.253`, port `8000`. With the GPU ZMQ server listening, first run the
+`10.38.32.253`, and checkpoint `pi05_droid`. Ports are selected automatically:
+8000 for `pi05_droid`, 8001 for `custom_droid`. With the selected GPU ZMQ server listening, first run the
 network-only metadata check. It does not open the cameras or Bamboo:
 
 ```bash
 fr3-pi05-check --server-only
+```
+
+Select the custom endpoint persistently by changing `pi05.checkpoint` in
+`config.toml`, or for one command with:
+
+```bash
+fr3-pi05-check --server-only --checkpoint custom_droid
 ```
 
 Then run the non-moving end-to-end check:

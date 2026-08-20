@@ -74,12 +74,19 @@ def main() -> int:
     parser.add_argument("--bind-host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--config-name", default="pi05_droid")
-    parser.add_argument("--checkpoint", default="gs://openpi-assets/checkpoints/pi05_droid")
+    parser.add_argument("--checkpoint", required=True, help="existing local checkpoint directory; never downloaded here")
     parser.add_argument("--default-prompt")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     policy = load_policy(args.config_name, args.checkpoint, args.default_prompt)
-    metadata = getattr(policy, "metadata", {}) or {}
+    metadata = dict(getattr(policy, "metadata", {}) or {})
+    metadata.update(
+        {
+            "transport": "zmq",
+            "config_name": args.config_name,
+            "checkpoint": args.checkpoint,
+        }
+    )
     serve(policy, metadata, f"tcp://{args.bind_host}:{args.port}")
     return 0
 

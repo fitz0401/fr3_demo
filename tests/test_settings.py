@@ -28,8 +28,10 @@ min = [0.1, -0.2, 0.3]
 max = [0.7, 0.2, 0.9]
 [pi05]
 transport = "zmq"
+checkpoint = "custom_droid"
 server_host = "gpu"
 server_port = 8001
+server_ports = { pi05_droid = 8000, custom_droid = 8001 }
 open_loop_horizon = 8
 """,
                 encoding="utf-8",
@@ -48,6 +50,7 @@ open_loop_horizon = 8
             self.assertEqual(cameras["camera_fps"], 15)
             self.assertEqual(pi05["policy_host"], "gpu")
             self.assertEqual(pi05["transport"], "zmq")
+            self.assertEqual(pi05["checkpoint"], "custom_droid")
             self.assertEqual(pi05["policy_port"], 8001)
             self.assertEqual(pi05["open_loop_horizon"], 8)
 
