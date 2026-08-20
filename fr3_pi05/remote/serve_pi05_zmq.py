@@ -11,6 +11,8 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from fr3_pi05.protocol import packb, unpackb
 
 LOG = logging.getLogger("pi05_zmq_server")
@@ -77,6 +79,27 @@ def load_policy(
     return policy, {"model": config_name}
 
 
+def warm_up(policy: Any, prompt: str) -> float:
+    """Compile one inference before exposing the network endpoint."""
+
+    observation = {
+        "observation/exterior_image_1_left": np.zeros((224, 224, 3), dtype=np.uint8),
+        "observation/wrist_image_left": np.zeros((224, 224, 3), dtype=np.uint8),
+        "observation/joint_position": np.array(
+            [-0.047, -0.735, -0.028, -2.278, -0.007, 1.578, 0.031],
+            dtype=np.float32,
+        ),
+        "observation/gripper_position": np.zeros(1, dtype=np.float32),
+        "prompt": prompt,
+    }
+    started = time.monotonic()
+    result = policy.infer(observation)
+    actions = np.asarray(result.get("actions")) if isinstance(result, dict) else np.empty(0)
+    if actions.ndim != 2 or actions.shape[1:] != (8,) or not np.all(np.isfinite(actions)):
+        raise RuntimeError(f"Policy warm-up returned invalid actions shaped {actions.shape}")
+    return (time.monotonic() - started) * 1000.0
+
+
 def serve(policy: Any, metadata: dict[str, Any], endpoint: str, *, connect: bool = False) -> None:
     try:
         import zmq
@@ -111,6 +134,7 @@ def main() -> int:
     parser.add_argument("--loader", choices=("official", "custom_droid"), default="official")
     parser.add_argument("--checkpoint", required=True, help="existing local checkpoint directory; never downloaded here")
     parser.add_argument("--default-prompt")
+    parser.add_argument("--no-warmup", action="store_true", help="skip the startup JIT inference")
     parser.add_argument(
         "--connect-endpoint",
         help="connect the REP socket outward (for example tcp://10.34.97.197:8000) instead of binding",
@@ -125,6 +149,12 @@ def main() -> int:
     )
     metadata = dict(getattr(policy, "metadata", {}) or {})
     metadata.update(loader_metadata)
+    if not args.no_warmup:
+        prompt = args.default_prompt or loader_metadata.get("default_prompt") or "perform the task"
+        LOG.info("warming policy before opening the ZMQ endpoint")
+        warmup_ms = warm_up(policy, str(prompt))
+        metadata["warmup_ms"] = warmup_ms
+        LOG.info("policy warm-up complete in %.1f ms", warmup_ms)
     metadata.update(
         {
             "transport": "zmq",

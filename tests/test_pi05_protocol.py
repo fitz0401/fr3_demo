@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from fr3_pi05.protocol import OpenPiWebsocketClient, OpenPiZmqClient, packb, unpackb
-from fr3_pi05.remote.serve_pi05_zmq import handle_request, load_policy
+from fr3_pi05.remote.serve_pi05_zmq import handle_request, load_policy, warm_up
 
 
 class Pi05ProtocolTest(unittest.TestCase):
@@ -153,6 +153,20 @@ def build_policy(args):
         self.assertEqual(policy["prompt"], "custom task")
         self.assertEqual(metadata["action_horizon"], 16)
         self.assertEqual(metadata["default_prompt"], "custom task")
+
+    def test_server_warmup_uses_droid_contract(self) -> None:
+        class FakePolicy:
+            def infer(self, observation):
+                self.observation = observation
+                return {"actions": np.zeros((15, 8), dtype=np.float32)}
+
+        policy = FakePolicy()
+        elapsed = warm_up(policy, "test task")
+
+        self.assertGreaterEqual(elapsed, 0.0)
+        self.assertEqual(policy.observation["prompt"], "test task")
+        self.assertEqual(policy.observation["observation/joint_position"].shape, (7,))
+        self.assertEqual(policy.observation["observation/wrist_image_left"].shape, (224, 224, 3))
 
 
 if __name__ == "__main__":

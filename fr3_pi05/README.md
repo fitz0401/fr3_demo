@@ -110,6 +110,10 @@ uses OpenPI's existing `.venv/bin/python` directly when it already contains
 only the transport dependency. Neither path changes OpenPI's lock file or
 downloads model weights.
 
+Both server profiles perform one synthetic DROID inference before opening the
+ZMQ endpoint. This pays the JAX compilation cost before a robot observation can
+be accepted; the reported `warmup_ms` is included in server metadata.
+
 The normal mode has this workstation connect to the configured GPU address. If
 a deployment filters that direction but permits GPU-to-workstation TCP, set
 `pi05.zmq_mode = "bind"` in `config.toml` and start the GPU process with an
@@ -176,7 +180,8 @@ fr3-pi05-check --prompt "pick up the red block"
 ```
 
 It opens both cameras, reads Bamboo and the gripper, makes one real GPU inference,
-checks the entire eight-action prefix, and opens RViz. It never starts Bamboo
+checks the entire eight-action prefix, and republishes a three-second RViz
+preview so the camera and marker displays can subscribe. It never starts Bamboo
 streaming. To validate only local configuration and kinematics:
 
 ```bash

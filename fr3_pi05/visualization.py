@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from importlib import resources
 from typing import Any
@@ -9,6 +10,17 @@ from typing import Any
 import numpy as np
 
 from fr3_demo.kinematics import forward_kinematics, link_positions
+
+
+def _rviz_environment() -> dict[str, str]:
+    """Remove editor Snap runtime paths that are binary-incompatible with ROS."""
+
+    environment = os.environ.copy()
+    incompatible_prefixes = ("SNAP", "GTK_", "GIO_")
+    for key in tuple(environment):
+        if key.startswith(incompatible_prefixes) or key == "LD_PRELOAD":
+            environment.pop(key, None)
+    return environment
 
 
 class RvizBridge:
@@ -39,7 +51,10 @@ class RvizBridge:
         if launch_rviz:
             config = resources.files("fr3_pi05").joinpath("config/pi05.rviz")
             with resources.as_file(config) as config_path:
-                self._rviz = subprocess.Popen(["rviz2", "-d", str(config_path)])
+                self._rviz = subprocess.Popen(
+                    ["rviz2", "-d", str(config_path)],
+                    env=_rviz_environment(),
+                )
 
     def _image_message(self, image: np.ndarray, frame_id: str) -> Any:
         message = self._image_type()
@@ -109,15 +124,15 @@ class RvizBridge:
         self._rclpy.spin_once(self._node, timeout_sec=0.0)
 
     def close(self) -> None:
-        self._node.destroy_node()
-        if self._rclpy.ok():
-            self._rclpy.shutdown()
         if self._rviz is not None:
             self._rviz.terminate()
             try:
                 self._rviz.wait(timeout=3.0)
             except subprocess.TimeoutExpired:
                 self._rviz.kill()
+        self._node.destroy_node()
+        if self._rclpy.ok():
+            self._rclpy.shutdown()
 
     def __enter__(self) -> RvizBridge:  # noqa: PYI034
         return self

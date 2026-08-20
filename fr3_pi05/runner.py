@@ -411,6 +411,16 @@ def run(args: argparse.Namespace) -> int:
             f"preview EEF={np.array2string(forward_kinematics(predicted[-1])[:3, 3], precision=4)}"
         )
         if args.check:
+            if rviz is not None and not args.rviz_publish_only:
+                preview_deadline = time.monotonic() + 3.0
+                while time.monotonic() < preview_deadline:
+                    rviz.publish(
+                        frames["exterior_image_left"].image,
+                        frames["wrist_image"].image,
+                        q,
+                        predicted,
+                    )
+                    time.sleep(0.1)
             print("CHECK PASSED. Bamboo streaming was not started; the robot did not move.")
             return 0
 
