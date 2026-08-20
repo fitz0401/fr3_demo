@@ -150,15 +150,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument(
-        "--wrist-vertical-flip",
+        "--wrist-rotate-180",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="flip wrist images top-to-bottom before RViz, recording, and policy inference",
+        help="rotate wrist images 180 degrees before RViz, recording, and policy inference",
     )
     parser.add_argument("--joystick", default="/dev/input/js0", help="Back button is the software abort")
     parser.add_argument("--control-hz", type=float, default=15.0)
     parser.add_argument("--stream-hz", type=float, default=30.0)
-    parser.add_argument("--open-loop-horizon", type=int, default=8)
+    parser.add_argument("--open-loop-horizon", type=int, default=15)
     parser.add_argument("--prefetch-actions", type=int, default=4)
     parser.add_argument("--max-joint-speed", type=float, default=0.20)
     parser.add_argument("--max-joint-acceleration", type=float, default=1.0)
@@ -174,7 +174,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--watchdog-ms", type=int, default=250)
     parser.add_argument("--max-camera-age", type=float, default=0.25)
     parser.add_argument("--max-inference-age", type=float, default=3.0)
-    parser.add_argument("--max-steps", type=int, default=600)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=600,
+        help="maximum policy steps before stopping; 0 runs until explicitly stopped",
+    )
     parser.add_argument("--workspace-min", type=float, nargs=3, default=(0.10, -0.60, 0.05))
     parser.add_argument("--workspace-max", type=float, nargs=3, default=(0.80, 0.60, 1.00))
     parser.add_argument("--no-rviz", action="store_true", help="do not publish ROS topics or launch RViz")
@@ -219,8 +224,8 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         parser.error("stream-hz must be at least control-hz, and both must be positive")
     if args.open_loop_horizon < 1 or not 0 <= args.prefetch_actions < args.open_loop_horizon:
         parser.error("prefetch-actions must be in [0, open-loop-horizon)")
-    if args.max_steps < 1:
-        parser.error("max-steps must be positive")
+    if args.max_steps < 0:
+        parser.error("max-steps must be non-negative (0 disables the limit)")
     if args.camera_width < 1 or args.camera_height < 1 or args.camera_fps < 1:
         parser.error("camera width, height, and fps must be positive")
     if args.home_speed <= 0 or args.home_timeout <= 0:
@@ -404,12 +409,12 @@ def run(args: argparse.Namespace) -> int:
             width=args.camera_width,
             height=args.camera_height,
             fps=args.camera_fps,
-            wrist_vertical_flip=args.wrist_vertical_flip,
+            wrist_rotate_180=args.wrist_rotate_180,
         ).start()
         print(
             f"Cameras ready: {cameras.serials}; "
             f"{args.camera_width}x{args.camera_height}@{args.camera_fps} Hz; "
-            f"wrist_vertical_flip={args.wrist_vertical_flip}"
+            f"wrist_rotate_180={args.wrist_rotate_180}"
         )
         policy = InferenceWorker(
             policy_host,
@@ -493,7 +498,9 @@ def run(args: argparse.Namespace) -> int:
         next_stream = time.monotonic()
         next_control = next_stream
 
-        while policy_steps < args.max_steps and not stopped.is_set():
+        unlimited_steps = args.max_steps == 0
+        step_limit_label = "unlimited" if unlimited_steps else str(args.max_steps)
+        while (unlimited_steps or policy_steps < args.max_steps) and not stopped.is_set():
             now = time.monotonic()
             if joystick is not None:
                 snapshot = joystick.snapshot()
@@ -582,7 +589,10 @@ def run(args: argparse.Namespace) -> int:
                     )
                 if policy_steps and policy_steps % int(max(1, args.control_hz * 2)) == 0:
                     mode = "EXECUTING" if args.execute else "INFERENCE ONLY"
-                    print(f"{mode}: step {policy_steps}/{args.max_steps}, |dq_cmd|={np.linalg.norm(desired_velocity):.3f}")
+                    print(
+                        f"{mode}: step {policy_steps}/{step_limit_label}, "
+                        f"|dq_cmd|={np.linalg.norm(desired_velocity):.3f}"
+                    )
                 next_control += control_period
                 if next_control < now - control_period:
                     next_control = now + control_period

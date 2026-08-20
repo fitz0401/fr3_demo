@@ -43,7 +43,7 @@ class Pi05PolicyTest(unittest.TestCase):
         self.assertTrue(np.all(actions == 1.0))
 
     def test_droid_aspect_is_padded_without_stretching(self) -> None:
-        image = np.full((720, 1280, 3), 255, dtype=np.uint8)
+        image = np.full((240, 424, 3), 255, dtype=np.uint8)
         resized = _resize(image)
 
         self.assertEqual(resized.shape, (224, 224, 3))

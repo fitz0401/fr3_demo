@@ -14,17 +14,17 @@ class _FakeCamera:
 
 
 class RealSensePairTest(unittest.TestCase):
-    def test_only_wrist_image_is_flipped_top_to_bottom(self) -> None:
+    def test_only_wrist_image_is_rotated_180_degrees(self) -> None:
         image = np.arange(18, dtype=np.uint8).reshape(3, 2, 3)
         pair = object.__new__(RealSensePair)
         pair.exterior = _FakeCamera(image)
         pair.wrist = _FakeCamera(image)
-        pair.wrist_vertical_flip = True
+        pair.wrist_rotate_180 = True
 
         frames = pair.snapshot()
 
         np.testing.assert_array_equal(frames["exterior_image_left"].image, image)
-        np.testing.assert_array_equal(frames["wrist_image"].image, image[::-1])
+        np.testing.assert_array_equal(frames["wrist_image"].image, image[::-1, ::-1])
         self.assertEqual(frames["wrist_image"].frame_number, 3)
 
 

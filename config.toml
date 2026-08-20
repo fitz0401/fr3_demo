@@ -19,13 +19,13 @@ device = "/dev/input/js0"
 [cameras]
 external_serial = "047322071010"
 wrist_serial = "309622300781"
-# DROID release images are 16:9 at 15 Hz. These modes also expose the cameras'
-# wider horizontal color FOV instead of the cropped 640x480 modes.
-width = 1280
-height = 720
-fps = 15
-# The wrist camera is mounted vertically inverted on this FR3.
-wrist_vertical_flip = true
+# Pinhao's validated RealSense adaptation: wide 16:9 modes with low transport
+# latency. The policy still samples/actions at DROID's 15 Hz control rate.
+width = 424
+height = 240
+fps = 30
+# The wrist camera mount is upside-down relative to the DROID hand camera.
+wrist_rotate_180 = true
 
 [recording]
 data_dir = "data/raw"
@@ -66,7 +66,7 @@ zmq_bind_host = "0.0.0.0"
 server_ports = { pi05_droid = 8000, custom_droid = 8001 }
 control_hz = 15.0
 stream_hz = 30.0
-open_loop_horizon = 8
+open_loop_horizon = 15
 prefetch_actions = 4
 # Begin conservatively. DROID actions are joint velocities in rad/s.
 max_joint_speed = 0.20
@@ -75,5 +75,6 @@ joint_margin = 0.10
 watchdog_ms = 250
 max_camera_age = 0.25
 max_inference_age = 3.0
-max_rollout_steps = 600
+# 0 disables the duration limit; stop with joystick Back, Ctrl+C, or E-stop.
+max_rollout_steps = 0
 rviz = true

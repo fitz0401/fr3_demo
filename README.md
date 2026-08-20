@@ -138,15 +138,27 @@ This workstation currently detects these two serials:
 047322071010  Intel RealSense D435I
 ```
 
-The likely assignment is D456 as the exterior view and D435I as the wrist view.
-That assignment is already stored in `config.toml`. Verify the physical views in
-RViz and swap `cameras.external_serial` and `cameras.wrist_serial` in the file if
-the displays are reversed:
+The configured assignment is D435I (`047322071010`) as the exterior view and
+D456 (`309622300781`) as the wrist view. Both stream RGB at 424x240 and 30 Hz.
+Verify the physical views in RViz and swap `cameras.external_serial` and
+`cameras.wrist_serial` in the file if the displays are reversed:
 
 ```bash
 source /opt/ros/humble/setup.bash
 fr3-camera-rviz
 ```
+
+The upside-down wrist mount is corrected with a 180-degree rotation controlled
+by `cameras.wrist_rotate_180 = true`. To temporarily inspect the unrotated image
+without changing the shared configuration, run:
+
+```bash
+fr3-camera-rviz --no-wrist-rotate-180
+```
+
+The same one-run override works with `fr3-teleop`, `fr3-collect`,
+`fr3-pi05-check`, and `fr3-pi05-run`. To disable rotation persistently, set
+`wrist_rotate_180 = false` under `[cameras]` in `config.toml`.
 
 The preview publishes `/fr3_demo/exterior_image_left` and
 `/fr3_demo/wrist_image`. Stop it with Ctrl+C before collection because a

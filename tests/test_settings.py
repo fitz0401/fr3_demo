@@ -22,10 +22,10 @@ enabled = false
 [cameras]
 external_serial = "external"
 wrist_serial = "wrist"
-width = 1280
-height = 720
-fps = 15
-wrist_vertical_flip = true
+width = 424
+height = 240
+fps = 30
+wrist_rotate_180 = true
 [workspace]
 min = [0.1, -0.2, 0.3]
 max = [0.7, 0.2, 0.9]
@@ -40,7 +40,8 @@ server_port = 8001
 server_ports = { pi05_droid = 8000, custom_droid = 8001 }
 zmq_mode = "bind"
 zmq_bind_host = "0.0.0.0"
-open_loop_horizon = 8
+open_loop_horizon = 15
+max_rollout_steps = 0
 """,
                 encoding="utf-8",
             )
@@ -55,12 +56,12 @@ open_loop_horizon = 8
             self.assertEqual(teleop["workspace_min"], [0.1, -0.2, 0.3])
             self.assertEqual(cameras["external_camera_serial"], "external")
             self.assertEqual(cameras["wrist_camera_serial"], "wrist")
-            self.assertEqual(cameras["camera_fps"], 15)
-            self.assertEqual(cameras["camera_width"], 1280)
-            self.assertEqual(cameras["camera_height"], 720)
-            self.assertTrue(cameras["wrist_vertical_flip"])
-            self.assertTrue(teleop["wrist_vertical_flip"])
-            self.assertTrue(pi05["wrist_vertical_flip"])
+            self.assertEqual(cameras["camera_fps"], 30)
+            self.assertEqual(cameras["camera_width"], 424)
+            self.assertEqual(cameras["camera_height"], 240)
+            self.assertTrue(cameras["wrist_rotate_180"])
+            self.assertTrue(teleop["wrist_rotate_180"])
+            self.assertTrue(pi05["wrist_rotate_180"])
             self.assertEqual(pi05["home_speed"], 0.18)
             self.assertEqual(pi05["home_timeout"], 20.0)
             self.assertEqual(pi05["policy_host"], "gpu")
@@ -69,7 +70,8 @@ open_loop_horizon = 8
             self.assertEqual(pi05["policy_port"], 8001)
             self.assertEqual(pi05["zmq_mode"], "bind")
             self.assertEqual(pi05["zmq_bind_host"], "0.0.0.0")
-            self.assertEqual(pi05["open_loop_horizon"], 8)
+            self.assertEqual(pi05["open_loop_horizon"], 15)
+            self.assertEqual(pi05["max_steps"], 0)
 
     def test_unknown_key_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

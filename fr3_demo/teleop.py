@@ -286,10 +286,10 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument(
-        "--wrist-vertical-flip",
+        "--wrist-rotate-180",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="flip wrist images top-to-bottom for an inverted camera mount",
+        help="rotate wrist images 180 degrees for an upside-down camera mount",
     )
     parser.add_argument("--record-fps", type=float, default=15.0, help="synchronized dataset sampling rate")
     parser.add_argument("--feedback-event", help="force-feedback event device; auto-detected by default")
@@ -399,7 +399,7 @@ def run(args: argparse.Namespace) -> int:
                 width=args.camera_width,
                 height=args.camera_height,
                 fps=args.camera_fps,
-                wrist_vertical_flip=args.wrist_vertical_flip,
+                wrist_rotate_180=args.wrist_rotate_180,
             ).start()
             collector = DemoCollector(
                 cameras,

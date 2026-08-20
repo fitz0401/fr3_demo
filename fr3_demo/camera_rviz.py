@@ -63,7 +63,7 @@ def rviz_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument(
-        "--wrist-vertical-flip",
+        "--wrist-rotate-180",
         action=argparse.BooleanOptionalAction,
         default=False,
     )
@@ -99,7 +99,7 @@ def rviz_main(argv: list[str] | None = None) -> int:
         width=args.camera_width,
         height=args.camera_height,
         fps=args.camera_fps,
-        wrist_vertical_flip=args.wrist_vertical_flip,
+        wrist_rotate_180=args.wrist_rotate_180,
     ).start()
     rclpy.init()
     node = Node("fr3_demo_camera_preview")
@@ -123,7 +123,7 @@ def rviz_main(argv: list[str] | None = None) -> int:
 
     print(
         f"Publishing {args.camera_width}x{args.camera_height}@{args.camera_fps} Hz camera views; "
-        f"wrist_vertical_flip={args.wrist_vertical_flip}. Press Ctrl+C to stop."
+        f"wrist_rotate_180={args.wrist_rotate_180}. Press Ctrl+C to stop."
     )
     try:
         rclpy.spin(node)

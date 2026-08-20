@@ -17,22 +17,29 @@ The exact request fields are:
 - `observation/gripper_position`: one normalized opening value;
 - `prompt`: the operator's language instruction.
 
-The installed wrist camera is vertically inverted. The shared
-`cameras.wrist_vertical_flip = true` setting flips it top-to-bottom before
+The installed wrist camera is upside-down relative to the DROID hand-camera
+mount. Pinhao's validated reproduction rotates it 180 degrees, so the shared
+`cameras.wrist_rotate_180 = true` setting applies the same rotation before
 policy inference, RViz publication, and future demonstration recording. The
-exterior image is not changed. Use `--no-wrist-vertical-flip` only for a
-temporary run after physically remounting the camera.
+exterior image is not changed. Use `--no-wrist-rotate-180` only after physically
+remounting the camera, or temporarily to compare the raw orientation:
 
-Both RealSense color streams use 1280x720 at 15 Hz. This matches the DROID RLDS
-16:9 aspect ratio and collection rate before OpenPI's official 224x224 padded
-resize. In the cameras' calibrated modes, switching from 640x480 to 1280x720
-widens the D456 wrist color view from about 79.3° to 89.7° horizontally and the
-D435I exterior view from about 55.6° to 70.2°. The wrist view is therefore close
-to the wide ZED Mini geometry used by DROID, although the RealSense setup is not
-an exact replacement for DROID's stereo hardware.
+```bash
+fr3-pi05-check --no-wrist-rotate-180 --prompt "test camera orientation"
+```
+
+The override applies to one run only. Set `cameras.wrist_rotate_180 = false` in
+`config.toml` to keep rotation disabled.
+
+Both RealSense color streams use 424x240 at 30 Hz, matching Pinhao's validated
+deployment. This 16:9 mode preserves essentially the same wide calibrated FOV
+as 1280x720 while reducing USB and network latency. The policy samples the
+latest frame at DROID's 15 Hz control rate and applies OpenPI's official 224x224
+padded resize. The wrist D456 remains close to the wide ZED Mini geometry used
+by DROID, although the RealSense setup is not an exact stereo-hardware match.
 
 The client accepts both the official 15x8 and custom 16x8 responses, executes
-only the configured first eight actions, and interprets each row as seven joint
+the configured first 15 actions, and interprets each row as seven joint
 velocities plus one gripper-position target. It runs at the DROID dataset rate
 of 15 Hz and prefetches the next chunk while the current chunk is executing.
 
@@ -194,7 +201,7 @@ fr3-pi05-check --prompt "pick up the red block"
 ```
 
 It opens both cameras, reads Bamboo and the gripper, makes one real GPU inference,
-checks the entire eight-action prefix, and republishes a three-second RViz
+checks the entire 15-action prefix, and republishes a three-second RViz
 preview so the camera and marker displays can subscribe. It never starts Bamboo
 streaming. To validate only local configuration and kinematics:
 
@@ -242,6 +249,9 @@ fr3-pi05-run --checkpoint pi05_droid --execute \
 ```
 
 There is no second typed confirmation: `--execute` is the explicit motion gate.
+The repository configuration sets `max_rollout_steps = 0`, so execution has no
+fixed duration and continues until Back, Ctrl+C, or a safety stop. Set it to a
+positive number in `config.toml`, or pass `--max-steps N`, to restore a limit.
 During motion, Back on the joystick, Ctrl+C, a stale camera/chunk, invalid
 action, workspace violation, joint-margin violation, gripper failure, or
 joystick disconnect stops the arm command. The Bamboo watchdog remains the

@@ -154,7 +154,7 @@ class RealSensePair:
         width: int = 640,
         height: int = 480,
         fps: int = 30,
-        wrist_vertical_flip: bool = False,
+        wrist_rotate_180: bool = False,
     ):
         if not exterior_serial or not wrist_serial:
             available = ", ".join(device["serial"] for device in discover_realsense()) or "none"
@@ -166,7 +166,7 @@ class RealSensePair:
             raise ValueError("Exterior and wrist camera serial numbers must be different")
         self.exterior = RealSenseCamera(exterior_serial, width, height, fps)
         self.wrist = RealSenseCamera(wrist_serial, width, height, fps)
-        self.wrist_vertical_flip = wrist_vertical_flip
+        self.wrist_rotate_180 = wrist_rotate_180
 
     @property
     def serials(self) -> dict[str, str]:
@@ -185,9 +185,9 @@ class RealSensePair:
 
     def snapshot(self, max_age: float = 0.25) -> dict[str, CameraFrame]:
         wrist = self.wrist.snapshot(max_age)
-        if self.wrist_vertical_flip:
+        if self.wrist_rotate_180:
             wrist = CameraFrame(
-                np.flip(wrist.image, axis=0).copy(),
+                np.rot90(wrist.image, k=2).copy(),
                 wrist.captured_monotonic,
                 wrist.hardware_timestamp,
                 wrist.frame_number,
