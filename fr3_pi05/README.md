@@ -20,25 +20,31 @@ of 15 Hz and prefetches the next chunk while the current chunk is executing.
 
 ## 1. GPU server
 
-SSH currently routes through `jump-l.icts.kuleuven.be`. Install the dedicated
-public key generated on this workstation for user `u0161364` on both the jump
-host and `10.38.32.253`. Test it with:
+SSH currently routes through `jump-l.icts.kuleuven.be`. This managed KU Leuven
+jump host does not accept a permanently registered personal public key: it
+requires a short-lived MFA SSH certificate. The `kmk` tool is already installed
+and configured for `u0161364` on this workstation. Activate and verify a
+certificate with:
 
 ```bash
-ssh -i ~/.ssh/fr3_pi05_gpu -J u0161364@jump-l.icts.kuleuven.be \
-  u0161364@10.38.32.253 hostname
+kmk renew
+kmk check
+ssh-add -l
+ssh 10.38.32.253
 ```
 
-The workstation SSH config already selects this identity for both hosts, so the
-short form `ssh 10.38.32.253` works after the key is registered.
+`kmk renew` opens the KU Leuven MFA flow. Certificates are temporary, so renew
+again when `kmk check` reports that the certificate expired. If authentication
+then succeeds on `jump-l` but fails specifically on `10.38.32.253`, the GPU host
+itself must either trust KU Leuven SSH certificates or have the workstation's
+public key added to `~/.ssh/authorized_keys`; a plain key is never installed on
+the managed jump host.
 
 After access works, copy and run the read-only inventory:
 
 ```bash
-scp -i ~/.ssh/fr3_pi05_gpu -o ProxyJump=u0161364@jump-l.icts.kuleuven.be \
-  fr3_pi05/remote/audit_host.sh u0161364@10.38.32.253:/tmp/fr3_pi05_audit.sh
-ssh -i ~/.ssh/fr3_pi05_gpu -J u0161364@jump-l.icts.kuleuven.be \
-  u0161364@10.38.32.253 'bash /tmp/fr3_pi05_audit.sh'
+scp fr3_pi05/remote/audit_host.sh 10.38.32.253:/tmp/fr3_pi05_audit.sh
+ssh 10.38.32.253 'bash /tmp/fr3_pi05_audit.sh'
 ```
 
 Do not start a download or installation until that output confirms whether an
