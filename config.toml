@@ -48,9 +48,9 @@ max = [0.80, 0.60, 1.00]
 [pi05]
 transport = "zmq"
 checkpoint = "pi05_droid"
-# The GPU workstation's dedicated robot-LAN adapter. Its primary routed address
-# remains 10.38.32.253, but inter-subnet TCP is filtered in both directions.
-server_host = "172.16.0.30"
+# The GPU workstation's campus address. TCP currently requires either an
+# approved ACL/overlay or a new dedicated Ethernet link between the hosts.
+server_host = "10.38.32.253"
 server_port = 8000
 # "connect": this workstation connects to the GPU. If that inter-subnet path is
 # filtered, use "bind" and launch the GPU wrapper with CONNECT_ENDPOINT pointing
