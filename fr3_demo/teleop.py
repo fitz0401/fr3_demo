@@ -39,6 +39,8 @@ class Mapping:
     z_up_button: int = 4  # LB
     roll_axis: int = 2  # right stick horizontal
     pitch_axis: int = 3  # right stick vertical
+    tool_y_axis: int = 4  # D-pad horizontal: left is negative, right is positive
+    tool_z_axis: int = 5  # D-pad vertical: up is negative, down is positive
     yaw_down_button: int = 7  # RT
     yaw_up_button: int = 5  # RB
 
@@ -60,12 +62,53 @@ def joystick_twist(
     return np.array(
         [
             -shape(axis(snapshot, mapping.x_axis)) * linear_speed,
-            shape(axis(snapshot, mapping.y_axis)) * linear_speed,
+            -shape(axis(snapshot, mapping.y_axis)) * linear_speed,
             z * linear_speed,
             shape(axis(snapshot, mapping.roll_axis)) * angular_speed,
             -shape(axis(snapshot, mapping.pitch_axis)) * angular_speed,
             yaw * angular_speed,
         ]
+    )
+
+
+def joystick_tool_z(
+    snapshot: JoystickSnapshot,
+    mapping: Mapping,
+    linear_speed: float,
+    deadzone: float,
+) -> float:
+    """Return D-pad translation along the current EEF Z axis."""
+
+    return -shaped_axis(axis(snapshot, mapping.tool_z_axis), deadzone=deadzone) * linear_speed
+
+
+def joystick_tool_y(
+    snapshot: JoystickSnapshot,
+    mapping: Mapping,
+    linear_speed: float,
+    deadzone: float,
+) -> float:
+    """Return D-pad translation along the current EEF Y axis."""
+
+    return shaped_axis(axis(snapshot, mapping.tool_y_axis), deadzone=deadzone) * linear_speed
+
+
+def lock_dpad_axis(tool_y: float, tool_z: float, active_axis: str | None) -> tuple[float, float, str | None]:
+    """Allow only one D-pad translation axis, retaining the first axis pressed."""
+
+    y_active = abs(tool_y) > 1e-8
+    z_active = abs(tool_z) > 1e-8
+    if (active_axis == "y" and not y_active) or (active_axis == "z" and not z_active):
+        active_axis = None
+    if active_axis is None:
+        if y_active:
+            active_axis = "y"
+        elif z_active:
+            active_axis = "z"
+    return (
+        tool_y if active_axis == "y" else 0.0,
+        tool_z if active_axis == "z" else 0.0,
+        active_axis,
     )
 
 
@@ -79,6 +122,7 @@ class BambooRobot:
         gripper_port: int,
         gripper_type: str,
         enable_gripper: bool,
+        gripper_force: float = 0.8,
     ) -> None:
         self._arm = BambooFrankaClient(
             server_ip=server_ip,
@@ -91,6 +135,7 @@ class BambooRobot:
         self._gripper_port = gripper_port
         self._gripper_type = gripper_type
         self._enable_gripper = enable_gripper
+        self._gripper_force = gripper_force
         try:
             self.state()
         except Exception as error:
@@ -160,7 +205,7 @@ class BambooRobot:
             raise RuntimeError("Bamboo failed to open gripper")
 
     def close_gripper(self) -> None:
-        result = self._gripper_client().close_gripper(speed=0.05, force=0.25, blocking=True)
+        result = self._gripper_client().close_gripper(speed=0.05, force=self._gripper_force, blocking=True)
         if not result.get("success", False):
             raise RuntimeError("Bamboo failed to close gripper")
 
@@ -247,6 +292,7 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-port", type=int, default=5555)
     parser.add_argument("--gripper-port", type=int, default=5559)
     parser.add_argument("--gripper-type", choices=("robotiq", "franka"), default="robotiq")
+    parser.add_argument("--gripper-force", type=float, default=0.8, help="normalized closing force from 0.0 to 1.0")
     parser.add_argument("--no-gripper", action="store_true")
     parser.add_argument("--joystick", default="/dev/input/js0")
     parser.add_argument("--linear-speed", type=float, default=0.08, help="maximum EEF translation speed in m/s")
@@ -320,6 +366,8 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         parser.error("--watchdog-ms must be between 50 and 500")
     if not 0.0 <= args.deadzone < 0.9:
         parser.error("--deadzone must be in [0, 0.9)")
+    if not 0.0 <= args.gripper_force <= 1.0:
+        parser.error("--gripper-force must be in [0.0, 1.0]")
     if np.any(np.asarray(args.workspace_min) >= np.asarray(args.workspace_max)):
         parser.error("each --workspace-min value must be below --workspace-max")
     if args.collect and (args.offline or args.dry_run or args.check or args.legacy_waypoints):
@@ -386,6 +434,7 @@ def run(args: argparse.Namespace) -> int:
                 args.gripper_port,
                 args.gripper_type,
                 not args.no_gripper,
+                args.gripper_force,
             )
 
         if args.collect:
@@ -432,7 +481,11 @@ def run(args: argparse.Namespace) -> int:
                 LOG.warning("Legacy waypoint mode intentionally stops after every command and will feel laggy")
 
             print("\nTeleoperation is active; moving a control commands the robot immediately.")
-            print("Left stick: X/Y | LT/LB: Z down/up | right stick: roll/pitch | RT/RB: yaw")
+            print(
+                "Left stick: X/Y | LT/LB: selected-frame Z down/up | "
+                "D-pad up/down: tool Z +/- | D-pad left/right: tool Y -/+ | "
+                "right stick: roll/pitch | RT/RB: yaw"
+            )
             controls = "A: close gripper | B: open gripper | Menu: home | Back: quit"
             if collector is not None:
                 controls += " | X: start/stop recording"
@@ -447,6 +500,7 @@ def run(args: argparse.Namespace) -> int:
             last_status = 0.0
             idle_sleep = min(0.02, args.command_period / 4.0)
             stream_period = 1.0 / args.stream_rate
+            dpad_axis_lock: str | None = None
 
             while not stop:
                 loop_started = time.monotonic()
@@ -535,9 +589,14 @@ def run(args: argparse.Namespace) -> int:
                     continue
 
                 twist = joystick_twist(snapshot, mapping, args.linear_speed, args.angular_speed, args.deadzone)
+                tool_y = joystick_tool_y(snapshot, mapping, args.linear_speed, args.deadzone)
+                tool_z = joystick_tool_z(snapshot, mapping, args.linear_speed, args.deadzone)
+                tool_y, tool_z, dpad_axis_lock = lock_dpad_axis(tool_y, tool_z, dpad_axis_lock)
+                rotation = forward_kinematics(q)[:3, :3]
                 if args.frame == "tool":
-                    rotation = forward_kinematics(q)[:3, :3]
                     twist = np.concatenate((rotation @ twist[:3], rotation @ twist[3:]))
+                twist[:3] += rotation[:, 1] * tool_y
+                twist[:3] += rotation[:, 2] * tool_z
 
                 moving = float(np.linalg.norm(twist)) > 1e-8
                 if moving:

@@ -107,8 +107,10 @@ diagnosis only; it necessarily retains the stop-and-go motion.
 | Control | Action |
 | --- | --- |
 | Left stick up/down | EEF +X/-X in the selected frame |
-| Left stick left/right | EEF -Y/+Y |
+| Left stick left/right | EEF +Y/-Y |
 | LT / LB | EEF -Z/+Z |
+| D-pad up/down | EEF tool-frame +Z/-Z (along the gripper axis) |
+| D-pad left/right | EEF tool-frame -Y/+Y |
 | Right stick left/right | EEF roll |
 | Right stick up/down | EEF pitch |
 | RT / RB | EEF negative/positive yaw |
@@ -122,6 +124,13 @@ The default frame is the robot base. For tool-relative motion, use
 `fr3-teleop --frame tool`. Homing uses closed-loop joint-velocity streaming at
 up to 0.20 rad/s by default; change the limit with `--home-speed`. Its timeout
 automatically grows for large moves and can be raised with `--home-timeout`.
+All D-pad translation is relative to the current EEF orientation, independent
+of the selected main teleoperation frame. The first D-pad axis pressed remains
+active until it is released, preventing diagonal Y+Z motion; if both axes first
+appear simultaneously, the lateral Y command takes priority.
+Gripper closing force is the normalized Bamboo value `gripper.close_force` in
+`config.toml` (default `0.8`, valid range `0.0` to `1.0`); override it for one
+run with `--gripper-force`.
 
 ## Collect demonstrations
 

@@ -143,6 +143,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-port", type=int, default=5555)
     parser.add_argument("--gripper-port", type=int, default=5559)
     parser.add_argument("--gripper-type", choices=("robotiq", "franka"), default="robotiq")
+    parser.add_argument("--gripper-force", type=float, default=0.8, help="normalized closing force from 0.0 to 1.0")
     parser.add_argument("--no-gripper", action="store_true")
     parser.add_argument("--external-camera-serial")
     parser.add_argument("--wrist-camera-serial")
@@ -230,6 +231,8 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         parser.error("camera width, height, and fps must be positive")
     if args.home_speed <= 0 or args.home_timeout <= 0:
         parser.error("home speed and timeout must be positive")
+    if not 0.0 <= args.gripper_force <= 1.0:
+        parser.error("--gripper-force must be in [0.0, 1.0]")
     if args.transport != "zmq" and args.zmq_mode != "connect":
         parser.error("--zmq-mode bind is only valid with --transport zmq")
     return args
@@ -398,6 +401,7 @@ def run(args: argparse.Namespace) -> int:
             args.gripper_port,
             args.gripper_type,
             not args.no_gripper,
+            args.gripper_force,
         )
         state, q = _state(robot)
         print(f"Bamboo: q={np.array2string(q, precision=3)}; dq_norm={np.linalg.norm(state['dq']):.4f}")

@@ -19,6 +19,7 @@ server_ip = "10.0.0.20"
 control_port = 6000
 [gripper]
 enabled = false
+close_force = 0.7
 [cameras]
 external_serial = "external"
 wrist_serial = "wrist"
@@ -53,6 +54,7 @@ max_rollout_steps = 0
             self.assertEqual(teleop["server_ip"], "10.0.0.20")
             self.assertEqual(teleop["control_port"], 6000)
             self.assertTrue(teleop["no_gripper"])
+            self.assertEqual(teleop["gripper_force"], 0.7)
             self.assertEqual(teleop["workspace_min"], [0.1, -0.2, 0.3])
             self.assertEqual(cameras["external_camera_serial"], "external")
             self.assertEqual(cameras["wrist_camera_serial"], "wrist")
@@ -62,6 +64,7 @@ max_rollout_steps = 0
             self.assertTrue(cameras["wrist_rotate_180"])
             self.assertTrue(teleop["wrist_rotate_180"])
             self.assertTrue(pi05["wrist_rotate_180"])
+            self.assertEqual(pi05["gripper_force"], 0.7)
             self.assertEqual(pi05["home_speed"], 0.18)
             self.assertEqual(pi05["home_timeout"], 20.0)
             self.assertEqual(pi05["policy_host"], "gpu")

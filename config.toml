@@ -10,6 +10,8 @@ control_port = 5555
 port = 5559
 type = "robotiq"
 enabled = true
+# Normalized Bamboo closing force (0.0 to 1.0).
+close_force = 0.8
 
 [joystick]
 device = "/dev/input/js0"
@@ -47,8 +49,8 @@ speed = 0.20
 timeout = 15.0
 
 [workspace]
-min = [0.10, -0.60, 0.05]
-max = [0.80, 0.60, 1.00]
+min = [-0.50, -0.5, 0.03]
+max = [1.00, 1.50, 1.00]
 
 # Physical Intelligence pi0.5 DROID inference and guarded execution.
 [pi05]

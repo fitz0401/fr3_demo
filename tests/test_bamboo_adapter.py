@@ -8,6 +8,26 @@ from fr3_demo.teleop import HOME_JOINTS, BambooRobot, stream_home
 
 class BambooAdapterTest(unittest.TestCase):
     @patch("fr3_demo.teleop.BambooFrankaClient")
+    def test_close_gripper_uses_configured_force(self, client_class: MagicMock) -> None:
+        arm = MagicMock()
+        arm.get_joint_states.return_value = {
+            "qpos": [0.0] * 7,
+            "dq": [0.0] * 7,
+            "tau_J": [0.0] * 7,
+            "ee_pose": np.eye(4).tolist(),
+            "time_sec": 1.0,
+        }
+        gripper = MagicMock()
+        gripper.close_gripper.return_value = {"success": True}
+        client_class.return_value = arm
+        with patch("bamboo.BambooFrankaClient", return_value=gripper):
+            robot = BambooRobot("127.0.0.1", 5555, 5559, "robotiq", True, 0.8)
+
+            robot.close_gripper()
+
+        gripper.close_gripper.assert_called_once_with(speed=0.05, force=0.8, blocking=True)
+
+    @patch("fr3_demo.teleop.BambooFrankaClient")
     def test_uses_public_bamboo_streaming_api(self, client_class: MagicMock) -> None:
         arm = MagicMock()
         arm.get_joint_states.return_value = {

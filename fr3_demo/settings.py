@@ -14,7 +14,7 @@ except ImportError:  # Python 3.10
 
 _SCHEMA: dict[str, set[str]] = {
     "robot": {"server_ip", "control_port"},
-    "gripper": {"port", "type", "enabled"},
+    "gripper": {"port", "type", "enabled", "close_force"},
     "joystick": {"device", "feedback_event"},
     "cameras": {"external_serial", "wrist_serial", "width", "height", "fps", "wrist_rotate_180"},
     "recording": {"data_dir", "fps"},
@@ -109,6 +109,7 @@ def teleop_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "control_port": robot.get("control_port"),
         "gripper_port": gripper.get("port"),
         "gripper_type": gripper.get("type"),
+        "gripper_force": gripper.get("close_force"),
         "no_gripper": None if "enabled" not in gripper else not gripper["enabled"],
         "joystick": joystick.get("device"),
         "feedback_event": joystick.get("feedback_event"),
@@ -170,6 +171,7 @@ def pi05_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "control_port": robot.get("control_port"),
         "gripper_port": gripper.get("port"),
         "gripper_type": gripper.get("type"),
+        "gripper_force": gripper.get("close_force"),
         "no_gripper": None if "enabled" not in gripper else not gripper["enabled"],
         "joystick": joystick.get("device"),
         "external_camera_serial": cameras.get("external_serial"),
