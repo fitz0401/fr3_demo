@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -27,14 +28,18 @@ def _load_rgb(path: Path) -> np.ndarray:
         return np.asarray(image.convert("RGB").resize((320, 180), resample=Image.Resampling.BICUBIC))
 
 
-def find_episodes(data_dir: Path) -> list[Path]:
-    episodes = []
-    for metadata_path in sorted(data_dir.expanduser().resolve().glob("**/episode_*/metadata.json")):
-        episode = metadata_path.parent
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if metadata.get("complete") and (episode / "trajectory.npz").is_file():
-            episodes.append(episode)
-    return episodes
+def find_episodes(data_dirs: Path | Sequence[Path]) -> list[Path]:
+    """Find unique completed episodes beneath one or more input roots."""
+
+    roots = [data_dirs] if isinstance(data_dirs, Path) else list(data_dirs)
+    episodes: set[Path] = set()
+    for data_dir in roots:
+        for metadata_path in data_dir.expanduser().resolve().glob("**/episode_*/metadata.json"):
+            episode = metadata_path.parent
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if metadata.get("complete") and (episode / "trajectory.npz").is_file():
+                episodes.add(episode)
+    return sorted(episodes)
 
 
 def _features() -> dict[str, dict[str, Any]]:
@@ -62,11 +67,17 @@ def _features() -> dict[str, dict[str, Any]]:
 
 
 def convert(
-    data_dir: Path, repo_id: str, output_root: Path | None = None, push: bool = False, public: bool = False
+    data_dirs: Path | Sequence[Path],
+    repo_id: str,
+    output_root: Path | None = None,
+    push: bool = False,
+    public: bool = False,
 ) -> Path:
-    episodes = find_episodes(data_dir)
+    episodes = find_episodes(data_dirs)
     if not episodes:
-        raise RuntimeError(f"No completed raw episodes found under {data_dir}")
+        roots = [data_dirs] if isinstance(data_dirs, Path) else list(data_dirs)
+        joined = ", ".join(str(path) for path in roots)
+        raise RuntimeError(f"No completed raw episodes found under: {joined}")
     missing_language = []
     for episode in episodes:
         metadata = json.loads((episode / "metadata.json").read_text(encoding="utf-8"))
@@ -138,13 +149,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Convert annotated FR3 demonstrations to LeRobot and optionally upload."
     )
-    parser.add_argument("--data-dir", type=Path, required=True)
+    parser.add_argument(
+        "--data-dir",
+        dest="data_dirs",
+        type=Path,
+        nargs="+",
+        action="extend",
+        required=True,
+        help="one or more session/parent directories; repeated --data-dir is also accepted",
+    )
     parser.add_argument("--repo-id", required=True, help="Hugging Face dataset id, e.g. username/fr3_task")
     parser.add_argument("--output-root", type=Path, help="defaults to LeRobot's HF_LEROBOT_HOME")
     parser.add_argument("--push-to-hub", action="store_true")
     parser.add_argument("--public", action="store_true", help="make an uploaded dataset public (default: private)")
     args = parser.parse_args(argv)
-    output = convert(args.data_dir, args.repo_id, args.output_root, args.push_to_hub, args.public)
+    output = convert(args.data_dirs, args.repo_id, args.output_root, args.push_to_hub, args.public)
     print(f"LeRobot dataset: {output}")
     return 0
 

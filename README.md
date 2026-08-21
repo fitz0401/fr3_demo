@@ -1,279 +1,211 @@
-# Franka Research 3 teleoperation and demo collection
+# FR3 teleoperation and demonstration collection
 
-This repository provides Cartesian EEF teleoperation and synchronized two-camera
-demonstration collection for an FR3 through the running
-[fitz0401 Bamboo controller](https://github.com/fitz0401/bamboo). It records a
-local, failure-preserving raw format and converts annotated episodes to the exact
-LeRobot feature layout used by OpenPI's `pi05_droid_finetune` setup.
-
-The implementation uses the official FR3 kinematic chain and converts a base- or
-tool-frame Cartesian velocity into damped-Jacobian joint velocity. A persistent
-controller on the real-time machine consumes setpoints at 30 Hz while retaining
-the 1 kHz Bamboo joint-impedance loop. Every update is bounded by a workspace
-box, joint limits, and velocity/acceleration caps.
-Controller and transport implementations live in Bamboo; this repository only
-contains the workstation-side teleoperation and demo-collection code.
-
-The repository also contains the guarded two-camera FR3 client and GPU-host
-launcher for the official OpenPI `pi05_droid` checkpoint. See
-[`fr3_pi05/README.md`](fr3_pi05/README.md) for server deployment, non-moving
-end-to-end checks, RViz trajectory visualization, and policy execution. A
-normal `fr3-pi05-run` homes the arm and opens the gripper before inference;
-`fr3-pi05-check` performs neither motion.
+Joystick teleoperation, synchronized two-RealSense recording, LeRobot
+conversion, and guarded OpenPI pi0.5 execution for a Franka Research 3. Robot
+control runs through [fitz0401/bamboo](https://github.com/fitz0401/bamboo) on
+the real-time machine; this repository runs on the operator workstation.
 
 ## Safety
 
-- Clear the workspace, inspect wrist-camera cabling, and keep the physical E-stop
-  in hand.
-- Start with `--check`, then `--dry-run`. Only omit `--dry-run` after confirming
-  the axes and EEF directions.
-- Teleoperation becomes active immediately after startup; there is no joystick
-  deadman button. Returning every motion control to neutral commands zero
-  velocity. A controller-side watchdog also brakes the arm if updates disappear
-  for 250 ms.
-- This first version enforces an EEF box and joint limits, but it does **not** do
-  environment or self-collision checking.
-- A software stop is not a replacement for the Franka physical E-stop.
+- Keep the physical E-stop ready and clear the workspace before motion.
+- Run `fr3-teleop --check`, then `fr3-teleop --dry-run`, before live control.
+- Teleoperation has no deadman button and becomes active immediately.
+- The software enforces joint and Cartesian limits, but does not provide
+  environment or self-collision avoidance.
 
-## Install
+## 1. Install
 
-Python 3.10+ is required. From this directory:
+Python 3.10 or newer is required:
 
 ```bash
+git clone git@github.com:fitz0401/fr3_demo.git
+cd fr3_demo
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e .
-```
-
-For camera collection and joystick vibration, install the recording extra:
-
-```bash
 python -m pip install -e '.[recording]'
 ```
 
-The connected BETOP controller is available as `/dev/input/js0`, and Bamboo was
-detected at `172.16.0.20:5555` with the Robotiq service on port `5559`; these are
-the defaults. To use another machine or device, pass `--server-ip` or `--joystick`.
+Install the conversion dependencies only when needed:
 
-Persistent robot, gripper, joystick, camera, recording, speed, homing, and
-workspace settings live in [`config.toml`](config.toml). All commands load this
-file automatically. Use `--config /another/file.toml` (or set
-`FR3_DEMO_CONFIG`) to select another setup; explicit command-line arguments
-remain one-run overrides.
+```bash
+python -m pip install -e '.[convert]'
+```
 
-## Validate and run
+## 2. Configure
 
-### Start Bamboo on the real-time machine
+Edit [`config.toml`](config.toml). It contains the Bamboo address, gripper,
+joystick, camera serials, motion rates, home pose, workspace, recording, and
+pi0.5 server settings. Every command loads this file automatically.
 
-Install the merged `fitz0401/bamboo` version and launch its arm and gripper
-services before starting this program:
+Useful details:
+
+- `teleop.frame = "base"` uses fixed robot-base axes; `"tool"` follows the EEF
+  orientation.
+- `workspace.min` and `workspace.max` are `[x, y, z]` in metres in the robot
+  base frame. They remain base-frame limits in tool mode.
+- `gripper.close_force` is normalized from `0.0` to `1.0`.
+- `cameras.wrist_rotate_180` changes image orientation only, not motion axes.
+
+CLI options override the file for one run. Use `--config PATH` or set
+`FR3_DEMO_CONFIG` to load a different configuration.
+
+## 3. Start and verify teleoperation
+
+On the real-time machine, start the Bamboo arm and gripper services:
 
 ```bash
 cd /path/to/bamboo
 bash RunTeleopController start --robot_ip 172.16.0.2 --robot_model fr3
 ```
 
-Do not run `RunBambooController` and `RunTeleopController` at the same time.
+Do not run `RunBambooController` and `RunTeleopController` together.
 
-Read-only hardware/model check (never sends a trajectory):
+On the operator workstation:
 
 ```bash
 source .venv/bin/activate
-fr3-teleop --check
+fr3-teleop --check       # read-only hardware and model check
+fr3-teleop --dry-run     # joystick input without robot commands
+fr3-teleop               # live control
 ```
 
-The check must report `Streaming protocol: available` before smooth live mode.
-
-Exercise the gamepad while only calculating and printing targets:
-
-```bash
-fr3-teleop --dry-run
-```
-
-Run live, initially at the conservative default of 8 cm/s, 0.35 rad/s, and a
-30 Hz setpoint rate:
-
-```bash
-fr3-teleop
-```
-
-The convenience form `python teleop.py` accepts the same options. Use
-`fr3-teleop --help` for speed, workspace, port, frame, and gripper settings.
-The old blocking Bamboo API remains available as `--legacy-waypoints` for
-diagnosis only; it necessarily retains the stop-and-go motion.
+The check must report `Streaming protocol: available`. Use
+`fr3-teleop --frame tool` for gripper-relative stick motion.
 
 ### BETOP controls
 
 | Control | Action |
 | --- | --- |
 | Left stick up/down | EEF +X/-X in the selected frame |
-| Left stick left/right | EEF +Y/-Y |
-| LT / LB | EEF -Z/+Z |
-| D-pad up/down | EEF tool-frame +Z/-Z (along the gripper axis) |
-| D-pad left/right | EEF tool-frame -Y/+Y |
-| Right stick left/right | EEF roll |
-| Right stick up/down | EEF pitch |
-| RT / RB | EEF negative/positive yaw |
-| A | Close gripper |
-| B | Open gripper |
-| X | Start/stop an episode when using `fr3-collect` |
-| Menu/Start | Move to the nominal FR3 home configuration |
-| Back/Select | Exit |
+| Left stick left/right | EEF +Y/-Y in the selected frame |
+| LT / LB | EEF -Z/+Z in the selected frame |
+| D-pad up/down | Tool-frame +Z/-Z |
+| D-pad left/right | Tool-frame -Y/+Y |
+| Right stick left/right | Roll |
+| Right stick up/down | Pitch |
+| RT / RB | Yaw -/+ |
+| A / B | Close/open gripper |
+| Menu / Back | Home/quit |
+| X | Start/stop recording in `fr3-collect` |
 
-The default frame is the robot base. For tool-relative motion, use
-`fr3-teleop --frame tool`. Homing uses closed-loop joint-velocity streaming at
-up to 0.20 rad/s by default; change the limit with `--home-speed`. Its timeout
-automatically grows for large moves and can be raised with `--home-timeout`.
-All D-pad translation is relative to the current EEF orientation, independent
-of the selected main teleoperation frame. The first D-pad axis pressed remains
-active until it is released, preventing diagonal Y+Z motion; if both axes first
-appear simultaneously, the lateral Y command takes priority.
-Gripper closing force is the normalized Bamboo value `gripper.close_force` in
-`config.toml` (default `0.8`, valid range `0.0` to `1.0`); override it for one
-run with `--gripper-force`.
+D-pad commands always use the tool frame. Its Y and Z axes are mutually
+exclusive, so diagonal input cannot command both directions simultaneously.
 
-## Collect demonstrations
+## 4. Collect demonstrations
 
-### 1. Assign and preview the cameras
-
-List the connected RealSense devices:
+Check the camera assignment before recording:
 
 ```bash
 fr3-camera-list
-```
-
-This workstation currently detects these two serials:
-
-```text
-309622300781  Intel RealSense D456
-047322071010  Intel RealSense D435I
-```
-
-The configured assignment is D435I (`047322071010`) as the exterior view and
-D456 (`309622300781`) as the wrist view. Both stream RGB at 424x240 and 30 Hz.
-Verify the physical views in RViz and swap `cameras.external_serial` and
-`cameras.wrist_serial` in the file if the displays are reversed:
-
-```bash
 source /opt/ros/humble/setup.bash
 fr3-camera-rviz
 ```
 
-The upside-down wrist mount is corrected with a 180-degree rotation controlled
-by `cameras.wrist_rotate_180 = true`. To temporarily inspect the unrotated image
-without changing the shared configuration, run:
+Use `fr3-camera-rviz --no-wrist-rotate-180` to inspect the raw wrist
+orientation. Stop the preview before collection because a RealSense device can
+only have one owner.
 
-```bash
-fr3-camera-rviz --no-wrist-rotate-180
-```
-
-The same one-run override works with `fr3-teleop`, `fr3-collect`,
-`fr3-pi05-check`, and `fr3-pi05-run`. To disable rotation persistently, set
-`wrist_rotate_180 = false` under `[cameras]` in `config.toml`.
-
-The preview publishes `/fr3_demo/exterior_image_left` and
-`/fr3_demo/wrist_image`. Stop it with Ctrl+C before collection because a
-RealSense device cannot be owned by the preview and recorder simultaneously.
-
-### 2. Record episodes
-
-With `RunTeleopController` still running on the real-time machine:
+Start collection:
 
 ```bash
 source .venv/bin/activate
 fr3-collect
 ```
 
-Camera serials and all normal collection parameters are read from `config.toml`.
+- Press X once to start: `⬆️ Recording started` and one vibration.
+- Press X again to finish: `✅ Recording stopped` and two vibrations.
+- Stop recording before homing. Back exits and safely finalizes an active
+  episode.
 
-- Press X once to start. One vibration confirms recording.
-- Teleoperate and use the gripper normally.
-- Press X again to finish. Two vibrations confirm that the episode was safely
-  finalized.
-- Repeat for more episodes. Back exits; an active episode is finalized first.
-- Homing is rejected while recording; stop the episode before pressing Menu.
+Sessions are stored under `data/raw/session_YYYYMMDD_HHMMSS`. Incomplete
+episodes retain an `.inprogress` suffix and are ignored during conversion.
 
-The recorder samples two RGB streams, robot joint state, commanded joint
-velocity, and normalized gripper state/action at 15 Hz. Camera capture and JPEG
-encoding run outside the 30 Hz control loop. Completed sessions are placed under
-`data/raw/session_YYYYMMDD_HHMMSS`; an interrupted episode retains the
-`.inprogress` suffix and is never converted or uploaded.
+## 5. Add language instructions
 
-### 3. Add language
-
-After exiting, annotate each episode interactively:
+Annotate every episode separately:
 
 ```bash
 fr3-annotate --data-dir data/raw/session_YYYYMMDD_HHMMSS
 ```
 
-To apply one instruction to every unannotated episode in a session:
+Prompt once and label every currently unlabeled episode, preserving existing
+labels:
 
 ```bash
-fr3-annotate \
-  --data-dir data/raw/session_YYYYMMDD_HHMMSS \
-  --language "pick up the red block and place it in the bowl"
+fr3-annotate --data-dir data/raw/session_YYYYMMDD_HHMMSS --all
 ```
 
-### 4. Convert to LeRobot and upload
-
-Install the conversion extra. It pins the same LeRobot revision used by the
-current OpenPI repository (LeRobot pulls a full ML stack, including PyTorch):
+For non-interactive use:
 
 ```bash
-python -m pip install -e '.[convert]'
-hf auth login
+fr3-annotate --data-dir data/raw/session_YYYYMMDD_HHMMSS \
+  --language "pick up the object and place it in the bowl"
 ```
 
-If OpenPI is already installed, its locked environment is preferable and avoids
-installing that stack twice:
+## 6. Convert to LeRobot
 
-```bash
-cd /path/to/openpi
-uv sync
-uv pip install -e /home/u0161364/fr3_demo
-uv run hf auth login
-uv run fr3-convert --help
-```
-
-Convert and upload (private by default):
+Convert locally first:
 
 ```bash
 fr3-convert \
-  --data-dir data/raw/session_YYYYMMDD_HHMMSS \
-  --repo-id YOUR_HF_USERNAME/fr3_task \
+  --data-dir data/raw/session_GIN data/raw/session_LILLET \
+  --repo-id USERNAME/fr3_task \
+  --output-root data/lerobot
+```
+
+Provide one or more paths after `--data-dir`. Each path is recursive, overlapping
+inputs are deduplicated, and every episode retains its own language instruction.
+Repeating the option also works, but the one-flag form above is shorter.
+
+After inspecting the local result, upload it privately:
+
+```bash
+hf auth login
+fr3-convert \
+  --data-dir data/raw/session_GIN data/raw/session_LILLET \
+  --repo-id USERNAME/fr3_task \
   --output-root data/lerobot \
   --push-to-hub
 ```
 
-Add `--public` only if the images and demonstrations are safe to publish. Omit
-`--push-to-hub` to validate the local dataset first. The converter refuses
-missing language, incomplete episodes, mismatched frame counts, and an existing
-output directory so it does not silently overwrite data.
+Add `--public` only when the images are safe to publish. Conversion rejects
+missing language, mismatched frames, and an existing output directory. The
+output follows the OpenPI DROID layout with exterior and wrist RGB, joint and
+gripper state, eight-dimensional actions, and per-episode tasks. The required
+second exterior image is a black compatibility field ignored by pi0.5.
 
-The resulting DROID-style LeRobot schema is:
+## 7. Run pi0.5
 
-| LeRobot feature | Recorded source |
+GPU deployment, checkpoint selection, networking, safety checks, and RViz
+instructions are in [fr3_pi05/README.md](fr3_pi05/README.md).
+
+On the operator workstation:
+
+```bash
+fr3-pi05-check --checkpoint pi05_droid --prompt "task instruction"
+fr3-pi05-run --checkpoint pi05_droid --execute --prompt "task instruction"
+```
+
+`fr3-pi05-check` never moves the robot. `fr3-pi05-run` homes the arm and opens
+the gripper before inference; policy motion additionally requires `--execute`.
+
+## Commands
+
+| Command | Purpose |
 | --- | --- |
-| `exterior_image_1_left` | `exterior_image_left`, resized to 320x180 RGB |
-| `wrist_image_left` | `wrist_image`, resized to 320x180 RGB |
-| `exterior_image_2_left` | Black compatibility view; pi0.5 masks/ignores it |
-| `joint_position` | Seven measured FR3 joint positions |
-| `gripper_position` | Normalized measured opening, shape 1 |
-| `actions` | Seven commanded joint velocities plus gripper target |
-| `task` | Your episode language instruction |
+| `fr3-teleop` | Joystick teleoperation |
+| `fr3-collect` | Teleoperation with synchronized recording |
+| `fr3-camera-list` | List RealSense serial numbers |
+| `fr3-camera-rviz` | Preview both cameras in RViz |
+| `fr3-annotate` | Add episode language instructions |
+| `fr3-convert` | Build and optionally upload a LeRobot dataset |
+| `fr3-pi05-check` | Non-moving policy integration check |
+| `fr3-pi05-run` | Guarded pi0.5 rollout |
 
-In OpenPI, set `repo_id` in the `pi05_droid_finetune` configuration to the Hub
-dataset ID above. That configuration uses `LeRobotDROIDDataConfig`, the
-pi0.5-DROID checkpoint, and its original DROID normalization statistics.
+Use `COMMAND --help` for all options.
 
 ## Tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
-
-The tests verify FK against a read-only pose sampled from the current Bamboo/FR3
-setup, validate the Jacobian numerically, exercise input shaping and safety
-limits, atomically finalize a synthetic raw episode, and validate the OpenPI
-DROID conversion schema without moving hardware.

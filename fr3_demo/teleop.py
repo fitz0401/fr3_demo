@@ -512,7 +512,7 @@ def run(args: argparse.Namespace) -> int:
                         completed = collector.stop_episode()
                         collector.set_action(np.zeros(7))
                         rumbler.recording_stopped()
-                        print(f"\nRecording stopped: {completed}")
+                        print(f"\n✅ Recording stopped: {completed}")
                     break
 
                 if collector is not None:
@@ -537,11 +537,11 @@ def run(args: argparse.Namespace) -> int:
                     if collector.active:
                         completed = collector.stop_episode()
                         rumbler.recording_stopped()
-                        print(f"\nRecording stopped: {completed}")
+                        print(f"\n✅ Recording stopped: {completed}")
                     else:
                         pending = collector.start_episode()
                         rumbler.recording_started()
-                        print(f"\nRecording started: {pending}")
+                        print(f"\n⬆️ Recording started: {pending}")
                     continue
 
                 if home_requested:
@@ -662,7 +662,7 @@ def run(args: argparse.Namespace) -> int:
             try:
                 completed = collector.close()
                 if completed is not None:
-                    print(f"Recording stopped during shutdown: {completed}")
+                    print(f"✅ Recording stopped during shutdown: {completed}")
             except Exception as error:  # noqa: BLE001 - shutdown must continue to camera and robot cleanup
                 LOG.error("Could not finalize active recording: %s", error)
         if cameras is not None:

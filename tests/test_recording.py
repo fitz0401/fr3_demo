@@ -53,11 +53,18 @@ class RawRecordingTest(unittest.TestCase):
     def test_conversion_matches_openpi_droid_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            episode = _write_episode(root / "raw")
-            metadata_path = episode / "metadata.json"
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            metadata["language_instruction"] = "pick up the block"
-            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            first_root = root / "raw_a"
+            second_root = root / "raw_b"
+            first_episode = _write_episode(first_root)
+            second_episode = _write_episode(second_root)
+            for episode, language in (
+                (first_episode, "pick up the block"),
+                (second_episode, "pour the liquid"),
+            ):
+                metadata_path = episode / "metadata.json"
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                metadata["language_instruction"] = language
+                metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
             class FakeDataset:
                 instance = None
@@ -78,19 +85,24 @@ class RawRecordingTest(unittest.TestCase):
                     self.saved += 1
 
             with patch("fr3_demo.convert_lerobot._load_lerobot_dataset", return_value=FakeDataset):
-                output = convert(root / "raw", "test/fr3", output_root=root / "datasets")
+                output = convert(
+                    [first_root, first_root, second_root],
+                    "test/fr3",
+                    output_root=root / "datasets",
+                )
 
             dataset = FakeDataset.instance
             self.assertEqual(output, root / "converted")
             self.assertEqual(dataset.create_args["fps"], 15)
-            self.assertEqual(dataset.saved, 1)
-            self.assertEqual(len(dataset.frames), 2)
+            self.assertEqual(dataset.saved, 2)
+            self.assertEqual(len(dataset.frames), 4)
             frame = dataset.frames[0]
             self.assertEqual(frame["exterior_image_1_left"].shape, (180, 320, 3))
             self.assertEqual(frame["wrist_image_left"].shape, (180, 320, 3))
             self.assertFalse(frame["exterior_image_2_left"].any())
             self.assertEqual(frame["actions"].shape, (8,))
             self.assertEqual(frame["task"], "pick up the block")
+            self.assertEqual(dataset.frames[-1]["task"], "pour the liquid")
 
 
 if __name__ == "__main__":
