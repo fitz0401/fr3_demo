@@ -10,7 +10,7 @@ PORT=${PORT:-8000}
 CONNECT_ENDPOINT=${CONNECT_ENDPOINT:-}
 
 if [ -z "$OPENPI_DIR" ] || [ -z "$FR3_DEMO_DIR" ] || [ -z "$CHECKPOINT" ]; then
-  echo "Usage: CUDA_VISIBLE_DEVICES=<A6000-index> PORT=<port> $0 /path/to/openpi /path/to/fr3_demo /local/checkpoint [pi05_droid|custom_droid]" >&2
+  echo "Usage: CUDA_VISIBLE_DEVICES=<A6000-index> PORT=<port> $0 /path/to/openpi /path/to/fr3_demo /local/checkpoint [pi05_droid|custom_droid|wine_hybrid]" >&2
   exit 2
 fi
 if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
@@ -35,6 +35,7 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 2
 fi
 
+CUSTOM_ASSET_ID=
 case "$MODEL_PROFILE" in
   pi05_droid)
     LOADER=official
@@ -43,25 +44,34 @@ case "$MODEL_PROFILE" in
   custom_droid)
     LOADER=custom_droid
     CONFIG_NAME=pi05_droid
-    if [ ! -f "$CHECKPOINT/serve_custom_droid.py" ]; then
-      echo "Custom loader is missing: $CHECKPOINT/serve_custom_droid.py" >&2
-      exit 2
-    fi
-    if [ ! -f "$CHECKPOINT/assets/fitz0401/custom_droid/norm_stats.json" ]; then
-      echo "Custom normalization statistics are missing; refusing stock DROID statistics." >&2
-      exit 2
-    fi
-    if ! grep -q 'gemma_2b_lora_r32' "$OPENPI_DIR/src/openpi/models/gemma.py" 2>/dev/null; then
-      echo "The custom checkpoint deploy.patch is not applied to this OpenPI checkout." >&2
-      echo "Follow $CHECKPOINT/DEPLOY.md before launching custom_droid." >&2
-      exit 2
-    fi
+    CUSTOM_ASSET_ID=fitz0401/custom_droid
+    ;;
+  wine_hybrid)
+    LOADER=custom_droid
+    CONFIG_NAME=pi05_droid
+    CUSTOM_ASSET_ID=fitz0401/franka_pour_wine
     ;;
   *)
-    echo "Unknown model profile: $MODEL_PROFILE (expected pi05_droid or custom_droid)" >&2
+    echo "Unknown model profile: $MODEL_PROFILE (expected pi05_droid, custom_droid, or wine_hybrid)" >&2
     exit 2
     ;;
 esac
+if [ "$LOADER" = custom_droid ]; then
+  if [ ! -f "$CHECKPOINT/serve_custom_droid.py" ]; then
+    echo "Custom loader is missing: $CHECKPOINT/serve_custom_droid.py" >&2
+    exit 2
+  fi
+  if [ ! -f "$CHECKPOINT/assets/$CUSTOM_ASSET_ID/norm_stats.json" ]; then
+    echo "Normalization statistics are missing: $CHECKPOINT/assets/$CUSTOM_ASSET_ID/norm_stats.json" >&2
+    echo "Refusing to substitute stock DROID or another task's statistics." >&2
+    exit 2
+  fi
+  if ! grep -q 'gemma_2b_lora_r32' "$OPENPI_DIR/src/openpi/models/gemma.py" 2>/dev/null; then
+    echo "The custom checkpoint deploy.patch is not applied to this OpenPI checkout." >&2
+    echo "Follow the custom checkpoint deployment instructions before launching." >&2
+    exit 2
+  fi
+fi
 
 cd "$OPENPI_DIR"
 export PYTHONPATH="$FR3_DEMO_DIR${PYTHONPATH:+:$PYTHONPATH}"

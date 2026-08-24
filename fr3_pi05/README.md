@@ -78,13 +78,14 @@ eno1:     172.16.0.3/24
 `ping -c 3 172.16.0.30` must succeed from the robot workstation before starting
 inference. Do not add a gateway or DNS server to the dedicated connection.
 
-This deployment uses two checkpoints already managed on the GPU host and never
+This deployment uses checkpoints already managed on the GPU host and never
 downloads checkpoint weights itself:
 
 | Local selection | GPU checkpoint | ZMQ port |
 | --- | --- | --- |
 | `pi05_droid` | `/mnt/data/yurui/.cache/openpi/openpi-assets/checkpoints/pi05_droid` | 8000 |
 | `custom_droid` | `/mnt/data/yurui/models/pi05_custom_droid_14999` | 8001 |
+| `wine_hybrid` | `/mnt/data/yurui/models/pi05_wine_hybrid_17500` | 8002 |
 
 The audit confirmed both checkpoints. The custom checkpoint is loaded through
 its own `serve_custom_droid.py`, including `gemma_2b_lora_r32`, its 16-step
@@ -120,6 +121,20 @@ CUDA_VISIBLE_DEVICES=1 PORT=8001 \
   "$HOME/fr3_demo" \
   /mnt/data/yurui/models/pi05_custom_droid_14999 \
   custom_droid
+```
+
+The wine checkpoint uses the same hybrid model loader but its own
+`fitz0401/franka_pour_wine` normalization statistics. Its copied loader must
+reference that asset ID rather than `fitz0401/custom_droid`. Start it on port
+8002:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PORT=8002 \
+  bash fr3_pi05/remote/start_pi05_zmq_server.sh \
+  /mnt/data/yurui/openpi \
+  "$HOME/fr3_demo" \
+  /mnt/data/yurui/models/pi05_wine_hybrid_17500 \
+  wine_hybrid
 ```
 
 The launcher refuses a missing local checkpoint path. The large models remain
@@ -179,7 +194,7 @@ source /opt/ros/humble/setup.bash
 All transport, direction, host, port, camera, Bamboo, rate, and safety values live in the
 shared `config.toml` under `[pi05]`. The default is `transport = "zmq"`, host
 `172.16.0.30`, and checkpoint `pi05_droid`. Ports are selected automatically:
-8000 for `pi05_droid`, 8001 for `custom_droid`. With the selected GPU ZMQ server
+8000 for `pi05_droid`, 8001 for `custom_droid`, and 8002 for `wine_hybrid`. With the selected GPU ZMQ server
 ready, first run the network-only metadata check. It does not open the cameras
 or Bamboo:
 

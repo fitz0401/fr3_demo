@@ -35,10 +35,10 @@ speed = 0.18
 timeout = 20.0
 [pi05]
 transport = "zmq"
-checkpoint = "custom_droid"
+checkpoint = "wine_hybrid"
 server_host = "gpu"
 server_port = 8001
-server_ports = { pi05_droid = 8000, custom_droid = 8001 }
+server_ports = { pi05_droid = 8000, custom_droid = 8001, wine_hybrid = 8002 }
 zmq_mode = "bind"
 zmq_bind_host = "0.0.0.0"
 open_loop_horizon = 15
@@ -69,8 +69,8 @@ max_rollout_steps = 0
             self.assertEqual(pi05["home_timeout"], 20.0)
             self.assertEqual(pi05["policy_host"], "gpu")
             self.assertEqual(pi05["transport"], "zmq")
-            self.assertEqual(pi05["checkpoint"], "custom_droid")
-            self.assertEqual(pi05["policy_port"], 8001)
+            self.assertEqual(pi05["checkpoint"], "wine_hybrid")
+            self.assertEqual(pi05["policy_port"], 8002)
             self.assertEqual(pi05["zmq_mode"], "bind")
             self.assertEqual(pi05["zmq_bind_host"], "0.0.0.0")
             self.assertEqual(pi05["open_loop_horizon"], 15)

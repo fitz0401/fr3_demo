@@ -129,7 +129,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=default_config_path())
     parser.add_argument("--prompt", help="language instruction; prompted interactively when omitted")
     parser.add_argument("--transport", choices=("zmq", "websocket"), default="zmq")
-    parser.add_argument("--checkpoint", choices=("pi05_droid", "custom_droid"), default="pi05_droid")
+    parser.add_argument(
+        "--checkpoint",
+        choices=("pi05_droid", "custom_droid", "wine_hybrid"),
+        default="pi05_droid",
+    )
     parser.add_argument("--policy-host", default="10.38.32.253")
     parser.add_argument("--policy-port", type=int, default=8000)
     parser.add_argument(
