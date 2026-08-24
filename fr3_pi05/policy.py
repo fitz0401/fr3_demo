@@ -53,7 +53,7 @@ class ProprioHistory:
         if not self.ready:
             raise RuntimeError(f"Proprio history needs {self.required_samples} samples; got {self.sample_count}")
         selected = [self._samples[-1 - offset] for offset in self.offsets]
-        joints = np.concatenate([sample[0] for sample in selected]).astype(np.float32, copy=False)
+        joints = np.stack([sample[0] for sample in selected]).astype(np.float32, copy=False)
         gripper = np.asarray([sample[1] for sample in selected], dtype=np.float32)
         return joints, gripper
 
@@ -77,6 +77,17 @@ def _resize(image: np.ndarray) -> np.ndarray:
     return np.asarray(result)
 
 
+def _resize_wine(image: np.ndarray) -> np.ndarray:
+    """Match the 320x180 LeRobot frames used by the wine training pipeline."""
+
+    try:
+        from PIL import Image
+    except ImportError as error:
+        raise RuntimeError("pi0.5 image support is missing; run: pip install -e '.[pi05]'") from error
+    source = Image.fromarray(np.asarray(image, dtype=np.uint8))
+    return np.asarray(source.resize((320, 180), resample=Image.Resampling.BICUBIC))
+
+
 def build_droid_observation(
     exterior_image: np.ndarray,
     wrist_image: np.ndarray,
@@ -87,8 +98,8 @@ def build_droid_observation(
     """Build the exact observation dictionary expected by ``pi05_droid``."""
 
     joints = np.asarray(joint_position, dtype=np.float32)
-    if joints.shape not in ((7,), (21,)) or not np.all(np.isfinite(joints)):
-        raise ValueError("DROID observation requires 7 or 21 finite joint positions")
+    if joints.shape not in ((7,), (3, 7)) or not np.all(np.isfinite(joints)):
+        raise ValueError("DROID observation requires joint positions shaped (7,) or (3, 7)")
     if not prompt.strip():
         raise ValueError("A non-empty language instruction is required")
     gripper = np.asarray(gripper_position, dtype=np.float32)
@@ -96,9 +107,10 @@ def build_droid_observation(
         gripper = gripper.reshape(1)
     if gripper.shape not in ((1,), (3,)) or not np.all(np.isfinite(gripper)):
         raise ValueError("DROID observation requires 1 or 3 finite gripper positions")
+    resize_image = _resize_wine if joints.shape == (3, 7) else _resize
     return {
-        "observation/exterior_image_1_left": _resize(np.asarray(exterior_image, dtype=np.uint8)),
-        "observation/wrist_image_left": _resize(np.asarray(wrist_image, dtype=np.uint8)),
+        "observation/exterior_image_1_left": resize_image(np.asarray(exterior_image, dtype=np.uint8)),
+        "observation/wrist_image_left": resize_image(np.asarray(wrist_image, dtype=np.uint8)),
         "observation/joint_position": joints,
         "observation/gripper_position": np.clip(gripper, 0.0, 1.0).astype(np.float32, copy=False),
         "prompt": prompt.strip(),

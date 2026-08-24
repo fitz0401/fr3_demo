@@ -44,7 +44,7 @@ in ways that do not raise.**
 | key | shape | notes |
 | --- | --- | --- |
 | `observation/exterior_image_1_left` | `(H, W, 3)` uint8 | resized to 224x224 internally |
-| `observation/wrist_image_left` | `(H, W, 3)` uint8 | send **as the camera produces it**, do not rotate |
+| `observation/wrist_image_left` | `(H, W, 3)` uint8 | match the training reference; this rig rotates raw wrist frames 180° |
 | `observation/joint_position` | **`(3, 7)`** float | **current first**, then the t-45 and t-75 frames |
 | `observation/gripper_position` | **`(3,)`** or `(3, 1)` float | same ordering |
 | `prompt` | str | **mandatory**, one of the two task strings |
@@ -53,9 +53,10 @@ Response: `actions`, shape `(16, 8)`, dtype **float64**. Columns 0-6 are joint *
 in rad/s, column 7 is the gripper position in [0, 1]. 16 steps at 15 fps = 1.07 s per chunk.
 
 **The state history is the client's job.** Keep a ring buffer of proprioception and send frames t,
-t-45 and t-75 (3 s and 5 s back at 15 fps). Before 75 frames have elapsed, repeat the current frame
--- that is exactly what the training pipeline does at the start of an episode. Sending a single
-unstacked frame raises rather than silently meaning something else.
+t-45 and t-75 (3 s and 5 s back at 15 fps). For a lag before episode start, repeat the startup
+sample; LeRobot clamps negative indices to the episode's first frame. The FR3 client instead fills
+five seconds of stationary home-state history before its first request, so every lag is available.
+Sending a single unstacked frame raises rather than silently meaning something else.
 
 **The prompt is mandatory by design.** The two tasks share a scene and differ only in the
 instruction, so a default would quietly pour the wrong bottle. A request without a prompt is

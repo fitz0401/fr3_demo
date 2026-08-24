@@ -14,8 +14,8 @@ old contract:
    t-75 (3 s and 5 s at 15 fps) so that it can tell "carrying the bottle to the glass" from
    "carrying it back" -- pi0.5 has no memory of its own. The client keeps the buffer and sends
    `observation/joint_position` with shape (3, 7) and `observation/gripper_position` with shape
-   (3,) or (3, 1), **current first**. Before 75 frames have elapsed, repeat the current frame; that
-   is what the training pipeline does at the start of an episode.
+   (3,) or (3, 1), **current first**. Before a lag is available, repeat the startup frame; this
+   matches LeRobot clamping negative history indices to the episode's first frame.
 
 2. **The prompt is mandatory.** This model was trained on two tasks that share a scene and differ
    only in the instruction. A default would silently pour the wrong bottle, so a request without a
@@ -28,7 +28,6 @@ import time
 
 import numpy as np
 import tyro
-
 from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.models import pi0_config
@@ -36,6 +35,8 @@ from openpi.policies import droid_policy
 from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
+
+LOG = logging.getLogger("pi05_wine")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -176,20 +177,19 @@ def self_test(policy) -> None:
         return {
             "observation/exterior_image_1_left": rng.integers(0, 256, (180, 320, 3), dtype=np.uint8),
             "observation/wrist_image_left": rng.integers(0, 256, (180, 320, 3), dtype=np.uint8),
-            # Current first, then t-45 and t-75. Here they are identical, which is what a client
-            # should send during the first 75 frames after startup.
+            # Current first, then t-45 and t-75. At episode startup all three are the first sample.
             "observation/joint_position": np.tile(rng.uniform(-1, 1, 7), (NUM_STATE_FRAMES, 1)),
             "observation/gripper_position": np.full((NUM_STATE_FRAMES,), 0.9),
             "prompt": task,
         }
 
-    logging.info(f"state contract: {NUM_STATE_FRAMES} stacked frames, lags {STATE_HISTORY_LAGS} (current first)")
-    logging.info("first call includes JIT compilation and is much slower")
+    LOG.info(f"state contract: {NUM_STATE_FRAMES} stacked frames, lags {STATE_HISTORY_LAGS} (current first)")
+    LOG.info("first call includes JIT compilation and is much slower")
     for task in TASKS:
         for i in range(2):
             t0 = time.monotonic()
             actions = policy.infer(example(task))["actions"]
-            logging.info(f"{task!r} call {i}: {(time.monotonic() - t0) * 1000:8.1f} ms  {actions.shape} {actions.dtype}")
+            LOG.info(f"{task!r} call {i}: {(time.monotonic() - t0) * 1000:8.1f} ms  {actions.shape} {actions.dtype}")
 
     # A missing prompt must fail loudly rather than default to one of the two tasks.
     bad = example(TASKS[0])
@@ -197,9 +197,9 @@ def self_test(policy) -> None:
     try:
         policy.infer(bad)
     except Exception as e:  # noqa: BLE001 - we only care that it refuses
-        logging.info(f"request without a prompt correctly rejected: {type(e).__name__}: {e}")
+        LOG.info(f"request without a prompt correctly rejected: {type(e).__name__}: {e}")
     else:
-        logging.error("A request without a prompt was ACCEPTED -- the server would guess the task.")
+        LOG.error("A request without a prompt was ACCEPTED -- the server would guess the task.")
 
     # A single (unstacked) state must also fail, rather than silently mean something else.
     stale = example(TASKS[0])
@@ -208,11 +208,11 @@ def self_test(policy) -> None:
     try:
         policy.infer(stale)
     except ValueError as e:
-        logging.info(f"single-frame state correctly rejected: {e}")
+        LOG.info(f"single-frame state correctly rejected: {e}")
     else:
-        logging.error("A single-frame state was ACCEPTED -- history would be silently wrong.")
+        LOG.error("A single-frame state was ACCEPTED -- history would be silently wrong.")
 
-    logging.info("self-test OK")
+    LOG.info("self-test OK")
 
 
 def main(args: Args) -> None:
@@ -225,7 +225,7 @@ def main(args: Args) -> None:
     if args.self_test:
         self_test(policy)
         return
-    logging.info(
+    LOG.info(
         f"serving on {args.host}:{args.port}; action expert {args.action_expert_variant}; "
         f"prompt is mandatory, one of {TASKS}"
     )

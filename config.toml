@@ -70,10 +70,11 @@ control_hz = 15.0
 stream_hz = 30.0
 open_loop_horizon = 15
 prefetch_actions = 4
-# Begin conservatively. DROID actions are joint velocities in rad/s.
-max_joint_speed = 0.20
-max_joint_acceleration = 1.0
-joint_margin = 0.10
+# Match the controller envelope used while collecting the wine demonstrations.
+# Workspace and joint-limit prediction remain active for every policy action.
+max_joint_speed = 0.35
+max_joint_acceleration = 1.5
+joint_margin = 0.08
 watchdog_ms = 250
 max_camera_age = 0.25
 max_inference_age = 3.0

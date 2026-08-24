@@ -20,8 +20,8 @@ index 0000000..0ae23d5
 +   t-75 (3 s and 5 s at 15 fps) so that it can tell "carrying the bottle to the glass" from
 +   "carrying it back" -- pi0.5 has no memory of its own. The client keeps the buffer and sends
 +   `observation/joint_position` with shape (3, 7) and `observation/gripper_position` with shape
-+   (3,) or (3, 1), **current first**. Before 75 frames have elapsed, repeat the current frame; that
-+   is what the training pipeline does at the start of an episode.
++   (3,) or (3, 1), **current first**. Before a lag is available, repeat the startup frame; this
++   matches LeRobot clamping negative history indices to the episode's first frame.
 +
 +2. **The prompt is mandatory.** This model was trained on two tasks that share a scene and differ
 +   only in the instruction. A default would silently pour the wrong bottle, so a request without a
@@ -182,8 +182,7 @@ index 0000000..0ae23d5
 +        return {
 +            "observation/exterior_image_1_left": rng.integers(0, 256, (180, 320, 3), dtype=np.uint8),
 +            "observation/wrist_image_left": rng.integers(0, 256, (180, 320, 3), dtype=np.uint8),
-+            # Current first, then t-45 and t-75. Here they are identical, which is what a client
-+            # should send during the first 75 frames after startup.
++            # Current first, then t-45 and t-75. At episode startup all three are the first sample.
 +            "observation/joint_position": np.tile(rng.uniform(-1, 1, 7), (NUM_STATE_FRAMES, 1)),
 +            "observation/gripper_position": np.full((NUM_STATE_FRAMES,), 0.9),
 +            "prompt": task,
@@ -1446,7 +1445,7 @@ index 55bdb41..69850e6 100644
 +    At inference the client sends the same stacked arrays -- shape `(1 + len(lags), 7)` for
 +    `joint_position` and `(1 + len(lags),)` or `(1 + len(lags), 1)` for `gripper_position`, in the same
 +    order -- so no separate code path is needed. When fewer than `lag` frames have elapsed the client
-+    should repeat the current frame, which is what LeRobot's clamping does during training.
++    should repeat the startup frame, matching LeRobot's first-frame clamping during training.
 +    """
 +
 +    model_type: _model.ModelType

@@ -19,8 +19,8 @@ The three things most likely to be got wrong:
 1. **State is three stacked frames, not one.** `observation/joint_position` is `(3, 7)` and
    `observation/gripper_position` is `(3,)`, ordered **current first**, then t-45 and t-75 frames
    (3 s and 5 s back at 15 fps). Index 0 is the present; reading it as a lag trains and runs fine
-   while feeding the model a stale state. Repeat the current frame until 75 frames have elapsed,
-   which is what the training pipeline does at the start of an episode.
+   while feeding the model a stale state. For unavailable negative history, repeat the episode's
+   startup frame, matching LeRobot's first-frame clamping.
 2. **The prompt is mandatory.** The two tasks share a scene and differ only in the instruction, so a
    default would quietly pour the wrong bottle. Requests without one are rejected.
 3. **Actions are joint velocities**, `(16, 8)` float64: seven joint rates in rad/s plus a gripper

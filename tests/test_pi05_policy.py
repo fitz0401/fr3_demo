@@ -44,9 +44,9 @@ class Pi05PolicyTest(unittest.TestCase):
 
         joints, gripper = history.observation()
 
-        self.assertEqual(joints.shape, (21,))
+        self.assertEqual(joints.shape, (3, 7))
         self.assertEqual(gripper.shape, (3,))
-        np.testing.assert_array_equal(joints.reshape(3, 7)[:, 0], [75, 30, 0])
+        np.testing.assert_array_equal(joints[:, 0], [75, 30, 0])
         np.testing.assert_allclose(gripper, [0.75, 0.30, 0.0])
 
     @patch("fr3_pi05.policy._resize", side_effect=lambda image: image[:224, :224])
@@ -55,13 +55,15 @@ class Pi05PolicyTest(unittest.TestCase):
         observation = build_droid_observation(
             image,
             image,
-            np.zeros(21),
+            np.zeros((3, 7)),
             np.array([1.0, 0.5, 0.0]),
             "pour the wine",
         )
 
-        self.assertEqual(observation["observation/joint_position"].shape, (21,))
+        self.assertEqual(observation["observation/joint_position"].shape, (3, 7))
         self.assertEqual(observation["observation/gripper_position"].shape, (3,))
+        self.assertEqual(observation["observation/exterior_image_1_left"].shape, (180, 320, 3))
+        self.assertEqual(observation["observation/wrist_image_left"].shape, (180, 320, 3))
 
     def test_current_pi05_horizon_is_accepted_and_clipped(self) -> None:
         response = {"actions": np.full((15, 8), 2.0)}

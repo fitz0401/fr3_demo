@@ -11,10 +11,11 @@ The official OpenPI WebSocket transport remains selectable as a fallback.
 
 The exact request fields are:
 
-- `observation/exterior_image_1_left`: exterior RGB, padded to 224x224;
-- `observation/wrist_image_left`: wrist RGB, padded to 224x224;
-- `observation/joint_position`: seven measured FR3 joint positions (21 for
-  `wine_hybrid`: current, t-45, t-75);
+- `observation/exterior_image_1_left`: exterior RGB, padded to 224x224 for
+  DROID/custom or resized to the wine training geometry of 320x180;
+- `observation/wrist_image_left`: wrist RGB with the same profile-specific resize;
+- `observation/joint_position`: seven measured FR3 joint positions (`(3, 7)`
+  for `wine_hybrid`: current, t-45, t-75);
 - `observation/gripper_position`: one normalized opening value (three for
   `wine_hybrid`, with the same history offsets);
 - `prompt`: the operator's language instruction.
@@ -46,10 +47,11 @@ latest frame at DROID's 15 Hz control rate and applies OpenPI's official 224x224
 padded resize. The wrist D456 remains close to the wide ZED Mini geometry used
 by DROID, although the RealSense setup is not an exact stereo-hardware match.
 
-The client accepts both the official 15x8 and custom 16x8 responses, executes
-the configured first 15 actions, and interprets each row as seven joint
-velocities plus one gripper-position target. It runs at the DROID dataset rate
-of 15 Hz and prefetches the next chunk while the current chunk is executing.
+The client accepts the official 15x8 and custom/wine 16x8 responses and
+interprets each row as seven joint velocities plus one gripper-position target.
+It runs at the dataset rate of 15 Hz. The wine profile executes all 16 actions
+and replans from a fresh boundary observation; it does not reuse action zero of
+a chunk predicted from an earlier state.
 
 ## 1. GPU server from its local console
 
@@ -131,12 +133,15 @@ CUDA_VISIBLE_DEVICES=1 PORT=8001 \
   custom_droid
 ```
 
-The wine checkpoint uses the same hybrid model loader but its own
-`fitz0401/franka_pour_wine` normalization statistics. Its copied loader must
-reference that asset ID rather than `fitz0401/custom_droid`. It also requires
-the training-time proprio history `[current, t-45, t-75]`: 21 joint values and
-three gripper values. At 15 Hz these offsets are 0, 3, and 5 seconds. Start it
-on port 8002:
+The wine checkpoint must use the dedicated `fr3_train/serve_wine.py` recipe,
+not a copied custom-DROID loader. The launcher imports that recipe directly and
+uses `assets/fitz0401/franka_pour_wine/norm_stats.json`. It requires the
+training-time proprio history `[current, t-45, t-75]`: joints shaped `(3, 7)`
+and gripper shaped `(3,)`. At 15 Hz the lagged frames are 3 and 5 seconds old.
+It also enforces the training OpenPI revision
+`15a9616a00943ada6c20a0f158e3adb39df2ccac` and both changes in
+`fr3_train/deploy.patch`; use a dedicated checkout if the existing OpenPI tree
+serves other experiments. Start it on port 8002:
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 PORT=8002 \
@@ -157,7 +162,7 @@ only the transport dependency. Neither path changes OpenPI's lock file or
 downloads model weights.
 
 All server profiles perform one synthetic inference before opening the ZMQ
-endpoint. The wine warm-up uses its 21/3 history shapes. This pays the JAX
+endpoint. The wine warm-up uses its `(3, 7)/(3,)` history shapes. This pays the JAX
 compilation cost before a robot observation can be accepted; `warmup_ms` and
 the proprio contract are included in server metadata.
 
@@ -221,15 +226,23 @@ fr3-pi05-check --server-only --checkpoint custom_droid
 ```
 
 For wine, select `--checkpoint wine_hybrid`. The client verifies the server's
-21/3 history metadata before the first inference or policy action, then collects 76
+exact history, model, task, and 16-step action metadata before the first
+inference or policy action, then collects 76
 samples at 15 Hz (five seconds of history) before its first inference. It
 continues sampling at 15 Hz while inference is pending and throughout the
 rollout:
 
 ```bash
-fr3-pi05-check --checkpoint wine_hybrid --prompt "pour wine into the glass"
-fr3-pi05-run --checkpoint wine_hybrid --execute --prompt "pour wine into the glass"
+fr3-pi05-check --checkpoint wine_hybrid --prompt "pour gin into the jigger"
+fr3-pi05-run --checkpoint wine_hybrid --execute --prompt "pour gin into the jigger"
 ```
+
+The only accepted wine prompts are `pour gin into the jigger` and
+`pour lillet into the jigger`, exactly as annotated during training. Wine
+execution uses the collection envelope (0.35 rad/s, 1.5 rad/s², 0.08 rad joint
+margin). When its gripper target changes, arm velocity is held at zero until
+the blocking Bamboo gripper operation completes; the remaining chunk is then
+discarded and replanned from measured state, matching demonstration timing.
 
 Then run the non-moving end-to-end check:
 
@@ -238,7 +251,7 @@ fr3-pi05-check --prompt "pick up the red block"
 ```
 
 It opens both cameras, reads Bamboo and the gripper, makes one real GPU inference,
-checks the entire 15-action prefix, and republishes a three-second RViz
+checks the complete selected-checkpoint action horizon, and republishes a three-second RViz
 preview so the camera and marker displays can subscribe. It never starts Bamboo
 streaming. To validate only local configuration and kinematics:
 

@@ -37,6 +37,8 @@ fi
 
 CUSTOM_ASSET_ID=
 PROPRIO_HISTORY_OFFSETS=(0)
+WINE_LOADER_PATH=
+ACTION_EXPERT_VARIANT=${ACTION_EXPERT_VARIANT:-gemma_300m_lora}
 case "$MODEL_PROFILE" in
   pi05_droid)
     LOADER=official
@@ -48,10 +50,11 @@ case "$MODEL_PROFILE" in
     CUSTOM_ASSET_ID=fitz0401/custom_droid
     ;;
   wine_hybrid)
-    LOADER=custom_droid
+    LOADER=wine
     CONFIG_NAME=pi05_droid
     CUSTOM_ASSET_ID=fitz0401/franka_pour_wine
     PROPRIO_HISTORY_OFFSETS=(0 45 75)
+    WINE_LOADER_PATH=$FR3_DEMO_DIR/fr3_train/serve_wine.py
     ;;
   *)
     echo "Unknown model profile: $MODEL_PROFILE (expected pi05_droid, custom_droid, or wine_hybrid)" >&2
@@ -63,6 +66,23 @@ if [ "$LOADER" = custom_droid ]; then
     echo "Custom loader is missing: $CHECKPOINT/serve_custom_droid.py" >&2
     exit 2
   fi
+fi
+if [ "$LOADER" = wine ] && [ ! -f "$WINE_LOADER_PATH" ]; then
+  echo "Wine loader is missing: $WINE_LOADER_PATH" >&2
+  echo "Pull the fr3_demo revision containing fr3_train before launching." >&2
+  exit 2
+fi
+if [ "$LOADER" = wine ]; then
+  EXPECTED_OPENPI_REV=15a9616a00943ada6c20a0f158e3adb39df2ccac
+  ACTUAL_OPENPI_REV=$(git -C "$OPENPI_DIR" rev-parse HEAD 2>/dev/null || true)
+  if [ "$ACTUAL_OPENPI_REV" != "$EXPECTED_OPENPI_REV" ]; then
+    echo "wine_hybrid requires OpenPI $EXPECTED_OPENPI_REV" >&2
+    echo "Current checkout is ${ACTUAL_OPENPI_REV:-not a Git checkout}." >&2
+    echo "Use a dedicated checkout at the training revision and apply fr3_train/deploy.patch." >&2
+    exit 2
+  fi
+fi
+if [ -n "$CUSTOM_ASSET_ID" ]; then
   if [ ! -f "$CHECKPOINT/assets/$CUSTOM_ASSET_ID/norm_stats.json" ]; then
     echo "Normalization statistics are missing: $CHECKPOINT/assets/$CUSTOM_ASSET_ID/norm_stats.json" >&2
     echo "Refusing to substitute stock DROID or another task's statistics." >&2
@@ -71,6 +91,11 @@ if [ "$LOADER" = custom_droid ]; then
   if ! grep -q 'gemma_2b_lora_r32' "$OPENPI_DIR/src/openpi/models/gemma.py" 2>/dev/null; then
     echo "The custom checkpoint deploy.patch is not applied to this OpenPI checkout." >&2
     echo "Follow the custom checkpoint deployment instructions before launching." >&2
+    exit 2
+  fi
+  if ! grep -q 'lora \* self.lora_config.scaling_value' "$OPENPI_DIR/src/openpi/models/lora.py" 2>/dev/null; then
+    echo "The mandatory FFN LoRA scaling fix is missing from this OpenPI checkout." >&2
+    echo "Apply fr3_train/deploy.patch before launching the checkpoint." >&2
     exit 2
   fi
 fi
@@ -87,6 +112,9 @@ if [ ! -w "$OPENPI_DATA_HOME" ] || [ ! -w "$UV_CACHE_DIR" ]; then
   exit 2
 fi
 EXTRA_ARGS=()
+if [ -n "$WINE_LOADER_PATH" ]; then
+  EXTRA_ARGS+=(--wine-loader-path "$WINE_LOADER_PATH" --action-expert-variant "$ACTION_EXPERT_VARIANT")
+fi
 if [ -n "$CONNECT_ENDPOINT" ]; then
   case "$CONNECT_ENDPOINT" in
     tcp://*) ;;

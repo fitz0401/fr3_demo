@@ -31,6 +31,12 @@ def handle_request(policy: Any, metadata: dict[str, Any], request: Any) -> dict[
     observation = request.get("observation")
     if not isinstance(observation, dict):
         return {"success": False, "error": "Inference request has no observation dictionary"}
+    tasks = metadata.get("tasks")
+    if tasks and observation.get("prompt") not in tasks:
+        return {
+            "success": False,
+            "error": f"Prompt must exactly match one of the trained tasks: {tasks}",
+        }
     started = time.monotonic()
     result = policy.infer(observation)
     if not isinstance(result, dict):
@@ -44,6 +50,8 @@ def load_policy(
     config_name: str,
     checkpoint: str,
     default_prompt: str | None,
+    wine_loader_path: str | None = None,
+    action_expert_variant: str = "gemma_300m_lora",
 ) -> tuple[Any, dict[str, Any]]:
     """Load OpenPI lazily so protocol tests do not need the GPU stack."""
 
@@ -66,6 +74,38 @@ def load_policy(
             "action_horizon": int(module.MODEL.action_horizon),
             "default_prompt": prompt,
         }
+    if loader == "wine":
+        loader_path = (
+            Path(wine_loader_path)
+            if wine_loader_path is not None
+            else Path(__file__).resolve().parents[2] / "fr3_train" / "serve_wine.py"
+        )
+        if not loader_path.is_file():
+            raise RuntimeError(f"Wine checkpoint loader is missing: {loader_path}")
+        module_name = "fr3_pi05_deployed_wine"
+        spec = importlib.util.spec_from_file_location(module_name, loader_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Cannot import wine checkpoint loader: {loader_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        policy = module.build_policy(checkpoint, action_expert_variant)
+        history_lags = list(module.STATE_HISTORY_LAGS)
+        num_frames = int(module.NUM_STATE_FRAMES)
+        return policy, {
+            "model": "pi05_wine_hybrid",
+            "action_horizon": int(module._model(action_expert_variant).action_horizon),
+            "action_expert_variant": action_expert_variant,
+            "state_history_lags": history_lags,
+            "proprio_history_offsets": [0, *history_lags],
+            "num_state_frames": num_frames,
+            "joint_observation_shape": [num_frames, 7],
+            "gripper_observation_shape": [num_frames],
+            "image_observation_shape": [180, 320, 3],
+            "joint_observation_dim": num_frames * 7,
+            "gripper_observation_dim": num_frames,
+            "tasks": list(module.TASKS),
+        }
     if loader != "official":
         raise ValueError(f"Unknown policy loader: {loader}")
     try:
@@ -79,17 +119,27 @@ def load_policy(
     return policy, {"model": config_name}
 
 
-def warm_up(policy: Any, prompt: str, proprio_history_offsets: tuple[int, ...] = (0,)) -> float:
+def warm_up(
+    policy: Any,
+    prompt: str,
+    proprio_history_offsets: tuple[int, ...] = (0,),
+    action_horizon: int | None = None,
+) -> float:
     """Compile one inference before exposing the network endpoint."""
 
     current_joints = np.array(
         [-0.047, -0.735, -0.028, -2.278, -0.007, 1.578, 0.031],
         dtype=np.float32,
     )
+    image_shape = (224, 224, 3) if len(proprio_history_offsets) == 1 else (180, 320, 3)
     observation = {
-        "observation/exterior_image_1_left": np.zeros((224, 224, 3), dtype=np.uint8),
-        "observation/wrist_image_left": np.zeros((224, 224, 3), dtype=np.uint8),
-        "observation/joint_position": np.tile(current_joints, len(proprio_history_offsets)),
+        "observation/exterior_image_1_left": np.zeros(image_shape, dtype=np.uint8),
+        "observation/wrist_image_left": np.zeros(image_shape, dtype=np.uint8),
+        "observation/joint_position": (
+            current_joints
+            if len(proprio_history_offsets) == 1
+            else np.tile(current_joints, (len(proprio_history_offsets), 1))
+        ),
         "observation/gripper_position": np.zeros(len(proprio_history_offsets), dtype=np.float32),
         "prompt": prompt,
     }
@@ -98,6 +148,10 @@ def warm_up(policy: Any, prompt: str, proprio_history_offsets: tuple[int, ...] =
     actions = np.asarray(result.get("actions")) if isinstance(result, dict) else np.empty(0)
     if actions.ndim != 2 or actions.shape[1:] != (8,) or not np.all(np.isfinite(actions)):
         raise RuntimeError(f"Policy warm-up returned invalid actions shaped {actions.shape}")
+    if action_horizon is not None and actions.shape[0] != action_horizon:
+        raise RuntimeError(
+            f"Policy warm-up returned horizon {actions.shape[0]}, expected {action_horizon}"
+        )
     return (time.monotonic() - started) * 1000.0
 
 
@@ -132,9 +186,15 @@ def main() -> int:
     parser.add_argument("--bind-host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--config-name", default="pi05_droid")
-    parser.add_argument("--loader", choices=("official", "custom_droid"), default="official")
+    parser.add_argument("--loader", choices=("official", "custom_droid", "wine"), default="official")
     parser.add_argument("--checkpoint", required=True, help="existing local checkpoint directory; never downloaded here")
     parser.add_argument("--default-prompt")
+    parser.add_argument("--wine-loader-path")
+    parser.add_argument(
+        "--action-expert-variant",
+        choices=("gemma_300m_lora", "gemma_300m"),
+        default="gemma_300m_lora",
+    )
     parser.add_argument(
         "--proprio-history-offsets",
         type=int,
@@ -158,13 +218,23 @@ def main() -> int:
         args.config_name,
         args.checkpoint,
         args.default_prompt,
+        args.wine_loader_path,
+        args.action_expert_variant,
     )
     metadata = dict(getattr(policy, "metadata", {}) or {})
     metadata.update(loader_metadata)
     if not args.no_warmup:
-        prompt = args.default_prompt or loader_metadata.get("default_prompt") or "perform the task"
+        trained_tasks = loader_metadata.get("tasks") or []
+        prompt = args.default_prompt or loader_metadata.get("default_prompt") or next(
+            iter(trained_tasks), "perform the task"
+        )
         LOG.info("warming policy before opening the ZMQ endpoint")
-        warmup_ms = warm_up(policy, str(prompt), history_offsets)
+        warmup_ms = warm_up(
+            policy,
+            str(prompt),
+            history_offsets,
+            int(loader_metadata["action_horizon"]) if "action_horizon" in loader_metadata else None,
+        )
         metadata["warmup_ms"] = warmup_ms
         LOG.info("policy warm-up complete in %.1f ms", warmup_ms)
     metadata.update(
@@ -173,9 +243,15 @@ def main() -> int:
             "loader": args.loader,
             "config_name": args.config_name,
             "checkpoint": args.checkpoint,
-            "joint_observation_dim": 7 * len(history_offsets),
-            "gripper_observation_dim": len(history_offsets),
-            "proprio_history_offsets": list(history_offsets),
+            "joint_observation_dim": loader_metadata.get(
+                "joint_observation_dim", 7 * len(history_offsets)
+            ),
+            "gripper_observation_dim": loader_metadata.get(
+                "gripper_observation_dim", len(history_offsets)
+            ),
+            "proprio_history_offsets": loader_metadata.get(
+                "proprio_history_offsets", list(history_offsets)
+            ),
         }
     )
     endpoint = args.connect_endpoint or f"tcp://{args.bind_host}:{args.port}"

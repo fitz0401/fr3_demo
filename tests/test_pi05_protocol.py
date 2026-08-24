@@ -128,6 +128,20 @@ class Pi05ProtocolTest(unittest.TestCase):
         self.assertEqual(policy.observation["prompt"], "move the block")
         self.assertIn("server_timing", result["result"])
 
+    def test_zmq_server_rejects_untrained_wine_prompt(self) -> None:
+        class FakePolicy:
+            def infer(self, _observation):
+                raise AssertionError("invalid prompt must not reach the policy")
+
+        result = handle_request(
+            FakePolicy(),
+            {"tasks": ["pour gin into the jigger"]},
+            {"operation": "infer", "observation": {"prompt": "pour the wine"}},
+        )
+
+        self.assertFalse(result["success"])
+        self.assertIn("exactly match", result["error"])
+
     def test_custom_loader_uses_checkpoint_recipe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint = Path(temporary)
@@ -168,6 +182,40 @@ def build_policy(args):
         self.assertEqual(policy.observation["observation/joint_position"].shape, (7,))
         self.assertEqual(policy.observation["observation/wrist_image_left"].shape, (224, 224, 3))
 
+    def test_wine_loader_uses_training_side_recipe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            loader_path = root / "serve_wine.py"
+            loader_path.write_text(
+                """
+STATE_HISTORY_LAGS = (45, 75)
+NUM_STATE_FRAMES = 3
+TASKS = ("pour lillet into the jigger", "pour gin into the jigger")
+class Model:
+    action_horizon = 16
+def _model(action_expert_variant):
+    return Model()
+def build_policy(checkpoint, action_expert_variant):
+    return {"checkpoint": checkpoint, "variant": action_expert_variant}
+""",
+                encoding="utf-8",
+            )
+
+            policy, metadata = load_policy(
+                "wine",
+                "unused",
+                str(root / "checkpoint"),
+                None,
+                str(loader_path),
+            )
+
+        self.assertEqual(policy["variant"], "gemma_300m_lora")
+        self.assertEqual(metadata["model"], "pi05_wine_hybrid")
+        self.assertEqual(metadata["action_horizon"], 16)
+        self.assertEqual(metadata["joint_observation_shape"], [3, 7])
+        self.assertEqual(metadata["image_observation_shape"], [180, 320, 3])
+        self.assertEqual(metadata["tasks"], ["pour lillet into the jigger", "pour gin into the jigger"])
+
     def test_server_warmup_uses_wine_history_contract(self) -> None:
         class FakePolicy:
             def infer(self, observation):
@@ -177,8 +225,12 @@ def build_policy(args):
         policy = FakePolicy()
         warm_up(policy, "pour the wine", (0, 45, 75))
 
-        self.assertEqual(policy.observation["observation/joint_position"].shape, (21,))
+        self.assertEqual(policy.observation["observation/joint_position"].shape, (3, 7))
         self.assertEqual(policy.observation["observation/gripper_position"].shape, (3,))
+        self.assertEqual(policy.observation["observation/wrist_image_left"].shape, (180, 320, 3))
+
+        with self.assertRaisesRegex(RuntimeError, "expected 16"):
+            warm_up(policy, "pour the wine", (0, 45, 75), action_horizon=16)
 
 
 if __name__ == "__main__":

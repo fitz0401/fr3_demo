@@ -34,6 +34,8 @@ from fr3_pi05.policy import (
 )
 
 LOG = logging.getLogger("fr3_pi05")
+WINE_ACTION_HORIZON = 16
+WINE_TASKS = ("pour lillet into the jigger", "pour gin into the jigger")
 
 
 class WineHistorySampler:
@@ -84,6 +86,7 @@ class GripperWorker:
         self._enabled = enabled
         self._position = 0.0
         self._desired: float | None = None
+        self._moving = False
         self._error: Exception | None = None
         self._lock = threading.Lock()
         self._commands: queue.Queue[float | None] = queue.Queue(maxsize=1)
@@ -99,6 +102,7 @@ class GripperWorker:
         try:
             with self._lock:
                 self._position = self._robot.gripper_position()
+                self._desired = 1.0 if self._position > 0.5 else 0.0
         except Exception as error:  # noqa: BLE001 - preserve Bamboo client errors for the control thread
             self._error = error
         finally:
@@ -116,8 +120,11 @@ class GripperWorker:
                     observed = self._robot.gripper_position()
                 with self._lock:
                     self._position = observed
+                    self._moving = False
             except Exception as error:  # noqa: BLE001 - preserve Bamboo client errors for the control thread
                 self._error = error
+                with self._lock:
+                    self._moving = False
                 return
 
     def wait_ready(self, timeout: float = 10.0) -> None:
@@ -135,13 +142,21 @@ class GripperWorker:
         with self._lock:
             return self._position
 
-    def command(self, desired: float) -> None:
+    @property
+    def moving(self) -> bool:
+        self.check()
+        with self._lock:
+            return self._moving
+
+    def command(self, desired: float) -> bool:
         if not self._enabled:
-            return
+            return False
         binary = 1.0 if desired > 0.5 else 0.0
-        if binary == self._desired:
-            return
-        self._desired = binary
+        with self._lock:
+            if binary == self._desired:
+                return False
+            self._desired = binary
+            self._moving = True
         try:
             self._commands.put_nowait(binary)
         except queue.Full:
@@ -150,6 +165,7 @@ class GripperWorker:
             except queue.Empty:
                 pass
             self._commands.put_nowait(binary)
+        return True
 
     def close(self) -> None:
         if self._thread is None:
@@ -264,6 +280,10 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
             args.policy_port = int(server_ports[args.checkpoint])
     if not args.external_camera_serial or not args.wrist_camera_serial:
         parser.error("both camera serial numbers are required in config.toml or on the command line")
+    if args.checkpoint == "wine_hybrid":
+        # These are checkpoint contract values, not rollout tuning parameters.
+        args.open_loop_horizon = WINE_ACTION_HORIZON
+        args.prefetch_actions = 0
     if args.execute and args.check:
         parser.error("--check never executes; remove either --check or --execute")
     if args.offline and not args.check:
@@ -340,9 +360,19 @@ def _validate_policy_contract(checkpoint: str, metadata: dict[str, Any]) -> None
     if checkpoint != "wine_hybrid":
         return
     expected = {
+        "model": "pi05_wine_hybrid",
+        "loader": "wine",
+        "action_expert_variant": "gemma_300m_lora",
+        "action_horizon": WINE_ACTION_HORIZON,
+        "state_history_lags": [45, 75],
+        "num_state_frames": 3,
         "joint_observation_dim": 21,
         "gripper_observation_dim": 3,
+        "joint_observation_shape": [3, 7],
+        "gripper_observation_shape": [3],
+        "image_observation_shape": [180, 320, 3],
         "proprio_history_offsets": list(WINE_HISTORY_OFFSETS),
+        "tasks": list(WINE_TASKS),
     }
     mismatches = [
         f"{key}={metadata.get(key)!r} (expected {value!r})"
@@ -467,6 +497,9 @@ def run(args: argparse.Namespace) -> int:
     prompt = args.prompt or input("Language instruction: ").strip()
     if not prompt:
         raise RuntimeError("Language instruction cannot be empty")
+    if args.checkpoint == "wine_hybrid" and prompt not in WINE_TASKS:
+        choices = " or ".join(repr(task) for task in WINE_TASKS)
+        raise RuntimeError(f"wine_hybrid prompt must exactly match {choices}; got {prompt!r}")
     workspace = WorkspaceBounds(tuple(args.workspace_min), tuple(args.workspace_max))
     policy_host, endpoint_label = _policy_endpoint(args)
     if args.transport != "zmq" or args.zmq_mode == "connect":
@@ -613,6 +646,7 @@ def run(args: argparse.Namespace) -> int:
         next_chunk: np.ndarray | None = None
         action_index = 0
         desired_velocity = np.zeros(7)
+        waiting_for_wine_gripper = False
         policy_steps = 0
         stream_period = 1.0 / args.stream_hz
         control_period = 1.0 / args.control_hz
@@ -655,45 +689,66 @@ def run(args: argparse.Namespace) -> int:
                 else:
                     observation_joints, observation_gripper = q, gripper_position
                 frames = cameras.snapshot(args.max_camera_age)
-                if action_chunk is not None:
+                if waiting_for_wine_gripper and not gripper.moving:
+                    waiting_for_wine_gripper = False
+                    print("Wine gripper motion complete; replanning from the measured state.")
+                if waiting_for_wine_gripper:
+                    desired_velocity = np.zeros(7)
+                    predicted = None
+                elif action_chunk is not None:
                     action = action_chunk[action_index]
-                    desired_velocity = safe_joint_velocity(
-                        q,
-                        action[:7],
-                        duration=control_period,
-                        maximum=args.max_joint_speed,
-                        joint_margin=args.joint_margin,
-                        workspace=workspace,
-                    )
+                    gripper_started = False
                     if args.execute:
-                        gripper.command(float(action[7]))
-                    action_index += 1
-                    policy_steps += 1
-                    remaining = args.open_loop_horizon - action_index
-                    predicted = predict_joint_path(
-                        q,
-                        action_chunk[action_index : args.open_loop_horizon],
-                        horizon=max(0, remaining),
-                        control_hz=args.control_hz,
-                        maximum=args.max_joint_speed,
-                        joint_margin=args.joint_margin,
-                        workspace=workspace,
-                    )
-                    if remaining <= args.prefetch_actions and next_chunk is None and not policy.busy:
-                        observation = build_droid_observation(
-                            frames["exterior_image_left"].image,
-                            frames["wrist_image"].image,
-                            observation_joints,
-                            observation_gripper,
-                            prompt,
-                        )
-                        policy.submit(observation)
-                    if action_index >= args.open_loop_horizon:
-                        action_chunk = next_chunk
+                        gripper_started = gripper.command(float(action[7]))
+                    if args.checkpoint == "wine_hybrid" and gripper_started:
+                        # Demonstrations pause the arm during blocking gripper motion. Keep the
+                        # Bamboo stream alive with zeros, discard this stale chunk, then replan.
+                        desired_velocity = np.zeros(7)
+                        predicted = None
+                        waiting_for_wine_gripper = True
+                        action_chunk = None
                         next_chunk = None
                         action_index = 0
-                        if action_chunk is None:
-                            desired_velocity = np.zeros(7)
+                        policy_steps += 1
+                        print("Wine gripper transition: pausing arm motion until Bamboo completes it.")
+                    else:
+                        desired_velocity = safe_joint_velocity(
+                            q,
+                            action[:7],
+                            duration=control_period,
+                            maximum=args.max_joint_speed,
+                            joint_margin=args.joint_margin,
+                            workspace=workspace,
+                        )
+                        action_index += 1
+                        policy_steps += 1
+                        remaining = args.open_loop_horizon - action_index
+                        predicted = predict_joint_path(
+                            q,
+                            action_chunk[action_index : args.open_loop_horizon],
+                            horizon=max(0, remaining),
+                            control_hz=args.control_hz,
+                            maximum=args.max_joint_speed,
+                            joint_margin=args.joint_margin,
+                            workspace=workspace,
+                        )
+                        if (
+                            0 < remaining <= args.prefetch_actions
+                            and next_chunk is None
+                            and not policy.busy
+                        ):
+                            observation = build_droid_observation(
+                                frames["exterior_image_left"].image,
+                                frames["wrist_image"].image,
+                                observation_joints,
+                                observation_gripper,
+                                prompt,
+                            )
+                            policy.submit(observation)
+                        if action_index >= args.open_loop_horizon:
+                            action_chunk = next_chunk
+                            next_chunk = None
+                            action_index = 0
                 else:
                     desired_velocity = np.zeros(7)
                     predicted = None
