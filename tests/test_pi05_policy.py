@@ -5,6 +5,7 @@ import numpy as np
 
 from fr3_demo.kinematics import JOINT_UPPER, WorkspaceBounds
 from fr3_pi05.policy import (
+    ProprioHistory,
     SafetyViolation,
     _resize,
     build_droid_observation,
@@ -35,6 +36,32 @@ class Pi05PolicyTest(unittest.TestCase):
         )
         self.assertEqual(observation["observation/joint_position"].shape, (7,))
         self.assertEqual(observation["observation/gripper_position"].shape, (1,))
+
+    def test_wine_history_orders_current_then_t45_then_t75(self) -> None:
+        history = ProprioHistory()
+        for frame in range(76):
+            history.append(np.full(7, frame, dtype=np.float32), frame / 100)
+
+        joints, gripper = history.observation()
+
+        self.assertEqual(joints.shape, (21,))
+        self.assertEqual(gripper.shape, (3,))
+        np.testing.assert_array_equal(joints.reshape(3, 7)[:, 0], [75, 30, 0])
+        np.testing.assert_allclose(gripper, [0.75, 0.30, 0.0])
+
+    @patch("fr3_pi05.policy._resize", side_effect=lambda image: image[:224, :224])
+    def test_wine_observation_accepts_history_shapes(self, _resize) -> None:
+        image = np.zeros((240, 424, 3), dtype=np.uint8)
+        observation = build_droid_observation(
+            image,
+            image,
+            np.zeros(21),
+            np.array([1.0, 0.5, 0.0]),
+            "pour the wine",
+        )
+
+        self.assertEqual(observation["observation/joint_position"].shape, (21,))
+        self.assertEqual(observation["observation/gripper_position"].shape, (3,))
 
     def test_current_pi05_horizon_is_accepted_and_clipped(self) -> None:
         response = {"actions": np.full((15, 8), 2.0)}

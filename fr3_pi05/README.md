@@ -13,8 +13,10 @@ The exact request fields are:
 
 - `observation/exterior_image_1_left`: exterior RGB, padded to 224x224;
 - `observation/wrist_image_left`: wrist RGB, padded to 224x224;
-- `observation/joint_position`: seven measured FR3 joint positions;
-- `observation/gripper_position`: one normalized opening value;
+- `observation/joint_position`: seven measured FR3 joint positions (21 for
+  `wine_hybrid`: current, t-45, t-75);
+- `observation/gripper_position`: one normalized opening value (three for
+  `wine_hybrid`, with the same history offsets);
 - `prompt`: the operator's language instruction.
 
 The installed wrist camera is upside-down relative to the DROID hand-camera
@@ -30,6 +32,12 @@ fr3-pi05-check --no-wrist-rotate-180 --prompt "test camera orientation"
 
 The override applies to one run only. Set `cameras.wrist_rotate_180 = false` in
 `config.toml` to keep rotation disabled.
+
+New raw sessions record these transforms in `session.json` and each episode's
+`metadata.json`. With the current configuration the stored wrist JPEGs are
+already rotated; conversion does not rotate them again. Older sessions created
+before this metadata field was added must be interpreted from the configuration
+used during collection.
 
 Both RealSense color streams use 424x240 at 30 Hz, matching Pinhao's validated
 deployment. This 16:9 mode preserves essentially the same wide calibrated FOV
@@ -125,8 +133,10 @@ CUDA_VISIBLE_DEVICES=1 PORT=8001 \
 
 The wine checkpoint uses the same hybrid model loader but its own
 `fitz0401/franka_pour_wine` normalization statistics. Its copied loader must
-reference that asset ID rather than `fitz0401/custom_droid`. Start it on port
-8002:
+reference that asset ID rather than `fitz0401/custom_droid`. It also requires
+the training-time proprio history `[current, t-45, t-75]`: 21 joint values and
+three gripper values. At 15 Hz these offsets are 0, 3, and 5 seconds. Start it
+on port 8002:
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 PORT=8002 \
@@ -146,9 +156,10 @@ uses OpenPI's existing `.venv/bin/python` directly when it already contains
 only the transport dependency. Neither path changes OpenPI's lock file or
 downloads model weights.
 
-Both server profiles perform one synthetic DROID inference before opening the
-ZMQ endpoint. This pays the JAX compilation cost before a robot observation can
-be accepted; the reported `warmup_ms` is included in server metadata.
+All server profiles perform one synthetic inference before opening the ZMQ
+endpoint. The wine warm-up uses its 21/3 history shapes. This pays the JAX
+compilation cost before a robot observation can be accepted; `warmup_ms` and
+the proprio contract are included in server metadata.
 
 The normal mode has this workstation connect to the configured GPU address. If
 a deployment filters that direction but permits GPU-to-workstation TCP, set
@@ -207,6 +218,17 @@ Select the custom endpoint persistently by changing `pi05.checkpoint` in
 
 ```bash
 fr3-pi05-check --server-only --checkpoint custom_droid
+```
+
+For wine, select `--checkpoint wine_hybrid`. The client verifies the server's
+21/3 history metadata before the first inference or policy action, then collects 76
+samples at 15 Hz (five seconds of history) before its first inference. It
+continues sampling at 15 Hz while inference is pending and throughout the
+rollout:
+
+```bash
+fr3-pi05-check --checkpoint wine_hybrid --prompt "pour wine into the glass"
+fr3-pi05-run --checkpoint wine_hybrid --execute --prompt "pour wine into the glass"
 ```
 
 Then run the non-moving end-to-end check:

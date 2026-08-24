@@ -45,6 +45,10 @@ class RawRecordingTest(unittest.TestCase):
             metadata = json.loads((episode / "metadata.json").read_text(encoding="utf-8"))
             self.assertTrue(metadata["complete"])
             self.assertEqual(metadata["frame_count"], 2)
+            self.assertEqual(
+                metadata["camera_transforms"],
+                {"exterior_image_left": "none", "wrist_image": "none"},
+            )
             with np.load(episode / "trajectory.npz") as trajectory:
                 self.assertEqual(trajectory["joint_position"].shape, (2, 7))
                 self.assertEqual(trajectory["action_joint_velocity"].shape, (2, 7))

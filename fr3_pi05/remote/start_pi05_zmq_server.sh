@@ -36,6 +36,7 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 CUSTOM_ASSET_ID=
+PROPRIO_HISTORY_OFFSETS=(0)
 case "$MODEL_PROFILE" in
   pi05_droid)
     LOADER=official
@@ -50,6 +51,7 @@ case "$MODEL_PROFILE" in
     LOADER=custom_droid
     CONFIG_NAME=pi05_droid
     CUSTOM_ASSET_ID=fitz0401/franka_pour_wine
+    PROPRIO_HISTORY_OFFSETS=(0 45 75)
     ;;
   *)
     echo "Unknown model profile: $MODEL_PROFILE (expected pi05_droid, custom_droid, or wine_hybrid)" >&2
@@ -108,4 +110,5 @@ exec "${PYTHON_COMMAND[@]}" \
   --loader "$LOADER" \
   --config-name "$CONFIG_NAME" \
   --checkpoint "$CHECKPOINT" \
+  --proprio-history-offsets "${PROPRIO_HISTORY_OFFSETS[@]}" \
   "${EXTRA_ARGS[@]}"

@@ -79,17 +79,18 @@ def load_policy(
     return policy, {"model": config_name}
 
 
-def warm_up(policy: Any, prompt: str) -> float:
+def warm_up(policy: Any, prompt: str, proprio_history_offsets: tuple[int, ...] = (0,)) -> float:
     """Compile one inference before exposing the network endpoint."""
 
+    current_joints = np.array(
+        [-0.047, -0.735, -0.028, -2.278, -0.007, 1.578, 0.031],
+        dtype=np.float32,
+    )
     observation = {
         "observation/exterior_image_1_left": np.zeros((224, 224, 3), dtype=np.uint8),
         "observation/wrist_image_left": np.zeros((224, 224, 3), dtype=np.uint8),
-        "observation/joint_position": np.array(
-            [-0.047, -0.735, -0.028, -2.278, -0.007, 1.578, 0.031],
-            dtype=np.float32,
-        ),
-        "observation/gripper_position": np.zeros(1, dtype=np.float32),
+        "observation/joint_position": np.tile(current_joints, len(proprio_history_offsets)),
+        "observation/gripper_position": np.zeros(len(proprio_history_offsets), dtype=np.float32),
         "prompt": prompt,
     }
     started = time.monotonic()
@@ -134,12 +135,23 @@ def main() -> int:
     parser.add_argument("--loader", choices=("official", "custom_droid"), default="official")
     parser.add_argument("--checkpoint", required=True, help="existing local checkpoint directory; never downloaded here")
     parser.add_argument("--default-prompt")
+    parser.add_argument(
+        "--proprio-history-offsets",
+        type=int,
+        nargs="+",
+        default=(0,),
+        metavar="FRAME",
+        help="observation history in collector-rate frames, ordered current first",
+    )
     parser.add_argument("--no-warmup", action="store_true", help="skip the startup JIT inference")
     parser.add_argument(
         "--connect-endpoint",
         help="connect the REP socket outward (for example tcp://10.34.97.197:8000) instead of binding",
     )
     args = parser.parse_args()
+    history_offsets = tuple(args.proprio_history_offsets)
+    if not history_offsets or history_offsets[0] != 0 or any(offset < 0 for offset in history_offsets):
+        parser.error("--proprio-history-offsets must start with 0 and contain non-negative frame offsets")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     policy, loader_metadata = load_policy(
         args.loader,
@@ -152,7 +164,7 @@ def main() -> int:
     if not args.no_warmup:
         prompt = args.default_prompt or loader_metadata.get("default_prompt") or "perform the task"
         LOG.info("warming policy before opening the ZMQ endpoint")
-        warmup_ms = warm_up(policy, str(prompt))
+        warmup_ms = warm_up(policy, str(prompt), history_offsets)
         metadata["warmup_ms"] = warmup_ms
         LOG.info("policy warm-up complete in %.1f ms", warmup_ms)
     metadata.update(
@@ -161,6 +173,9 @@ def main() -> int:
             "loader": args.loader,
             "config_name": args.config_name,
             "checkpoint": args.checkpoint,
+            "joint_observation_dim": 7 * len(history_offsets),
+            "gripper_observation_dim": len(history_offsets),
+            "proprio_history_offsets": list(history_offsets),
         }
     )
     endpoint = args.connect_endpoint or f"tcp://{args.bind_host}:{args.port}"

@@ -22,8 +22,11 @@ from fr3_demo.kinematics import WorkspaceBounds, forward_kinematics
 from fr3_demo.settings import default_config_path, load_config, pi05_defaults
 from fr3_demo.teleop import HOME_JOINTS, BambooRobot, Mapping, stream_home
 from fr3_pi05.policy import (
+    DROID_CONTROL_HZ,
+    WINE_HISTORY_OFFSETS,
     InferenceResult,
     InferenceWorker,
+    ProprioHistory,
     SafetyViolation,
     build_droid_observation,
     predict_joint_path,
@@ -31,6 +34,46 @@ from fr3_pi05.policy import (
 )
 
 LOG = logging.getLogger("fr3_pi05")
+
+
+class WineHistorySampler:
+    """Sample Bamboo proprioception at the demonstration collector's rate."""
+
+    def __init__(self, control_hz: float) -> None:
+        self.history = ProprioHistory()
+        self.period = 1.0 / control_hz
+        self.next_sample = time.monotonic()
+
+    def sample_due(self, robot: BambooRobot, gripper: GripperWorker) -> bool:
+        now = time.monotonic()
+        if now < self.next_sample:
+            return False
+        _, q = _state(robot)
+        self.history.append(q, gripper.position)
+        self.next_sample += self.period
+        if self.next_sample < now - self.period:
+            self.next_sample = now + self.period
+        return True
+
+    def append_control_sample(self, q: np.ndarray, gripper_position: float, now: float) -> None:
+        self.history.append(q, gripper_position)
+        self.next_sample += self.period
+        if self.next_sample < now - self.period:
+            self.next_sample = now + self.period
+
+    def fill(self, robot: BambooRobot, gripper: GripperWorker, stopped: threading.Event) -> None:
+        duration = max(WINE_HISTORY_OFFSETS) * self.period
+        print(
+            f"Collecting wine proprio history at {1.0 / self.period:.1f} Hz "
+            f"for {duration:.1f} s ({self.history.required_samples} samples)..."
+        )
+        while not self.history.ready:
+            if stopped.is_set():
+                raise RuntimeError("Stopped while collecting initial wine proprio history")
+            if self.sample_due(robot, gripper):
+                continue
+            stopped.wait(min(0.02, max(0.0, self.next_sample - time.monotonic())))
+        print("Wine proprio history ready: joints=21, gripper=3, offsets=[0, 45, 75].")
 
 
 class GripperWorker:
@@ -227,6 +270,10 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--offline is only supported with --check")
     if args.control_hz <= 0 or args.stream_hz < args.control_hz:
         parser.error("stream-hz must be at least control-hz, and both must be positive")
+    if args.checkpoint == "wine_hybrid" and not np.isclose(args.control_hz, DROID_CONTROL_HZ):
+        parser.error(
+            f"wine_hybrid requires --control-hz {DROID_CONTROL_HZ:g} to match its demonstration history"
+        )
     if args.open_loop_horizon < 1 or not 0 <= args.prefetch_actions < args.open_loop_horizon:
         parser.error("prefetch-actions must be in [0, open-loop-horizon)")
     if args.max_steps < 0:
@@ -271,17 +318,43 @@ def _make_observation(
     gripper: GripperWorker,
     prompt: str,
     max_camera_age: float,
+    history: ProprioHistory | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], np.ndarray, dict[str, Any]]:
     frames = cameras.snapshot(max_camera_age)
     state, q = _state(robot)
+    observation_joints: np.ndarray = q
+    observation_gripper: float | np.ndarray = gripper.position
+    if history is not None:
+        observation_joints, observation_gripper = history.observation()
     observation = build_droid_observation(
         frames["exterior_image_left"].image,
         frames["wrist_image"].image,
-        q,
-        gripper.position,
+        observation_joints,
+        observation_gripper,
         prompt,
     )
     return observation, frames, q, state
+
+
+def _validate_policy_contract(checkpoint: str, metadata: dict[str, Any]) -> None:
+    if checkpoint != "wine_hybrid":
+        return
+    expected = {
+        "joint_observation_dim": 21,
+        "gripper_observation_dim": 3,
+        "proprio_history_offsets": list(WINE_HISTORY_OFFSETS),
+    }
+    mismatches = [
+        f"{key}={metadata.get(key)!r} (expected {value!r})"
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "wine_hybrid server does not advertise the required history contract: "
+            + "; ".join(mismatches)
+            + ". Pull the latest fr3_demo on the GPU machine and restart the wine server."
+        )
 
 
 def _offline_check(args: argparse.Namespace) -> int:
@@ -304,13 +377,27 @@ def _offline_check(args: argparse.Namespace) -> int:
     return 0
 
 
-def _wait_result(worker: InferenceWorker, timeout: float = 60.0) -> InferenceResult:
+def _wait_result(
+    worker: InferenceWorker,
+    timeout: float = 60.0,
+    *,
+    history_sampler: WineHistorySampler | None = None,
+    robot: BambooRobot | None = None,
+    gripper: GripperWorker | None = None,
+) -> InferenceResult:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         result = worker.poll()
         if result is not None:
             return result
-        time.sleep(0.02)
+        if history_sampler is not None:
+            if robot is None or gripper is None:
+                raise ValueError("Wine history sampling requires Bamboo and gripper handles")
+            history_sampler.sample_due(robot, gripper)
+        sleep_seconds = 0.02
+        if history_sampler is not None:
+            sleep_seconds = min(sleep_seconds, max(0.0, history_sampler.next_sample - time.monotonic()))
+        time.sleep(sleep_seconds)
     raise RuntimeError(f"Timed out after {timeout:.0f}s waiting for pi0.5 inference")
 
 
@@ -367,6 +454,7 @@ def run(args: argparse.Namespace) -> int:
 
             client = OpenPiWebsocketClient(args.policy_host, args.policy_port)
         try:
+            _validate_policy_contract(args.checkpoint, client.metadata)
             metadata = ", ".join(f"{key}={value}" for key, value in sorted(client.metadata.items())) or "none"
             print(
                 f"pi0.5 {args.transport} server ready at {endpoint_label}; "
@@ -390,6 +478,7 @@ def run(args: argparse.Namespace) -> int:
     policy: InferenceWorker | None = None
     rviz: Any | None = None
     joystick: LinuxJoystick | None = None
+    history_sampler: WineHistorySampler | None = None
     stream_started = False
     stopped = threading.Event()
 
@@ -445,14 +534,30 @@ def run(args: argparse.Namespace) -> int:
         )
         if policy.metadata:
             print(f"Server metadata keys: {', '.join(sorted(policy.metadata))}")
+        _validate_policy_contract(args.checkpoint, policy.metadata)
         if not args.no_rviz:
             from fr3_pi05.visualization import RvizBridge
 
             rviz = RvizBridge(launch_rviz=not args.rviz_publish_only)
 
-        observation, frames, q, _ = _make_observation(cameras, robot, gripper, prompt, args.max_camera_age)
+        if args.checkpoint == "wine_hybrid":
+            history_sampler = WineHistorySampler(args.control_hz)
+            history_sampler.fill(robot, gripper, stopped)
+        observation, frames, q, _ = _make_observation(
+            cameras,
+            robot,
+            gripper,
+            prompt,
+            args.max_camera_age,
+            history_sampler.history if history_sampler is not None else None,
+        )
         policy.submit(observation)
-        first = _wait_result(policy)
+        first = _wait_result(
+            policy,
+            history_sampler=history_sampler,
+            robot=robot,
+            gripper=gripper,
+        )
         age = first.completed_at - first.requested_at
         if age > args.max_inference_age:
             raise RuntimeError(f"Initial inference was stale ({age:.2f}s > {args.max_inference_age:.2f}s)")
@@ -512,7 +617,7 @@ def run(args: argparse.Namespace) -> int:
         stream_period = 1.0 / args.stream_hz
         control_period = 1.0 / args.control_hz
         next_stream = time.monotonic()
-        next_control = next_stream
+        next_control = history_sampler.next_sample if history_sampler is not None else next_stream
 
         unlimited_steps = args.max_steps == 0
         step_limit_label = "unlimited" if unlimited_steps else str(args.max_steps)
@@ -543,6 +648,12 @@ def run(args: argparse.Namespace) -> int:
 
             if now >= next_control:
                 _, q = _state(robot)
+                gripper_position = gripper.position
+                if history_sampler is not None:
+                    history_sampler.append_control_sample(q, gripper_position, now)
+                    observation_joints, observation_gripper = history_sampler.history.observation()
+                else:
+                    observation_joints, observation_gripper = q, gripper_position
                 frames = cameras.snapshot(args.max_camera_age)
                 if action_chunk is not None:
                     action = action_chunk[action_index]
@@ -572,8 +683,8 @@ def run(args: argparse.Namespace) -> int:
                         observation = build_droid_observation(
                             frames["exterior_image_left"].image,
                             frames["wrist_image"].image,
-                            q,
-                            gripper.position,
+                            observation_joints,
+                            observation_gripper,
                             prompt,
                         )
                         policy.submit(observation)
@@ -590,8 +701,8 @@ def run(args: argparse.Namespace) -> int:
                         observation = build_droid_observation(
                             frames["exterior_image_left"].image,
                             frames["wrist_image"].image,
-                            q,
-                            gripper.position,
+                            observation_joints,
+                            observation_gripper,
                             prompt,
                         )
                         policy.submit(observation)

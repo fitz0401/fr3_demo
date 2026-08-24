@@ -27,7 +27,15 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
 class RawEpisodeWriter:
     """Write one raw episode as synchronized JPEG frames and numeric arrays."""
 
-    def __init__(self, session_dir: Path, episode_index: int, fps: float, camera_serials: dict[str, str]) -> None:
+    def __init__(
+        self,
+        session_dir: Path,
+        episode_index: int,
+        fps: float,
+        camera_serials: dict[str, str],
+        *,
+        wrist_rotate_180: bool = False,
+    ) -> None:
         self.episode_index = episode_index
         self.fps = fps
         self.started_monotonic = time.monotonic()
@@ -55,6 +63,10 @@ class RawEpisodeWriter:
             "created_at": _utc_now(),
             "fps": fps,
             "camera_serials": camera_serials,
+            "camera_transforms": {
+                "exterior_image_left": "none",
+                "wrist_image": "rotate_180" if wrist_rotate_180 else "none",
+            },
             "language_instruction": None,
             "frame_count": 0,
         }
@@ -156,6 +168,10 @@ class DemoCollector:
                 "created_at": _utc_now(),
                 "fps": fps,
                 "camera_serials": cameras.serials,
+                "camera_transforms": {
+                    "exterior_image_left": "none",
+                    "wrist_image": "rotate_180" if cameras.wrist_rotate_180 else "none",
+                },
                 "format": "fr3_demo_raw",
             },
         )
@@ -208,6 +224,7 @@ class DemoCollector:
                 self._next_episode_index(),
                 self.fps,
                 self.cameras.serials,
+                wrist_rotate_180=self.cameras.wrist_rotate_180,
             )
             return self._writer.path
 

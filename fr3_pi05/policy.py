@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +15,47 @@ from fr3_demo.kinematics import JOINT_LOWER, JOINT_UPPER, WorkspaceBounds, forwa
 
 DROID_CONTROL_HZ = 15.0
 DROID_ACTION_DIM = 8
+WINE_HISTORY_OFFSETS = (0, 45, 75)
+
+
+class ProprioHistory:
+    """Keep collector-rate joint/gripper samples for the wine policy."""
+
+    def __init__(self, offsets: tuple[int, ...] = WINE_HISTORY_OFFSETS) -> None:
+        if not offsets or offsets[0] != 0 or any(offset < 0 for offset in offsets):
+            raise ValueError("History offsets must start at zero and be non-negative")
+        self.offsets = offsets
+        self._samples: deque[tuple[np.ndarray, float]] = deque(maxlen=max(offsets) + 1)
+
+    @property
+    def ready(self) -> bool:
+        return len(self._samples) == self._samples.maxlen
+
+    @property
+    def sample_count(self) -> int:
+        return len(self._samples)
+
+    @property
+    def required_samples(self) -> int:
+        return int(self._samples.maxlen or 0)
+
+    def append(self, joint_position: np.ndarray, gripper_position: float) -> None:
+        joints = np.asarray(joint_position, dtype=np.float32)
+        if joints.shape != (7,) or not np.all(np.isfinite(joints)):
+            raise ValueError("A history sample requires seven finite joint positions")
+        if not np.isfinite(gripper_position):
+            raise ValueError("A history sample requires a finite gripper position")
+        self._samples.append((joints.copy(), float(np.clip(gripper_position, 0.0, 1.0))))
+
+    def observation(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return values ordered current, then each configured past offset."""
+
+        if not self.ready:
+            raise RuntimeError(f"Proprio history needs {self.required_samples} samples; got {self.sample_count}")
+        selected = [self._samples[-1 - offset] for offset in self.offsets]
+        joints = np.concatenate([sample[0] for sample in selected]).astype(np.float32, copy=False)
+        gripper = np.asarray([sample[1] for sample in selected], dtype=np.float32)
+        return joints, gripper
 
 
 class SafetyViolation(RuntimeError):
@@ -39,25 +81,26 @@ def build_droid_observation(
     exterior_image: np.ndarray,
     wrist_image: np.ndarray,
     joint_position: np.ndarray,
-    gripper_position: float,
+    gripper_position: float | np.ndarray,
     prompt: str,
 ) -> dict[str, Any]:
     """Build the exact observation dictionary expected by ``pi05_droid``."""
 
     joints = np.asarray(joint_position, dtype=np.float32)
-    if joints.shape != (7,) or not np.all(np.isfinite(joints)):
-        raise ValueError("DROID observation requires seven finite joint positions")
+    if joints.shape not in ((7,), (21,)) or not np.all(np.isfinite(joints)):
+        raise ValueError("DROID observation requires 7 or 21 finite joint positions")
     if not prompt.strip():
         raise ValueError("A non-empty language instruction is required")
-    if not np.isfinite(gripper_position):
-        raise ValueError("Gripper position must be finite")
+    gripper = np.asarray(gripper_position, dtype=np.float32)
+    if gripper.ndim == 0:
+        gripper = gripper.reshape(1)
+    if gripper.shape not in ((1,), (3,)) or not np.all(np.isfinite(gripper)):
+        raise ValueError("DROID observation requires 1 or 3 finite gripper positions")
     return {
         "observation/exterior_image_1_left": _resize(np.asarray(exterior_image, dtype=np.uint8)),
         "observation/wrist_image_left": _resize(np.asarray(wrist_image, dtype=np.uint8)),
         "observation/joint_position": joints,
-        "observation/gripper_position": np.array(
-            [np.clip(float(gripper_position), 0.0, 1.0)], dtype=np.float32
-        ),
+        "observation/gripper_position": np.clip(gripper, 0.0, 1.0).astype(np.float32, copy=False),
         "prompt": prompt.strip(),
     }
 

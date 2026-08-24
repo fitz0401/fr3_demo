@@ -168,6 +168,18 @@ def build_policy(args):
         self.assertEqual(policy.observation["observation/joint_position"].shape, (7,))
         self.assertEqual(policy.observation["observation/wrist_image_left"].shape, (224, 224, 3))
 
+    def test_server_warmup_uses_wine_history_contract(self) -> None:
+        class FakePolicy:
+            def infer(self, observation):
+                self.observation = observation
+                return {"actions": np.zeros((15, 8), dtype=np.float32)}
+
+        policy = FakePolicy()
+        warm_up(policy, "pour the wine", (0, 45, 75))
+
+        self.assertEqual(policy.observation["observation/joint_position"].shape, (21,))
+        self.assertEqual(policy.observation["observation/gripper_position"].shape, (3,))
+
 
 if __name__ == "__main__":
     unittest.main()
