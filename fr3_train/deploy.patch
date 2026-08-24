@@ -1,0 +1,42 @@
+diff --git a/src/openpi/models/gemma.py b/src/openpi/models/gemma.py
+index d1623d1..b8679e3 100644
+--- a/src/openpi/models/gemma.py
++++ b/src/openpi/models/gemma.py
+@@ -52,7 +52,7 @@ class Config:
+     lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
+ 
+ 
+-Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
++Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora", "gemma_2b_lora_r32"]
+ 
+ 
+ def get_config(variant: Variant) -> Config:
+@@ -95,6 +95,16 @@ def get_config(variant: Variant) -> Config:
+             head_dim=256,
+             lora_configs={"attn": lora.LoRAConfig(rank=16, alpha=16.0), "ffn": lora.LoRAConfig(rank=16, alpha=16.0)},
+         )
++    if variant == "gemma_2b_lora_r32":
++        return Config(
++            width=2048,
++            depth=18,
++            mlp_dim=16_384,
++            num_heads=8,
++            num_kv_heads=1,
++            head_dim=256,
++            lora_configs={"attn": lora.LoRAConfig(rank=32, alpha=32.0), "ffn": lora.LoRAConfig(rank=32, alpha=32.0)},
++        )
+     if variant == "gemma_300m_lora":
+         # 311M params
+         return Config(
+diff --git a/src/openpi/models/lora.py b/src/openpi/models/lora.py
+index 3dfff5b..eb0bfa3 100644
+--- a/src/openpi/models/lora.py
++++ b/src/openpi/models/lora.py
+@@ -145,4 +145,6 @@ class FeedForward(nn.Module):
+         base = jnp.dot(x, w.astype(x.dtype))
+         if lora_weights is None:
+             return base
+-        return base + jnp.dot(jnp.dot(x, lora_weights[0].astype(x.dtype)), lora_weights[1].astype(x.dtype))
++        assert self.lora_config is not None
++        lora = jnp.dot(jnp.dot(x, lora_weights[0].astype(x.dtype)), lora_weights[1].astype(x.dtype))
++        return base + lora * self.lora_config.scaling_value

@@ -1,0 +1,2601 @@
+diff --git a/examples/wine/serve_wine.py b/examples/wine/serve_wine.py
+new file mode 100644
+index 0000000..0ae23d5
+--- /dev/null
++++ b/examples/wine/serve_wine.py
+@@ -0,0 +1,247 @@
++"""Stand-alone policy server for the pi05_wine_hybrid checkpoint.
++
++Self-contained: the TrainConfig is built inline, so the deployment machine does not need the
++patched training config from the research workspace. It does need the `gemma_2b_lora_r32` variant,
++which is not upstream -- apply `deploy.patch` first.
++
++    uv run examples/wine/serve_wine.py --checkpoint-dir /path/to/ckpt --self-test
++    uv run examples/wine/serve_wine.py --checkpoint-dir /path/to/ckpt --port 8000
++
++Two things changed versus the custom_droid server, and both will break a client that assumes the
++old contract:
++
++1. **The state is three stacked frames, not one.** The model reads proprioception at t, t-45 and
++   t-75 (3 s and 5 s at 15 fps) so that it can tell "carrying the bottle to the glass" from
++   "carrying it back" -- pi0.5 has no memory of its own. The client keeps the buffer and sends
++   `observation/joint_position` with shape (3, 7) and `observation/gripper_position` with shape
++   (3,) or (3, 1), **current first**. Before 75 frames have elapsed, repeat the current frame; that
++   is what the training pipeline does at the start of an episode.
++
++2. **The prompt is mandatory.** This model was trained on two tasks that share a scene and differ
++   only in the instruction. A default would silently pour the wrong bottle, so a request without a
++   prompt is rejected rather than guessed.
++"""
++
++import dataclasses
++import logging
++import time
++
++import numpy as np
++import tyro
++
++from openpi import transforms as _transforms
++from openpi.models import model as _model
++from openpi.models import pi0_config
++from openpi.policies import droid_policy
++from openpi.policies import policy_config as _policy_config
++from openpi.serving import websocket_policy_server
++from openpi.training import config as _config
++
++
++@dataclasses.dataclass(frozen=True)
++class DroidInputsWithStateHistory(_transforms.DataTransformFn):
++    """Assemble the stacked state this checkpoint expects. Defined here, not imported, so that this
++    file runs against a stock openpi checkout plus `deploy.patch` and nothing else.
++
++    Layout is current-first: [q_t, grip_t, q_{t-lag0}, grip_{t-lag0}, ...]. Index 0 of the stacked
++    axis is the present; treating index 0 as a lag would feed the model a stale state that still
++    trains and still runs, just wrongly.
++    """
++
++    model_type: _model.ModelType
++    num_state_frames: int = 1
++
++    def __call__(self, data: dict) -> dict:
++        joints = np.asarray(data["observation/joint_position"])
++        gripper = np.asarray(data["observation/gripper_position"])
++        if joints.ndim == 1:
++            joints = joints[np.newaxis, :]
++        if gripper.ndim == 0:
++            gripper = gripper.reshape(1, 1)
++        elif gripper.ndim == 1:
++            gripper = gripper.reshape(-1, 1) if joints.shape[0] > 1 else gripper.reshape(1, -1)
++
++        if joints.shape[0] != self.num_state_frames or gripper.shape[0] != self.num_state_frames:
++            raise ValueError(
++                f"Expected {self.num_state_frames} stacked state frames, got joint_position "
++                f"{joints.shape} and gripper_position {gripper.shape}. Send the same number of "
++                "frames the model was trained with, current first."
++            )
++
++        state = np.concatenate([np.concatenate([joints[i], gripper[i]]) for i in range(self.num_state_frames)])
++        base_image = droid_policy._parse_image(data["observation/exterior_image_1_left"])
++        wrist_image = droid_policy._parse_image(data["observation/wrist_image_left"])
++        names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
++        images = (base_image, wrist_image, np.zeros_like(base_image))
++        image_masks = (np.True_, np.True_, np.False_)
++
++        inputs = {
++            "state": state,
++            "image": dict(zip(names, images, strict=True)),
++            "image_mask": dict(zip(names, image_masks, strict=True)),
++        }
++        if "prompt" in data:
++            prompt = data["prompt"]
++            inputs["prompt"] = prompt.decode("utf-8") if isinstance(prompt, bytes) else prompt
++        return inputs
++
++
++@dataclasses.dataclass(frozen=True)
++class _WineDataConfig(_config.DataConfigFactory):
++    """The inference half of the training data config, rebuilt from upstream pieces only."""
++
++    num_state_frames: int = 3
++
++    def create(self, assets_dirs, model_config: _model.BaseModelConfig) -> _config.DataConfig:
++        return dataclasses.replace(
++            self.create_base_config(assets_dirs, model_config),
++            repack_transforms=_transforms.Group(
++                inputs=[
++                    _transforms.RepackTransform(
++                        {
++                            "observation/exterior_image_1_left": "exterior_image_1_left",
++                            "observation/wrist_image_left": "wrist_image_left",
++                            "observation/joint_position": "joint_position",
++                            "observation/gripper_position": "gripper_position",
++                            "prompt": "prompt",
++                        }
++                    )
++                ]
++            ),
++            data_transforms=_transforms.Group(
++                inputs=[DroidInputsWithStateHistory(model_config.model_type, self.num_state_frames)],
++                outputs=[droid_policy.DroidOutputs()],
++            ),
++            model_transforms=_config.ModelTransformFactory()(model_config),
++        )
++
++# Must match training exactly: the LoRA variants decide whether the params load at all, and
++# discrete_state_input decides how the prompt (and therefore the state) is built.
++def _model(action_expert_variant: str) -> pi0_config.Pi0Config:
++    """The training recipe. Everything here must match the checkpoint or the params will not load.
++
++    `action_expert_variant` is the one field that differs between the two released checkpoints:
++    `gemma_300m_lora` for the LoRA run and `gemma_300m` for the fully-trained expert. The parameter
++    trees differ structurally (71 vs 61 groups -- the LoRA layers simply do not exist in the second),
++    so the wrong value raises at load time rather than degrading quietly.
++    """
++    return pi0_config.Pi0Config(
++        pi05=True,
++        action_dim=32,
++        action_horizon=16,
++        discrete_state_input=True,
++        paligemma_variant="gemma_2b_lora_r32",
++        action_expert_variant=action_expert_variant,
++    )
++STATE_HISTORY_LAGS = (45, 75)
++NUM_STATE_FRAMES = 1 + len(STATE_HISTORY_LAGS)
++TASKS = ("pour lillet into the jigger", "pour gin into the jigger")
++
++
++@dataclasses.dataclass
++class Args:
++    # Directory holding `params/` and `assets/`.
++    checkpoint_dir: str = "."
++    # Interface to bind the websocket server to.
++    host: str = "0.0.0.0"
++    # Port to bind the websocket server to.
++    port: int = 8000
++    # Run a few dummy inferences and exit, instead of serving.
++    self_test: bool = False
++    # "gemma_300m_lora" for the LoRA action expert, "gemma_300m" for the fully-trained one.
++    # See the DEPLOY.md shipped alongside the checkpoint.
++    action_expert_variant: str = "gemma_300m_lora"
++
++
++def build_policy(checkpoint_dir: str, action_expert_variant: str = "gemma_300m_lora"):
++    config = _config.TrainConfig(
++        name="pi05_wine_hybrid",
++        exp_name="deploy",
++        model=_model(action_expert_variant),
++        # repo_id only supplies the asset_id under which the norm stats sit inside the checkpoint's
++        # `assets/` directory; the dataset itself is not needed at inference.
++        data=_WineDataConfig(
++            repo_id="fitz0401/franka_pour_wine",
++            num_state_frames=NUM_STATE_FRAMES,
++            base_config=_config.DataConfig(prompt_from_task=True),
++        ),
++    )
++    # No default_prompt on purpose: see the module docstring.
++    return _policy_config.create_trained_policy(config, checkpoint_dir)
++
++
++def self_test(policy) -> None:
++    def example(task: str) -> dict:
++        rng = np.random.default_rng(0)
++        return {
++            "observation/exterior_image_1_left": rng.integers(0, 256, (180, 320, 3), dtype=np.uint8),
++            "observation/wrist_image_left": rng.integers(0, 256, (180, 320, 3), dtype=np.uint8),
++            # Current first, then t-45 and t-75. Here they are identical, which is what a client
++            # should send during the first 75 frames after startup.
++            "observation/joint_position": np.tile(rng.uniform(-1, 1, 7), (NUM_STATE_FRAMES, 1)),
++            "observation/gripper_position": np.full((NUM_STATE_FRAMES,), 0.9),
++            "prompt": task,
++        }
++
++    logging.info(f"state contract: {NUM_STATE_FRAMES} stacked frames, lags {STATE_HISTORY_LAGS} (current first)")
++    logging.info("first call includes JIT compilation and is much slower")
++    for task in TASKS:
++        for i in range(2):
++            t0 = time.monotonic()
++            actions = policy.infer(example(task))["actions"]
++            logging.info(f"{task!r} call {i}: {(time.monotonic() - t0) * 1000:8.1f} ms  {actions.shape} {actions.dtype}")
++
++    # A missing prompt must fail loudly rather than default to one of the two tasks.
++    bad = example(TASKS[0])
++    del bad["prompt"]
++    try:
++        policy.infer(bad)
++    except Exception as e:  # noqa: BLE001 - we only care that it refuses
++        logging.info(f"request without a prompt correctly rejected: {type(e).__name__}: {e}")
++    else:
++        logging.error("A request without a prompt was ACCEPTED -- the server would guess the task.")
++
++    # A single (unstacked) state must also fail, rather than silently mean something else.
++    stale = example(TASKS[0])
++    stale["observation/joint_position"] = stale["observation/joint_position"][0]
++    stale["observation/gripper_position"] = stale["observation/gripper_position"][:1]
++    try:
++        policy.infer(stale)
++    except ValueError as e:
++        logging.info(f"single-frame state correctly rejected: {e}")
++    else:
++        logging.error("A single-frame state was ACCEPTED -- history would be silently wrong.")
++
++    logging.info("self-test OK")
++
++
++def main(args: Args) -> None:
++    # force=True: importing jax/absl installs a root handler above INFO, which makes a plain
++    # basicConfig() a silent no-op and swallows every logging call in this script.
++    logging.basicConfig(
++        level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S", force=True
++    )
++    policy = build_policy(args.checkpoint_dir, args.action_expert_variant)
++    if args.self_test:
++        self_test(policy)
++        return
++    logging.info(
++        f"serving on {args.host}:{args.port}; action expert {args.action_expert_variant}; "
++        f"prompt is mandatory, one of {TASKS}"
++    )
++    websocket_policy_server.WebsocketPolicyServer(
++        policy,
++        host=args.host,
++        port=args.port,
++        metadata={
++            "model": "pi05_wine_hybrid",
++            "action_horizon": _model(args.action_expert_variant).action_horizon,
++            "state_history_lags": list(STATE_HISTORY_LAGS),
++            "num_state_frames": NUM_STATE_FRAMES,
++            "tasks": list(TASKS),
++        },
++    ).serve_forever()
++
++
++if __name__ == "__main__":
++    main(tyro.cli(Args))
+diff --git a/scripts/compute_norm_stats.py b/scripts/compute_norm_stats.py
+index c8aef87..24b8863 100644
+--- a/scripts/compute_norm_stats.py
++++ b/scripts/compute_norm_stats.py
+@@ -86,6 +86,28 @@ def create_rlds_dataloader(
+     return data_loader, num_batches
+ 
+ 
++def _tile_base_state_stats(stats: normalize.NormStats, num_frames: int) -> normalize.NormStats:
++    """Give every stacked state frame the same normalisation as the current one.
++
++    The stacked blocks hold the same physical quantities at different times, so they must share one
++    mapping: the whole point of the design is that the *difference* between blocks is readable, and
++    per-block quantiles would corrupt exactly that. They would also differ for a spurious reason --
++    the lagged blocks repeat each episode's first frame `lag` times because of LeRobot's clamping,
++    which drags their low quantiles towards the home pose.
++
++    The leading block is estimated on the unclamped current values, so it is the one to copy.
++    """
++    dim = stats.q01.shape[-1]
++    if dim % num_frames != 0:
++        raise ValueError(f"State dim {dim} is not divisible by {num_frames} stacked frames.")
++    base = dim // num_frames
++
++    def tile(x):
++        return None if x is None else np.tile(x[..., :base], num_frames)
++
++    return normalize.NormStats(mean=tile(stats.mean), std=tile(stats.std), q01=tile(stats.q01), q99=tile(stats.q99))
++
++
+ def main(config_name: str, max_frames: int | None = None):
+     config = _config.get_config(config_name)
+     data_config = config.data.create(config.assets_dirs, config.model)
+@@ -108,6 +130,9 @@ def main(config_name: str, max_frames: int | None = None):
+ 
+     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+ 
++    if data_config.state_history_lags:
++        norm_stats["state"] = _tile_base_state_stats(norm_stats["state"], 1 + len(data_config.state_history_lags))
++
+     output_path = config.assets_dirs / data_config.repo_id
+     print(f"Writing stats to: {output_path}")
+     normalize.save(output_path, norm_stats)
+diff --git a/scripts/eval_offline.py b/scripts/eval_offline.py
+new file mode 100644
+index 0000000..c6d8b5c
+--- /dev/null
++++ b/scripts/eval_offline.py
+@@ -0,0 +1,176 @@
++"""Offline evaluation of one or more saved checkpoints.
++
++Forward passes only -- no optimizer, no gradients. For each requested step it restores the params,
++runs the shared validation metrics from `openpi.training.evaluation` over a fixed set of batches,
++and writes one JSON per checkpoint plus a summary table.
++
++Example:
++
++    uv run scripts/eval_offline.py --config-name pi05_custom_droid_hybrid \
++        --exp-name b0_custom_droid_full_15k \
++        --steps 5000,10000,14999 \
++        --split val --val-episodes 4,12,17 \
++        --num-batches 16
++
++Note on interpretation: if the checkpoints being evaluated were trained on the episodes named by
++--val-episodes (as is the case for the original `b0_custom_droid_full_15k` run, which used all 20),
++the numbers are in-sample. In-sample loss falls monotonically with training, so it measures fit,
++not generalization, and must not be used to pick a "best" checkpoint.
++"""
++
++import dataclasses
++import json
++import logging
++import pathlib
++
++import etils.epath as epath
++import jax
++import jax.numpy as jnp
++import tyro
++
++import openpi.models.model as _model
++import openpi.training.config as _config
++import openpi.training.data_loader as _data_loader
++import openpi.training.evaluation as _evaluation
++import openpi.training.sharding as sharding
++
++
++@dataclasses.dataclass
++class Args:
++    # Name of the training config the checkpoints were produced with. This must be the config the
++    # model was *trained* with: it determines the architecture and, importantly, the norm stats.
++    config_name: str
++    # Experiment name, i.e. the checkpoint sub-directory. Defaults to the config's exp_name.
++    exp_name: str | None = None
++    # Explicit checkpoint directory; overrides config_name/exp_name based lookup.
++    checkpoint_dir: str | None = None
++    # Comma-separated steps to evaluate. Defaults to every step present in the checkpoint dir.
++    steps: str | None = None
++    # Which split to evaluate on.
++    split: str = "val"
++    # Comma-separated validation episodes. Defaults to the config's val_episodes.
++    val_episodes: str | None = None
++    # Number of batches per checkpoint. 16 batches x 64 = 1024 windows is enough for a stable mean.
++    num_batches: int = 16
++    # Batch size; defaults to the training batch size.
++    batch_size: int | None = None
++    # Seed for the fixed validation noise/time draws. Must match across checkpoints to compare them.
++    seed: int = 0
++    # Whether to also sample actions and report action-space errors (costs num_denoise_steps
++    # forward passes per batch, but these are the interpretable numbers).
++    sample_actions: bool = True
++    num_denoise_steps: int = 10
++    # Where to write results. Defaults to artifacts/eval/<exp_name>.
++    out_dir: str | None = None
++
++
++def _parse_ints(value: str | None) -> tuple[int, ...] | None:
++    if value is None:
++        return None
++    return tuple(int(part) for part in value.replace(" ", "").split(",") if part)
++
++
++def main(args: Args) -> None:
++    # force=True: importing jax/absl installs a root handler above INFO, which makes a plain
++    # basicConfig() a silent no-op and swallows every logging call in this script.
++    logging.basicConfig(
++        level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S", force=True
++    )
++
++    config = _config.get_config(args.config_name)
++    if args.exp_name is not None:
++        config = dataclasses.replace(config, exp_name=args.exp_name)
++    checkpoint_dir = epath.Path(args.checkpoint_dir) if args.checkpoint_dir else epath.Path(config.checkpoint_dir)
++    if not checkpoint_dir.exists():
++        raise FileNotFoundError(f"Checkpoint directory {checkpoint_dir} does not exist.")
++
++    steps = _parse_ints(args.steps)
++    if steps is None:
++        steps = tuple(sorted(int(p.name) for p in checkpoint_dir.iterdir() if p.is_dir() and p.name.isdigit()))
++    if not steps:
++        raise ValueError(f"No checkpoints found in {checkpoint_dir}.")
++
++    val_episodes = _parse_ints(args.val_episodes)
++    if val_episodes is None:
++        val_episodes = config.val_episodes
++    if args.split != "all" and not val_episodes:
++        raise ValueError(f"--split={args.split} needs --val-episodes (the config defines none).")
++
++    out_dir = pathlib.Path(args.out_dir or f"artifacts/eval/{config.exp_name}")
++    out_dir.mkdir(parents=True, exist_ok=True)
++
++    mesh = sharding.make_mesh(config.fsdp_devices)
++    data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
++
++    # shuffle=False so that every checkpoint sees exactly the same windows in the same order.
++    data_loader = _data_loader.create_data_loader(
++        config,
++        sharding=data_sharding,
++        shuffle=False,
++        split=args.split,
++        val_episodes=val_episodes,
++        batch_size=args.batch_size,
++    )
++
++    results = {}
++    for step in steps:
++        params_path = checkpoint_dir / str(step) / "params"
++        if not params_path.exists():
++            raise FileNotFoundError(f"No params at {params_path}.")
++        logging.info(f"=== step {step}: loading {params_path}")
++        model = config.model.load(_model.restore_params(params_path, dtype=jnp.bfloat16))
++
++        with sharding.set_mesh(mesh):
++            metrics = _evaluation.evaluate_model(
++                model,
++                data_loader,
++                num_batches=args.num_batches,
++                seed=args.seed,
++                sample_actions=args.sample_actions,
++                num_denoise_steps=args.num_denoise_steps,
++            )
++        metrics |= {
++            "step": step,
++            "config_name": config.name,
++            "checkpoint_dir": str(checkpoint_dir),
++            "split": args.split,
++            "val_episodes": list(val_episodes),
++            "seed": args.seed,
++            "batch_size": args.batch_size or config.batch_size,
++            "num_denoise_steps": args.num_denoise_steps if args.sample_actions else None,
++        }
++        results[step] = metrics
++        (out_dir / f"eval_step{step}.json").write_text(json.dumps(metrics, indent=2))
++        logging.info(f"step {step}: " + ", ".join(f"{k}={v:.5f}" for k, v in metrics.items() if isinstance(v, float)))
++        del model
++
++    summary_path = out_dir / "eval_summary.json"
++    summary_path.write_text(json.dumps({str(k): v for k, v in results.items()}, indent=2))
++
++    scalar_keys = [
++        "val_loss",
++        "action_mse_phys",
++        "action_mae_phys",
++        "gripper_mae",
++        "pred_stall_frac",
++        "gt_stall_frac",
++        "creep_speed_p50",
++        "creep_speed_p90",
++        "moving_speed_p50",
++        "creep_ratio",
++        "pred_abs_joint_mean",
++        "gt_abs_joint_mean",
++    ]
++    header = f"{'step':>8} " + " ".join(f"{k:>19}" for k in scalar_keys if k in next(iter(results.values())))
++    print("\n" + header)
++    print("-" * len(header))
++    for step, metrics in sorted(results.items()):
++        row = f"{step:>8} " + " ".join(
++            f"{metrics[k]:>19.6f}" for k in scalar_keys if k in metrics and isinstance(metrics[k], float)
++        )
++        print(row)
++    print(f"\nWrote {summary_path}")
++
++
++if __name__ == "__main__":
++    main(tyro.cli(Args))
+diff --git a/scripts/launch_leonardo_4gpu_eval.sh b/scripts/launch_leonardo_4gpu_eval.sh
+new file mode 100755
+index 0000000..bb24b7e
+--- /dev/null
++++ b/scripts/launch_leonardo_4gpu_eval.sh
+@@ -0,0 +1,61 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# Offline evaluation of saved checkpoints on one Leonardo Booster node (4x A100 64GB).
++# Forward passes only, so this is far cheaper than training: budget ~5 min per checkpoint.
++#
++#   CKPT_STEPS=5000,10000,14999 bash scripts/launch_leonardo_4gpu_eval.sh
++#
++# Environment overrides: CONFIG_NAME, EXP_NAME, CKPT_STEPS, SPLIT, VAL_EPISODES, NUM_BATCHES,
++# EVAL_BATCH_SIZE, SAMPLE_ACTIONS, OUT_DIR.
++ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++cd "${ROOT_DIR}"
++
++WORK_ROOT="${WORK_ROOT:-/leonardo_work/EUHPC_D35_005}"
++export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-${WORK_ROOT}/datasets/lerobot}"
++export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-${WORK_ROOT}/.cache/openpi}"
++export HF_HOME="${HF_HOME:-${WORK_ROOT}/.cache/huggingface}"
++export UV_CACHE_DIR="${UV_CACHE_DIR:-${WORK_ROOT}/.cache/uv}"
++export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-${WORK_ROOT}/.cache/uv/python}"
++export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
++export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.90}"
++export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
++export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-${WORK_ROOT}/.cache/jax}"
++export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
++
++CONFIG_NAME="${CONFIG_NAME:-pi05_custom_droid_hybrid}"
++EXP_NAME="${EXP_NAME:-b0_custom_droid_full_15k}"
++CKPT_STEPS="${CKPT_STEPS:-}"
++SPLIT="${SPLIT:-val}"
++# Empty by default: eval_offline.py then falls back to the train config's own val_episodes,
++# which is the only place that knows the right split for a given dataset. Hard-coding a
++# default here silently evaluated wine checkpoints on custom_droid's episodes once.
++VAL_EPISODES="${VAL_EPISODES:-}"
++NUM_BATCHES="${NUM_BATCHES:-16}"
++EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-64}"
++SAMPLE_ACTIONS="${SAMPLE_ACTIONS:-true}"
++OUT_DIR="${OUT_DIR:-artifacts/eval/${EXP_NAME}}"
++UV_BIN="${UV_BIN:-${WORK_ROOT}/conda/envs/jepa-wms/bin/uv}"
++UV_RUN_ARGS=(run --managed-python --python 3.11 --no-dev --python-platform x86_64-manylinux_2_31)
++
++mkdir -p "${OUT_DIR}" "${JAX_COMPILATION_CACHE_DIR}"
++
++EVAL_ARGS=(
++  --config-name "${CONFIG_NAME}"
++  --exp-name "${EXP_NAME}"
++  --split "${SPLIT}"
++  --num-batches "${NUM_BATCHES}"
++  --batch-size "${EVAL_BATCH_SIZE}"
++  --out-dir "${OUT_DIR}"
++)
++if [[ -n "${VAL_EPISODES}" ]]; then
++  EVAL_ARGS+=(--val-episodes "${VAL_EPISODES}")
++fi
++if [[ -n "${CKPT_STEPS}" ]]; then
++  EVAL_ARGS+=(--steps "${CKPT_STEPS}")
++fi
++if [[ "${SAMPLE_ACTIONS}" == "false" ]]; then
++  EVAL_ARGS+=(--no-sample-actions)
++fi
++
++"${UV_BIN}" "${UV_RUN_ARGS[@]}" scripts/eval_offline.py "${EVAL_ARGS[@]}"
+diff --git a/scripts/launch_leonardo_4gpu_wine.sh b/scripts/launch_leonardo_4gpu_wine.sh
+new file mode 100755
+index 0000000..f782589
+--- /dev/null
++++ b/scripts/launch_leonardo_4gpu_wine.sh
+@@ -0,0 +1,129 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# Run inside one Leonardo Booster node allocation with 4x A100 64GB.
++# Modes: preflight, probe, full.
++#   preflight - one batch through the input pipeline (no training)
++#   probe     - 20 optimizer steps, checks grad norms / throughput / checkpointing
++#   full      - the real pi05_base -> wine post-training run
++MODE="${1:-preflight}"
++ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++cd "${ROOT_DIR}"
++
++WORK_ROOT="${WORK_ROOT:-/leonardo_work/EUHPC_D35_005}"
++export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-${WORK_ROOT}/datasets/lerobot}"
++export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-${WORK_ROOT}/.cache/openpi}"
++export HF_HOME="${HF_HOME:-${WORK_ROOT}/.cache/huggingface}"
++export UV_CACHE_DIR="${UV_CACHE_DIR:-${WORK_ROOT}/.cache/uv}"
++export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-${WORK_ROOT}/.cache/uv/python}"
++export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
++export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.90}"
++export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
++export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-${WORK_ROOT}/.cache/jax}"
++# Compute nodes have no outbound network: everything below must already be on disk.
++export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
++
++CONFIG_NAME="${CONFIG_NAME:-pi05_wine_hybrid}"
++GLOBAL_BATCH="${GLOBAL_BATCH:-64}"
++FSDP_DEVICES="${FSDP_DEVICES:-1}"
++NORM_MAX_FRAMES="${NORM_MAX_FRAMES:-60000}"
++LOG_DIR="${LOG_DIR:-artifacts/leonardo_4gpu_wine}"
++WANDB_ENABLED="${WANDB_ENABLED:-false}"
++RUN_NORM_STATS="${RUN_NORM_STATS:-auto}"  # auto | true | false
++UV_BIN="${UV_BIN:-${WORK_ROOT}/conda/envs/jepa-wms/bin/uv}"
++UV_RUN_ARGS=(run --managed-python --python 3.11 --no-dev --python-platform x86_64-manylinux_2_31)
++RESUME="${RESUME:-false}"
++OVERWRITE="${OVERWRITE:-false}"
++
++case "${MODE}" in
++  preflight)
++    PREFLIGHT_BATCH="${PREFLIGHT_BATCH:-4}"
++    ;;
++  probe)
++    EXP_NAME="${EXP_NAME:-b1_wine_probe_fsdp${FSDP_DEVICES}_gb${GLOBAL_BATCH}}"
++    NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-20}"
++    LOG_INTERVAL="${LOG_INTERVAL:-1}"
++    SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
++    ;;
++  scan)
++    # Locate where overfitting starts: short run, fine-grained eval and saves so that every
++    # recorded point has a checkpoint behind it. The 30k run only recorded at its 2,500-step save
++    # interval, so its earliest point was already past the minimum.
++    EXP_NAME="${EXP_NAME:-b1_wine_scan_4k}"
++    NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-4000}"
++    LOG_INTERVAL="${LOG_INTERVAL:-100}"
++    SAVE_INTERVAL="${SAVE_INTERVAL:-250}"
++    EVAL_INTERVAL="${EVAL_INTERVAL:-250}"
++    # 16 batches instead of 8 halves the standard error of the mean, which matters when comparing
++    # points near a shallow minimum. Not directly comparable to the 30k run's numbers.
++    EVAL_NUM_BATCHES="${EVAL_NUM_BATCHES:-16}"
++    ;;
++  full)
++    EXP_NAME="${EXP_NAME:-b1_wine_full_30k}"
++    NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-30000}"
++    LOG_INTERVAL="${LOG_INTERVAL:-100}"
++    SAVE_INTERVAL="${SAVE_INTERVAL:-2500}"
++    ;;
++  *)
++    echo "Unknown mode: ${MODE}; expected preflight, probe, scan, or full" >&2
++    exit 2
++    ;;
++esac
++
++mkdir -p "${LOG_DIR}" "${OPENPI_DATA_HOME}" "${HF_HOME}" "${UV_CACHE_DIR}" "${JAX_COMPILATION_CACHE_DIR}"
++
++MONITOR_LOG="${LOG_DIR}/${MODE}_${CONFIG_NAME}_nvidia_smi.csv"
++if command -v nvidia-smi >/dev/null 2>&1; then
++  nvidia-smi --query-gpu=timestamp,index,memory.used,memory.total,utilization.gpu --format=csv -l 5 > "${MONITOR_LOG}" &
++  MONITOR_PID=$!
++  trap 'kill ${MONITOR_PID} >/dev/null 2>&1 || true' EXIT
++fi
++
++if [[ "${MODE}" == "preflight" ]]; then
++  "${UV_BIN}" "${UV_RUN_ARGS[@]}" examples/custom_droid/preflight_custom_droid_batch.py \
++    --config-name "${CONFIG_NAME}" \
++    --batch-size "${PREFLIGHT_BATCH}"
++  echo "preflight complete"
++  exit 0
++fi
++
++# Norm stats are computed once from the full dataset and then reused from
++# assets/<config>/<repo_id>/norm_stats.json. "auto" computes them only if missing.
++NORM_STATS_FILE="assets/${CONFIG_NAME}/fitz0401/franka_pour_wine/norm_stats.json"
++if [[ "${RUN_NORM_STATS}" == "auto" && ! -f "${NORM_STATS_FILE}" ]]; then
++  RUN_NORM_STATS=true
++fi
++if [[ "${RUN_NORM_STATS}" == "true" ]]; then
++  "${UV_BIN}" "${UV_RUN_ARGS[@]}" scripts/compute_norm_stats.py \
++    --config-name "${CONFIG_NAME}" \
++    --max-frames "${NORM_MAX_FRAMES}"
++fi
++
++TRAIN_ARGS=(
++  "${CONFIG_NAME}"
++  --exp-name="${EXP_NAME}"
++  --batch-size="${GLOBAL_BATCH}"
++  --fsdp-devices="${FSDP_DEVICES}"
++  --num-train-steps="${NUM_TRAIN_STEPS}"
++  --log-interval="${LOG_INTERVAL}"
++  --save-interval="${SAVE_INTERVAL}"
++)
++if [[ -n "${EVAL_INTERVAL:-}" ]]; then
++  TRAIN_ARGS+=(--eval-interval="${EVAL_INTERVAL}")
++fi
++if [[ -n "${EVAL_NUM_BATCHES:-}" ]]; then
++  TRAIN_ARGS+=(--eval-num-batches="${EVAL_NUM_BATCHES}")
++fi
++
++if [[ "${WANDB_ENABLED}" == "false" ]]; then
++  TRAIN_ARGS+=(--no-wandb-enabled)
++fi
++if [[ "${RESUME}" == "true" ]]; then
++  TRAIN_ARGS+=(--resume)
++elif [[ "${OVERWRITE}" == "true" ]]; then
++  TRAIN_ARGS+=(--overwrite)
++fi
++
++"${UV_BIN}" "${UV_RUN_ARGS[@]}" scripts/train.py "${TRAIN_ARGS[@]}"
++
++echo "nvidia-smi monitor: ${MONITOR_LOG}"
+diff --git a/scripts/sbatch_leonardo_eval.sbatch b/scripts/sbatch_leonardo_eval.sbatch
+new file mode 100644
+index 0000000..69c3a8b
+--- /dev/null
++++ b/scripts/sbatch_leonardo_eval.sbatch
+@@ -0,0 +1,26 @@
++#!/bin/bash
++#SBATCH --job-name=openpi-eval
++#SBATCH --account=euhpc_d35_005
++#SBATCH --partition=boost_usr_prod
++#SBATCH --nodes=1
++#SBATCH --ntasks=1
++#SBATCH --cpus-per-task=32
++#SBATCH --gres=gpu:4
++#SBATCH --mem=480G
++#SBATCH --time=01:00:00
++#SBATCH --output=/leonardo_work/EUHPC_D35_005/logs/openpi/slurm/%x-%j.out
++#SBATCH --error=/leonardo_work/EUHPC_D35_005/logs/openpi/slurm/%x-%j.err
++
++# Offline eval of saved checkpoints. Forward passes only; one hour is ample for a handful.
++#
++#   sbatch scripts/sbatch_leonardo_eval.sbatch
++#   sbatch --export=ALL,CKPT_STEPS=5000,10000,14999 scripts/sbatch_leonardo_eval.sbatch
++set -euo pipefail
++
++ROOT_DIR=/leonardo_work/EUHPC_D35_005/openpi
++cd "${ROOT_DIR}"
++
++hostname
++nvidia-smi
++
++bash scripts/launch_leonardo_4gpu_eval.sh
+diff --git a/scripts/sbatch_leonardo_selftest_wine.sbatch b/scripts/sbatch_leonardo_selftest_wine.sbatch
+new file mode 100644
+index 0000000..cd320f9
+--- /dev/null
++++ b/scripts/sbatch_leonardo_selftest_wine.sbatch
+@@ -0,0 +1,18 @@
++#!/bin/bash
++#SBATCH --job-name=openpi-wine-selftest
++#SBATCH --account=euhpc_d35_005
++#SBATCH --partition=boost_usr_prod
++#SBATCH --nodes=1 --ntasks=1 --cpus-per-task=8 --gres=gpu:1 --mem=120G --time=00:30:00
++#SBATCH --output=/leonardo_work/EUHPC_D35_005/logs/openpi/slurm/%x-%j.out
++#SBATCH --error=/leonardo_work/EUHPC_D35_005/logs/openpi/slurm/%x-%j.err
++set -uo pipefail
++WORK_ROOT=/leonardo_work/EUHPC_D35_005
++cd "${WORK_ROOT}/openpi"
++export OPENPI_DATA_HOME="${WORK_ROOT}/.cache/openpi" HF_HOME="${WORK_ROOT}/.cache/huggingface"
++export JAX_COMPILATION_CACHE_DIR="${WORK_ROOT}/.cache/jax"
++export XLA_PYTHON_CLIENT_PREALLOCATE=false HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1
++hostname
++echo "=== BEFORE python $(date +%T) ==="
++.venv/bin/python "${EXPORT_DIR}/serve_wine.py" --checkpoint-dir "${EXPORT_DIR}" \
++  --action-expert-variant "${AE_VARIANT}" --self-test 2>&1
++echo "=== AFTER python rc=$? $(date +%T) ==="
+diff --git a/scripts/sbatch_leonardo_verify_wine.sbatch b/scripts/sbatch_leonardo_verify_wine.sbatch
+new file mode 100644
+index 0000000..c3fabaf
+--- /dev/null
++++ b/scripts/sbatch_leonardo_verify_wine.sbatch
+@@ -0,0 +1,33 @@
++#!/bin/bash
++#SBATCH --job-name=openpi-verify-wine
++#SBATCH --account=euhpc_d35_005
++#SBATCH --partition=boost_usr_prod
++#SBATCH --nodes=1
++#SBATCH --ntasks=1
++#SBATCH --cpus-per-task=8
++#SBATCH --gres=gpu:1
++#SBATCH --mem=120G
++#SBATCH --time=00:40:00
++#SBATCH --output=/leonardo_work/EUHPC_D35_005/logs/openpi/slurm/%x-%j.out
++#SBATCH --error=/leonardo_work/EUHPC_D35_005/logs/openpi/slurm/%x-%j.err
++set -uo pipefail
++WORK_ROOT=/leonardo_work/EUHPC_D35_005
++cd "${WORK_ROOT}/openpi"
++export HF_LEROBOT_HOME="${WORK_ROOT}/datasets/lerobot"
++export OPENPI_DATA_HOME="${WORK_ROOT}/.cache/openpi"
++export HF_HOME="${WORK_ROOT}/.cache/huggingface"
++export JAX_COMPILATION_CACHE_DIR="${WORK_ROOT}/.cache/jax"
++export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
++export XLA_PYTHON_CLIENT_PREALLOCATE=false
++export HF_HUB_OFFLINE=1
++export PYTHONUNBUFFERED=1
++hostname
++nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
++echo "=== BEFORE python $(date +%T) ==="
++.venv/bin/python scripts/verify_export.py \
++  --config-name "${CONFIG_NAME:-pi05_wine_hybrid}" \
++  --checkpoint-dir "${CKPT_DIR}" \
++  --export-dir "${EXPORT_DIR}" 2>&1
++rc=$?
++echo "=== AFTER python rc=${rc} $(date +%T) ==="
++exit "${rc}"
+diff --git a/scripts/sbatch_leonardo_wine.sbatch b/scripts/sbatch_leonardo_wine.sbatch
+new file mode 100644
+index 0000000..9b9306d
+--- /dev/null
++++ b/scripts/sbatch_leonardo_wine.sbatch
+@@ -0,0 +1,36 @@
++#!/bin/bash
++#SBATCH --job-name=openpi-wine
++#SBATCH --account=euhpc_d35_005
++#SBATCH --partition=boost_usr_prod
++#SBATCH --nodes=1
++#SBATCH --ntasks=1
++#SBATCH --cpus-per-task=32
++#SBATCH --gres=gpu:4
++#SBATCH --mem=480G
++#SBATCH --time=04:00:00
++#SBATCH --output=/leonardo_work/EUHPC_D35_005/logs/openpi/slurm/%x-%j.out
++#SBATCH --error=/leonardo_work/EUHPC_D35_005/logs/openpi/slurm/%x-%j.err
++
++# Usage:
++#   sbatch scripts/sbatch_leonardo_wine.sbatch            # probe, then full
++#   sbatch scripts/sbatch_leonardo_wine.sbatch probe
++#   sbatch --export=ALL,RESUME=true scripts/sbatch_leonardo_wine.sbatch full
++#
++# Norm stats are computed inside the first mode that needs them (RUN_NORM_STATS=auto)
++# and then reused, so the whole pipeline fits in one allocation.
++set -euo pipefail
++
++MODES=("${@:-probe full}")
++if [[ $# -eq 0 ]]; then
++  MODES=(probe full)
++fi
++ROOT_DIR=/leonardo_work/EUHPC_D35_005/openpi
++cd "${ROOT_DIR}"
++
++hostname
++nvidia-smi
++
++for mode in "${MODES[@]}"; do
++  echo "=== launch_leonardo_4gpu_wine.sh ${mode} ==="
++  bash scripts/launch_leonardo_4gpu_wine.sh "${mode}"
++done
+diff --git a/scripts/train.py b/scripts/train.py
+index 5d28941..a4b573c 100644
+--- a/scripts/train.py
++++ b/scripts/train.py
+@@ -1,7 +1,9 @@
+ import dataclasses
+ import functools
++import json
+ import logging
+ import platform
++import time
+ from typing import Any
+ 
+ import etils.epath as epath
+@@ -16,12 +18,14 @@ import optax
+ import tqdm_loggable.auto as tqdm
+ import wandb
+ 
++import openpi.models.gemma as _gemma
+ import openpi.models.model as _model
+ import openpi.shared.array_typing as at
+ import openpi.shared.nnx_utils as nnx_utils
+ import openpi.training.checkpoints as _checkpoints
+ import openpi.training.config as _config
+ import openpi.training.data_loader as _data_loader
++import openpi.training.evaluation as _evaluation
+ import openpi.training.optimizer as _optimizer
+ import openpi.training.sharding as sharding
+ import openpi.training.utils as training_utils
+@@ -186,11 +190,174 @@ def train_step(
+     info = {
+         "loss": loss,
+         "grad_norm": optax.global_norm(grads),
++        "grad_norm_siglip": optax.global_norm(grads.filter(nnx_utils.PathRegex(".*PaliGemma/img.*"))),
++        "grad_norm_vlm_lora": optax.global_norm(
++            grads.filter(
++                nnx_utils.PathRegex(
++                    ".*PaliGemma/llm/layers/(attn/(attn_vec_einsum|kv_einsum|q_einsum)/lora.*|mlp/(gating_einsum|linear)_lora_.*)"
++                )
++            )
++        ),
++        "grad_norm_action_expert_lora": optax.global_norm(
++            grads.filter(
++                nnx_utils.PathRegex(
++                    ".*PaliGemma/llm/layers/(attn/(attn_vec_einsum_1|kv_einsum_1|q_einsum_1)/lora.*|mlp_1/(gating_einsum|linear)_lora_.*)"
++                )
++            )
++        ),
++        "grad_norm_projection": optax.global_norm(
++            grads.filter(
++                nnx_utils.PathRegex(
++                    ".*(action_in_proj|action_out_proj|time_mlp_in|time_mlp_out|state_proj|action_time_mlp_in|action_time_mlp_out).*"
++                )
++            )
++        ),
+         "param_norm": optax.global_norm(kernel_params),
+     }
+     return new_state, info
+ 
+ 
++@at.typecheck
++def eval_step(
++    rng: at.KeyArrayLike,
++    state: training_utils.TrainState,
++    batch: tuple[_model.Observation, _model.Actions],
++) -> at.Array:
++    """Denoising loss of one validation batch. Forward only -- no gradients, no state update."""
++    model = nnx.merge(state.model_def, state.params)
++    model.eval()
++    observation, actions = batch
++    return jnp.mean(model.compute_loss(rng, observation, actions, train=False))
++
++
++@at.typecheck
++def eval_sample_step(
++    num_steps: int,
++    rng: at.KeyArrayLike,
++    state: training_utils.TrainState,
++    batch: tuple[_model.Observation, _model.Actions],
++) -> at.Array:
++    """Sample an action chunk from a validation batch. Jitted once, unlike `module_jit`, which would
++    re-trace on every call because it freezes the module state at call time."""
++    model = nnx.merge(state.model_def, state.params)
++    model.eval()
++    observation, _ = batch
++    return model.sample_actions(rng, observation, num_steps=num_steps)
++
++
++def run_validation(
++    peval_step,
++    val_loader: _data_loader.DataLoader,
++    config: _config.TrainConfig,
++    state: training_utils.TrainState,
++    mesh: jax.sharding.Mesh,
++    peval_sample=None,
++) -> dict[str, float]:
++    """Mean validation loss over a fixed set of batches.
++
++    The iterator is restarted and the rng re-derived from `config.eval_seed` on every call, so each
++    evaluation sees the same windows with the same noise and timestep draws. Without that, the
++    step-to-step differences would be dominated by sampling noise rather than by learning.
++    """
++    val_iter = iter(val_loader)
++    eval_rng = jax.random.key(config.eval_seed)
++    data_config = val_loader.data_config()
++    losses = []
++    errors = _evaluation.ActionErrorAccumulator() if peval_sample is not None else None
++    for i in range(config.eval_num_batches):
++        val_batch = next(val_iter)
++        batch_rng = jax.random.fold_in(eval_rng, i)
++        with sharding.set_mesh(mesh):
++            losses.append(peval_step(batch_rng, state, val_batch))
++            if errors is not None:
++                pred = np.asarray(jax.device_get(peval_sample(batch_rng, state, val_batch)))
++                gt = np.asarray(jax.device_get(val_batch[1]))
++                dim = np.asarray(data_config.norm_stats["actions"].q01).shape[-1]
++                unnorm = functools.partial(
++                    _evaluation.unnormalize_actions,
++                    norm_stats=data_config.norm_stats,
++                    use_quantiles=data_config.use_quantile_norm,
++                )
++                errors.update(unnorm(pred), unnorm(gt), pred[..., :dim], gt[..., :dim])
++    losses = jax.device_get(losses)
++    info = {"val_loss": float(np.mean(losses)), "val_loss_std": float(np.std(losses))}
++    if errors is not None:
++        info |= {k: v for k, v in errors.result().items() if isinstance(v, (int, float))}
++    return info
++
++
++def _state_to_summary(state) -> dict[str, dict[str, object]]:
++    if hasattr(state, "to_pure_dict"):
++        state = state.to_pure_dict()
++    flat = traverse_util.flatten_dict(state, sep="/")
++    summary = {}
++    for path, value in sorted(flat.items()):
++        shape = list(getattr(value, "shape", ()))
++        dtype = str(getattr(value, "dtype", type(value).__name__))
++        summary[str(path)] = {"shape": shape, "dtype": dtype}
++    return summary
++
++
++def _state_param_count(state) -> int:
++    if hasattr(state, "to_pure_dict"):
++        state = state.to_pure_dict()
++    total = 0
++    for leaf in jax.tree.leaves(state):
++        if hasattr(leaf, "shape"):
++            total += int(np.prod(leaf.shape))
++    return total
++
++
++def _lora_config_summary(model_config: _model.BaseModelConfig) -> dict[str, object]:
++    summary = {}
++    for label, attr in (("vlm_gemma", "paligemma_variant"), ("action_expert", "action_expert_variant")):
++        variant = getattr(model_config, attr, None)
++        if not isinstance(variant, str):
++            continue
++        config = _gemma.get_config(variant)
++        summary[label] = {
++            "variant": variant,
++            "targets": {
++                name: {"rank": lora_config.rank, "alpha": lora_config.alpha}
++                for name, lora_config in config.lora_configs.items()
++            },
++        }
++    return summary
++
++
++def _log_and_save_trainable_metadata(config: _config.TrainConfig, params) -> None:
++    if jax.process_index() != 0:
++        return
++
++    all_params = params.filter(nnx.Param)
++    trainable_params = params.filter(config.trainable_filter)
++    all_summary = _state_to_summary(all_params)
++    trainable_summary = _state_to_summary(trainable_params)
++    frozen_summary = {path: value for path, value in all_summary.items() if path not in trainable_summary}
++
++    metadata = {
++        "config_name": config.name,
++        "model_type": str(config.model.model_type),
++        "batch_size": config.batch_size,
++        "fsdp_devices": config.fsdp_devices,
++        "lora": _lora_config_summary(config.model),
++        "lora_parameter_paths": [path for path in trainable_summary if "lora" in path],
++        "trainable_parameter_count": _state_param_count(trainable_params),
++        "frozen_parameter_count": _state_param_count(all_params) - _state_param_count(trainable_params),
++        "trainable_parameters": trainable_summary,
++        "frozen_parameters": frozen_summary,
++    }
++
++    output_path = config.checkpoint_dir / "trainable_parameters.json"
++    output_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
++    logging.info(
++        "Saved trainable parameter metadata to %s; trainable=%d frozen=%d",
++        output_path,
++        metadata["trainable_parameter_count"],
++        metadata["frozen_parameter_count"],
++    )
++
++
+ def main(config: _config.TrainConfig):
+     init_logging()
+     logging.info(f"Running on: {platform.node()}")
+@@ -214,6 +381,7 @@ def main(config: _config.TrainConfig):
+         keep_period=config.keep_period,
+         overwrite=config.overwrite,
+         resume=config.resume,
++        keep_best=config.keep_best_checkpoint,
+     )
+     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+ 
+@@ -221,6 +389,7 @@ def main(config: _config.TrainConfig):
+         config,
+         sharding=data_sharding,
+         shuffle=True,
++        split="train" if config.val_episodes else "all",
+     )
+     data_iter = iter(data_loader)
+     batch = next(data_iter)
+@@ -240,6 +409,8 @@ def main(config: _config.TrainConfig):
+     if resuming:
+         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+ 
++    _log_and_save_trainable_metadata(config, train_state.params)
++
+     ptrain_step = jax.jit(
+         functools.partial(train_step, config),
+         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+@@ -247,6 +418,33 @@ def main(config: _config.TrainConfig):
+         donate_argnums=(1,),
+     )
+ 
++    val_loader = None
++    peval_step = None
++    peval_sample = None
++    if config.eval_enabled:
++        # shuffle=False: validation must see the same windows in the same order every time.
++        val_loader = _data_loader.create_data_loader(
++            config,
++            sharding=data_sharding,
++            shuffle=False,
++            split="val",
++        )
++        peval_step = jax.jit(
++            eval_step,
++            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
++            out_shardings=replicated_sharding,
++        )
++        if config.eval_sample_actions:
++            peval_sample = jax.jit(
++                functools.partial(eval_sample_step, config.eval_num_denoise_steps),
++                in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
++                out_shardings=replicated_sharding,
++            )
++        logging.info(
++            f"Validation enabled: episodes {list(config.val_episodes)}, every {config.eval_interval} steps, "
++            f"{config.eval_num_batches} batches"
++        )
++
+     start_step = int(train_state.step)
+     pbar = tqdm.tqdm(
+         range(start_step, config.num_train_steps),
+@@ -256,6 +454,8 @@ def main(config: _config.TrainConfig):
+     )
+ 
+     infos = []
++    last_log_time = time.monotonic()
++    last_log_step = start_step
+     for step in pbar:
+         with sharding.set_mesh(mesh):
+             train_state, info = ptrain_step(train_rng, train_state, batch)
+@@ -263,17 +463,56 @@ def main(config: _config.TrainConfig):
+         if step % config.log_interval == 0:
+             stacked_infos = common_utils.stack_forest(infos)
+             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
++            now = time.monotonic()
++            steps_since_last_log = max(step - last_log_step, 1)
++            step_time = (now - last_log_time) / steps_since_last_log
++            reduced_info["step_time"] = step_time
++            reduced_info["samples_per_sec"] = config.batch_size / step_time
+             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+             pbar.write(f"Step {step}: {info_str}")
+             wandb.log(reduced_info, step=step)
+             infos = []
++            last_log_time = now
++            last_log_step = step
+         batch = next(data_iter)
+ 
+-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
++        saving = (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1
++        # Validate on the eval cadence, and always right before a save so that every checkpoint has
++        # a metric to be ranked by.
++        if peval_step is not None and (saving or (step % config.eval_interval == 0 and step > start_step)):
++            val_info = run_validation(peval_step, val_loader, config, train_state, mesh, peval_sample)
++            pbar.write(f"Step {step}: " + ", ".join(f"{k}={v:.4f}" for k, v in val_info.items()))
++            wandb.log(val_info, step=step)
++            # Record every evaluation, not only the ones that coincide with a save. Ranking only
++            # looks at steps that still have a checkpoint, but the full curve is what tells you
++            # where to stop next time, and it costs a few hundred bytes.
++            _checkpoints.record_eval_metrics(config.checkpoint_dir, step, val_info)
++
++        if saving:
+             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
++            if config.keep_best_checkpoint:
++                _checkpoints.prune_to_final_and_best(
++                    checkpoint_manager, config.checkpoint_dir, config.best_metric, mode=config.best_metric_mode
++                )
+ 
+     logging.info("Waiting for checkpoint manager to finish")
+     checkpoint_manager.wait_until_finished()
++    if config.keep_best_checkpoint:
++        _checkpoints.prune_to_final_and_best(
++            checkpoint_manager, config.checkpoint_dir, config.best_metric, mode=config.best_metric_mode
++        )
++        # Report the best among the checkpoints that actually survived, not the best evaluation
++        # point: with eval_interval < save_interval most minima have no weights behind them, and
++        # naming one of those here sends people looking for a checkpoint that was never written.
++        retained = sorted(checkpoint_manager.all_steps())
++        best_kept = _checkpoints.best_step(
++            config.checkpoint_dir, config.best_metric, mode=config.best_metric_mode, among=retained
++        )
++        best_seen = _checkpoints.best_step(config.checkpoint_dir, config.best_metric, mode=config.best_metric_mode)
++        logging.info(
++            f"Retained checkpoints {retained}; best retained {config.best_metric} at step {best_kept}"
++            + (f" (best evaluated was step {best_seen}, not saved)" if best_seen != best_kept else "")
++        )
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/scripts/verify_export.py b/scripts/verify_export.py
+new file mode 100644
+index 0000000..94674e3
+--- /dev/null
++++ b/scripts/verify_export.py
+@@ -0,0 +1,223 @@
++"""Verify an exported checkpoint loads standalone, and characterise its input/output contract.
++
++Answers three questions before the model is shipped to a robot:
++
++1. Does a checkpoint stripped to `params/` + `assets/` (no `train_state/`) load and run? That is
++   what gets downloaded, so it must be sufficient on its own.
++2. Which inputs actually influence the output? `pi05=True` with `discrete_state_input=False` leaves
++   the model with no pathway for proprioceptive state, so `observation/joint_position` and
++   `observation/gripper_position` should provably not change the actions. Positive controls (image,
++   prompt, noise) must change them, otherwise a bug in this script would fake the same result.
++3. What is the inference latency, which decides what control rates the deployment can sustain.
++
++All comparisons pass the same fixed `noise` to `Policy.infer`, so the flow-matching sampler is
++deterministic and any output difference comes from the input under test.
++
++    uv run scripts/verify_export.py --config-name pi05_custom_droid_hybrid \
++        --checkpoint-dir checkpoints/pi05_custom_droid_hybrid/b0_custom_droid_full_15k/14999 \
++        --export-dir /leonardo_work/EUHPC_D35_005/openpi/artifacts/export/pi05_custom_droid_14999
++"""
++
++import dataclasses
++import functools
++import json
++import logging
++import pathlib
++import shutil
++import time
++
++import numpy as np
++import tyro
++
++from openpi.policies import policy_config as _policy_config
++from openpi.training import config as _config
++
++
++@dataclasses.dataclass
++class Args:
++    config_name: str = "pi05_custom_droid_hybrid"
++    checkpoint_dir: str = "checkpoints/pi05_custom_droid_hybrid/b0_custom_droid_full_15k/14999"
++    # Deployment copy to create and test. Only `params/` and `assets/` are copied.
++    export_dir: str = "artifacts/export/pi05_custom_droid_14999"
++    # Skip the copy and test an existing export dir.
++    skip_copy: bool = False
++    # Prompt the model was fine-tuned on.
++    prompt: str = "pour lillet into the jigger"
++    # A different in-distribution task, used as the prompt-sensitivity control.
++    alt_prompt: str = "pour gin into the jigger"
++    # Native camera resolution of the dataset; the policy resizes to 224x224 itself.
++    image_hw: tuple[int, int] = (180, 320)
++    latency_reps: int = 10
++    out_json: str | None = None
++
++
++def _example(
++    rng: np.random.Generator,
++    args: Args,
++    *,
++    state_seed: int,
++    image_seed: int,
++    prompt: str,
++    num_state_frames: int = 1,
++    history_seed: int | None = None,
++) -> dict:
++    """One request. With history the state keys carry `num_state_frames` stacked frames, current first.
++
++    `history_seed`, when given, drives only the lagged frames, so a request can differ from another
++    in its history alone while the present is bit-identical. That is what shows whether the lagged
++    proprioception reaches the output at all.
++    """
++    h, w = args.image_hw
++    img_rng = np.random.default_rng(image_seed)
++    state_rng = np.random.default_rng(state_seed)
++    now_j = state_rng.uniform(-2.0, 2.0, 7).astype(np.float32)
++    now_g = state_rng.uniform(0.0, 1.0, 1).astype(np.float32)
++    if num_state_frames == 1:
++        joints, gripper = now_j, now_g
++    else:
++        hist_rng = np.random.default_rng(state_seed if history_seed is None else history_seed)
++        past_j = hist_rng.uniform(-2.0, 2.0, (num_state_frames - 1, 7)).astype(np.float32)
++        past_g = hist_rng.uniform(0.0, 1.0, (num_state_frames - 1, 1)).astype(np.float32)
++        joints = np.concatenate([now_j[None, :], past_j], axis=0)
++        gripper = np.concatenate([now_g[None, :], past_g], axis=0)
++    return {
++        "observation/exterior_image_1_left": img_rng.integers(0, 256, (h, w, 3), dtype=np.uint8),
++        "observation/wrist_image_left": img_rng.integers(0, 256, (h, w, 3), dtype=np.uint8),
++        "observation/joint_position": joints,
++        "observation/gripper_position": gripper,
++        "prompt": prompt,
++    }
++
++
++def main(args: Args) -> None:
++    # force=True: importing jax/absl installs a root handler above INFO, which makes a plain
++    # basicConfig() a silent no-op and swallows every logging call in this script.
++    logging.basicConfig(
++        level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S", force=True
++    )
++    ckpt = pathlib.Path(args.checkpoint_dir)
++    export = pathlib.Path(args.export_dir)
++
++    if not args.skip_copy:
++        export.mkdir(parents=True, exist_ok=True)
++        for item in ("params", "assets"):
++            src, dst = ckpt / item, export / item
++            if dst.exists():
++                logging.info(f"{dst} already present, skipping copy")
++                continue
++            logging.info(f"copying {src} -> {dst}")
++            shutil.copytree(src, dst)
++    size_mb = sum(f.stat().st_size for f in export.rglob("*") if f.is_file()) / 1e6
++    logging.info(f"export dir {export} is {size_mb:.0f} MB")
++
++    config = _config.get_config(args.config_name)
++    logging.info(
++        f"model: pi05={config.model.pi05} discrete_state_input={config.model.discrete_state_input} "
++        f"action_horizon={config.model.action_horizon} action_dim={config.model.action_dim} "
++        f"max_token_len={config.model.max_token_len} "
++        f"paligemma={config.model.paligemma_variant} action_expert={config.model.action_expert_variant}"
++    )
++
++    # Loaded from the export copy, not the original checkpoint: this is the artifact being shipped.
++    policy = _policy_config.create_trained_policy(config, export)
++
++    rng = np.random.default_rng(0)
++    noise = rng.normal(size=(config.model.action_horizon, config.model.action_dim)).astype(np.float32)
++    noise_b = np.random.default_rng(1).normal(
++        size=(config.model.action_horizon, config.model.action_dim)
++    ).astype(np.float32)
++
++    lags = tuple(config.data.state_history_lags) if hasattr(config.data, "state_history_lags") else ()
++    nf = 1 + len(lags)
++    ex = functools.partial(_example, rng, args, num_state_frames=nf)
++    base = ex(state_seed=1, image_seed=100, prompt=args.prompt)
++    variants = {
++        # Whole state replaced, present included.
++        "state_changed": ex(state_seed=2, image_seed=100, prompt=args.prompt),
++        # Positive controls: these MUST change the output.
++        "image_changed": ex(state_seed=1, image_seed=200, prompt=args.prompt),
++        "prompt_changed": ex(state_seed=1, image_seed=100, prompt=args.alt_prompt),
++    }
++    if nf > 1:
++        # Only the lagged frames differ; the present is bit-identical. If this does not move the
++        # output, the history the model was trained with is not reaching it at inference.
++        variants["history_only_changed"] = ex(state_seed=1, image_seed=100, prompt=args.prompt, history_seed=99)
++
++    ref = policy.infer(base, noise=noise)["actions"]
++    logging.info(f"actions shape {ref.shape} dtype {ref.dtype}")
++
++    results = {}
++    for name, obs in variants.items():
++        out = policy.infer(obs, noise=noise)["actions"]
++        diff = float(np.abs(out - ref).max())
++        results[name] = {"max_abs_diff": diff, "identical": bool(np.array_equal(out, ref))}
++        logging.info(f"{name:16s} max|diff| = {diff:.6e}  identical={results[name]['identical']}")
++
++    # Control on the sampler itself: a different noise draw must move the output, otherwise the
++    # `noise` argument is not reaching the sampler and every comparison above is vacuous.
++    out = policy.infer(base, noise=noise_b)["actions"]
++    results["noise_changed"] = {"max_abs_diff": float(np.abs(out - ref).max()), "identical": bool(np.array_equal(out, ref))}
++    logging.info(f"{'noise_changed':16s} max|diff| = {results['noise_changed']['max_abs_diff']:.6e}")
++
++    # Repeatability: same input, same noise, twice.
++    out = policy.infer(base, noise=noise)["actions"]
++    results["repeat_same_noise"] = {"max_abs_diff": float(np.abs(out - ref).max()), "identical": bool(np.array_equal(out, ref))}
++    logging.info(f"{'repeat':16s} max|diff| = {results['repeat_same_noise']['max_abs_diff']:.6e}")
++
++    times = []
++    for _ in range(args.latency_reps):
++        t0 = time.monotonic()
++        policy.infer(base)
++        times.append((time.monotonic() - t0) * 1000)
++    latency = {
++        "mean_ms": float(np.mean(times)),
++        "p50_ms": float(np.percentile(times, 50)),
++        "p90_ms": float(np.percentile(times, 90)),
++        "reps": args.latency_reps,
++    }
++    logging.info(f"latency mean {latency['mean_ms']:.1f} ms, p50 {latency['p50_ms']:.1f}, p90 {latency['p90_ms']:.1f}")
++
++    contract = {
++        "action_shape": list(ref.shape),
++        "action_dtype": str(ref.dtype),
++        "joint_velocity_range": [float(ref[:, :7].min()), float(ref[:, :7].max())],
++        "gripper_range": [float(ref[:, 7].min()), float(ref[:, 7].max())],
++        "export_size_mb": size_mb,
++        "model": {
++            "pi05": config.model.pi05,
++            "discrete_state_input": config.model.discrete_state_input,
++            "action_horizon": config.model.action_horizon,
++            "action_dim": config.model.action_dim,
++            "max_token_len": config.model.max_token_len,
++            "paligemma_variant": config.model.paligemma_variant,
++            "action_expert_variant": config.model.action_expert_variant,
++        },
++    }
++    summary = {"sensitivity": results, "latency": latency, "contract": contract}
++    print("\n" + json.dumps(summary, indent=2))
++
++    out_json = pathlib.Path(args.out_json) if args.out_json else export.parent / f"{export.name}_verify.json"
++    out_json.write_text(json.dumps(summary, indent=2))
++    print(f"\nWrote {out_json}")
++
++    verdict = []
++    if results["state_changed"]["identical"]:
++        verdict.append("STATE IGNORED: proprioception provably does not affect the output.")
++    else:
++        verdict.append(f"STATE USED: changing state moved the actions by {results['state_changed']['max_abs_diff']:.3e}.")
++    if "history_only_changed" in results:
++        if results["history_only_changed"]["identical"]:
++            verdict.append("HISTORY IGNORED: the lagged frames do not affect the output at all.")
++        else:
++            verdict.append(
++                f"HISTORY USED: changing only the lagged frames moved the actions by "
++                f"{results['history_only_changed']['max_abs_diff']:.3e}."
++            )
++    for control in ("image_changed", "prompt_changed", "noise_changed"):
++        if results[control]["identical"]:
++            verdict.append(f"BROKEN CONTROL: {control} produced an identical output -- this test is not valid.")
++    print("\n" + "\n".join(verdict))
++
++
++if __name__ == "__main__":
++    main(tyro.cli(Args))
+diff --git a/src/openpi/models/gemma.py b/src/openpi/models/gemma.py
+index d1623d1..b8679e3 100644
+--- a/src/openpi/models/gemma.py
++++ b/src/openpi/models/gemma.py
+@@ -52,7 +52,7 @@ class Config:
+     lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
+ 
+ 
+-Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
++Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora", "gemma_2b_lora_r32"]
+ 
+ 
+ def get_config(variant: Variant) -> Config:
+@@ -95,6 +95,16 @@ def get_config(variant: Variant) -> Config:
+             head_dim=256,
+             lora_configs={"attn": lora.LoRAConfig(rank=16, alpha=16.0), "ffn": lora.LoRAConfig(rank=16, alpha=16.0)},
+         )
++    if variant == "gemma_2b_lora_r32":
++        return Config(
++            width=2048,
++            depth=18,
++            mlp_dim=16_384,
++            num_heads=8,
++            num_kv_heads=1,
++            head_dim=256,
++            lora_configs={"attn": lora.LoRAConfig(rank=32, alpha=32.0), "ffn": lora.LoRAConfig(rank=32, alpha=32.0)},
++        )
+     if variant == "gemma_300m_lora":
+         # 311M params
+         return Config(
+diff --git a/src/openpi/models/lora.py b/src/openpi/models/lora.py
+index 3dfff5b..eb0bfa3 100644
+--- a/src/openpi/models/lora.py
++++ b/src/openpi/models/lora.py
+@@ -145,4 +145,6 @@ class FeedForward(nn.Module):
+         base = jnp.dot(x, w.astype(x.dtype))
+         if lora_weights is None:
+             return base
+-        return base + jnp.dot(jnp.dot(x, lora_weights[0].astype(x.dtype)), lora_weights[1].astype(x.dtype))
++        assert self.lora_config is not None
++        lora = jnp.dot(jnp.dot(x, lora_weights[0].astype(x.dtype)), lora_weights[1].astype(x.dtype))
++        return base + lora * self.lora_config.scaling_value
+diff --git a/src/openpi/policies/droid_policy.py b/src/openpi/policies/droid_policy.py
+index 55bdb41..69850e6 100644
+--- a/src/openpi/policies/droid_policy.py
++++ b/src/openpi/policies/droid_policy.py
+@@ -79,3 +79,77 @@ class DroidOutputs(transforms.DataTransformFn):
+     def __call__(self, data: dict) -> dict:
+         # Only return the first 8 dims.
+         return {"actions": np.asarray(data["actions"][..., :8])}
++
++
++@dataclasses.dataclass(frozen=True)
++class DroidInputsWithStateHistory(transforms.DataTransformFn):
++    """DroidInputs with past copies of the proprioceptive state appended to the state vector.
++
++    pi0.5 has no memory: one frame per camera, no observation history, and nothing carried between
++    calls. That makes phases of a task that look alike but need opposite actions -- carrying a bottle
++    towards the glass versus carrying it back -- indistinguishable. Stacking older proprioception onto
++    the state supplies that context without consuming a camera slot or adding image tokens.
++
++    The state is laid out current-first:
++
++        [q_t, grip_t, q_{t-lag0}, grip_{t-lag0}, q_{t-lag1}, grip_{t-lag1}, ...]
++
++    matching the ordering that `create_torch_dataset` writes into `delta_timestamps`. Index 0 of the
++    stacked axis is the present; taking index 0 to mean "the first lag" would silently train the model
++    on a stale state, which converges perfectly well and is wrong.
++
++    At inference the client sends the same stacked arrays -- shape `(1 + len(lags), 7)` for
++    `joint_position` and `(1 + len(lags),)` or `(1 + len(lags), 1)` for `gripper_position`, in the same
++    order -- so no separate code path is needed. When fewer than `lag` frames have elapsed the client
++    should repeat the current frame, which is what LeRobot's clamping does during training.
++    """
++
++    model_type: _model.ModelType
++    # Number of stacked state frames, i.e. 1 + len(state_history_lags). 1 reproduces plain DroidInputs.
++    num_state_frames: int = 1
++
++    def __call__(self, data: dict) -> dict:
++        joints = np.asarray(data["observation/joint_position"])
++        gripper = np.asarray(data["observation/gripper_position"])
++
++        # Accept both the unstacked (no history) and stacked (history) forms.
++        if joints.ndim == 1:
++            joints = joints[np.newaxis, :]
++        if gripper.ndim == 0:
++            gripper = gripper.reshape(1, 1)
++        elif gripper.ndim == 1:
++            # Either (frames,) with history, or (1,) without it.
++            gripper = gripper.reshape(-1, 1) if joints.shape[0] > 1 else gripper.reshape(1, -1)
++
++        if joints.shape[0] != self.num_state_frames or gripper.shape[0] != self.num_state_frames:
++            raise ValueError(
++                f"Expected {self.num_state_frames} stacked state frames, got joint_position "
++                f"{joints.shape} and gripper_position {gripper.shape}. The client must send the same "
++                "number of frames, current first, that the model was trained with."
++            )
++
++        # Current first; ravel keeps [q, grip] adjacent within each frame.
++        state = np.concatenate([np.concatenate([joints[i], gripper[i]]) for i in range(self.num_state_frames)])
++
++        base_image = _parse_image(data["observation/exterior_image_1_left"])
++        wrist_image = _parse_image(data["observation/wrist_image_left"])
++
++        match self.model_type:
++            case _model.ModelType.PI0 | _model.ModelType.PI05:
++                names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
++                images = (base_image, wrist_image, np.zeros_like(base_image))
++                image_masks = (np.True_, np.True_, np.False_)
++            case _:
++                raise ValueError(f"Unsupported model type: {self.model_type}")
++
++        inputs = {
++            "state": state,
++            "image": dict(zip(names, images, strict=True)),
++            "image_mask": dict(zip(names, image_masks, strict=True)),
++        }
++        if "actions" in data:
++            inputs["actions"] = np.asarray(data["actions"])
++        if "prompt" in data:
++            prompt = data["prompt"]
++            inputs["prompt"] = prompt.decode("utf-8") if isinstance(prompt, bytes) else prompt
++        return inputs
+diff --git a/src/openpi/training/checkpoints.py b/src/openpi/training/checkpoints.py
+index f32a831..0470697 100644
+--- a/src/openpi/training/checkpoints.py
++++ b/src/openpi/training/checkpoints.py
+@@ -1,8 +1,10 @@
+ from __future__ import annotations
+ 
+ import asyncio
++from collections.abc import Iterable
+ import concurrent.futures as futures
+ import dataclasses
++import json
+ import logging
+ from typing import Protocol
+ 
+@@ -17,8 +19,16 @@ import openpi.training.data_loader as _data_loader
+ import openpi.training.utils as training_utils
+ 
+ 
++EVAL_HISTORY_FILENAME = "eval_history.json"
++
++
+ def initialize_checkpoint_dir(
+-    checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
++    checkpoint_dir: epath.Path | str,
++    *,
++    keep_period: int | None,
++    overwrite: bool,
++    resume: bool,
++    keep_best: bool = False,
+ ) -> tuple[ocp.CheckpointManager, bool]:
+     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
+     resuming = False
+@@ -37,6 +47,9 @@ def initialize_checkpoint_dir(
+ 
+     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+ 
++    # With keep_best, retention is handled by `prune_to_final_and_best` after each save, so orbax is
++    # told to keep everything -- letting it also apply max_to_keep would race with our own pruning
++    # and could delete the best checkpoint before we get to rank it.
+     mngr = ocp.CheckpointManager(
+         checkpoint_dir,
+         item_handlers={
+@@ -45,8 +58,8 @@ def initialize_checkpoint_dir(
+             "params": ocp.PyTreeCheckpointHandler(),
+         },
+         options=ocp.CheckpointManagerOptions(
+-            max_to_keep=1,
+-            keep_period=keep_period,
++            max_to_keep=None if keep_best else 1,
++            keep_period=None if keep_best else keep_period,
+             create=False,
+             async_options=ocp.AsyncOptions(timeout_secs=7200),
+         ),
+@@ -86,6 +99,68 @@ def save_state(
+     checkpoint_manager.save(step, items)
+ 
+ 
++def record_eval_metrics(checkpoint_dir: epath.Path | str, step: int, metrics: dict[str, float]) -> None:
++    """Append one validation record to the checkpoint directory's eval history.
++
++    The history is the authoritative record for best-checkpoint selection: it is kept in a plain
++    JSON sidecar rather than in orbax metadata so that it survives resumes and can be inspected
++    (and corrected) by hand.
++    """
++    if jax.process_index() != 0:
++        return
++    history_path = epath.Path(checkpoint_dir) / EVAL_HISTORY_FILENAME
++    history = json.loads(history_path.read_text()) if history_path.exists() else []
++    # A resumed run can re-evaluate a step that is already recorded; the newer value wins.
++    history = [record for record in history if record["step"] != step]
++    history.append({"step": int(step), **{k: float(v) for k, v in metrics.items()}})
++    history.sort(key=lambda record: record["step"])
++    history_path.write_text(json.dumps(history, indent=2))
++
++
++def best_step(
++    checkpoint_dir: epath.Path | str, metric: str, *, mode: str = "min", among: Iterable[int] | None = None
++) -> int | None:
++    """Step with the best recorded value of `metric`, or None if nothing is recorded."""
++    history_path = epath.Path(checkpoint_dir) / EVAL_HISTORY_FILENAME
++    if not history_path.exists():
++        return None
++    history = [record for record in json.loads(history_path.read_text()) if metric in record]
++    if among is not None:
++        allowed = set(among)
++        history = [record for record in history if record["step"] in allowed]
++    if not history:
++        return None
++    pick = min if mode == "min" else max
++    return int(pick(history, key=lambda record: record[metric])["step"])
++
++
++def prune_to_final_and_best(
++    checkpoint_manager: ocp.CheckpointManager,
++    checkpoint_dir: epath.Path | str,
++    metric: str,
++    *,
++    mode: str = "min",
++) -> None:
++    """Keep only the most recent checkpoint and the best-scoring one; delete the rest.
++
++    The most recent checkpoint is always kept so that a crashed run resumes from where it stopped
++    rather than rolling back to the best step.
++    """
++    if jax.process_index() != 0:
++        return
++    checkpoint_manager.wait_until_finished()
++    steps = sorted(checkpoint_manager.all_steps())
++    if not steps:
++        return
++    keep = {steps[-1]}
++    if (best := best_step(checkpoint_dir, metric, mode=mode, among=steps)) is not None:
++        keep.add(best)
++    for step in steps:
++        if step not in keep:
++            logging.info(f"Deleting checkpoint {step} (keeping {sorted(keep)}: latest + best {metric})")
++            checkpoint_manager.delete(step)
++
++
+ def restore_state(
+     checkpoint_manager: ocp.CheckpointManager,
+     state: training_utils.TrainState,
+diff --git a/src/openpi/training/config.py b/src/openpi/training/config.py
+index 4ca47e1..9241953 100644
+--- a/src/openpi/training/config.py
++++ b/src/openpi/training/config.py
+@@ -18,8 +18,10 @@ import openpi.models.pi0_config as pi0_config
+ import openpi.models.pi0_fast as pi0_fast
+ import openpi.models.tokenizer as _tokenizer
+ import openpi.policies.aloha_policy as aloha_policy
++import openpi.policies.cocktail_policy as cocktail_policy
+ import openpi.policies.droid_policy as droid_policy
+ import openpi.policies.libero_policy as libero_policy
++import openpi.policies.mix_policy as mix_policy
+ import openpi.shared.download as _download
+ import openpi.shared.normalize as _normalize
+ import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+@@ -87,6 +89,17 @@ class DataConfig:
+     # LeRobot dataset is using different keys to represent the action.
+     action_sequence_keys: Sequence[str] = ("actions",)
+ 
++    # Lags, in frames, at which past copies of the state keys are stacked onto the current one, giving the
++    # policy a memory it otherwise does not have (pi0.5 sees a single frame per camera and no observation
++    # history). Empty means no history, i.e. the upstream behaviour.
++    #
++    # The stacked axis is ordered **current first**, then one entry per lag in this order, so index 0 is
++    # always the present. `create_torch_dataset` and `DroidInputs` both derive their layout from this field;
++    # do not reorder one without the other.
++    state_history_lags: tuple[int, ...] = ()
++    # Keys that `state_history_lags` applies to.
++    state_history_keys: Sequence[str] = ("joint_position", "gripper_position")
++
+     # If true, will use the LeRobot dataset task to define the prompt.
+     prompt_from_task: bool = False
+ 
+@@ -462,6 +475,178 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
+         )
+ 
+ 
++@dataclasses.dataclass(frozen=True)
++class LeRobotDroidHistoryDataConfig(DataConfigFactory):
++    """DROID-schema data with lagged proprioception stacked onto the state.
++
++    Identical to `LeRobotDROIDDataConfig` except that the state carries `state_history_lags` extra
++    copies of itself from the past, giving the policy the observation history the architecture
++    otherwise lacks. See `DroidInputsWithStateHistory` for the layout.
++    """
++
++    # Lags in frames. At 15 fps, (45, 75) is 3 s and 5 s.
++    state_history_lags: tuple[int, ...] = (45, 75)
++
++    @override
++    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
++        repack_transform = _transforms.Group(
++            inputs=[
++                _transforms.RepackTransform(
++                    {
++                        "observation/exterior_image_1_left": "exterior_image_1_left",
++                        "observation/exterior_image_2_left": "exterior_image_2_left",
++                        "observation/wrist_image_left": "wrist_image_left",
++                        "observation/joint_position": "joint_position",
++                        "observation/gripper_position": "gripper_position",
++                        "actions": "actions",
++                        "prompt": "prompt",
++                    }
++                )
++            ]
++        )
++        # Joint *velocity* actions, so no delta transform -- same as the non-history config.
++        data_transforms = _transforms.Group(
++            inputs=[
++                droid_policy.DroidInputsWithStateHistory(
++                    model_type=model_config.model_type,
++                    num_state_frames=1 + len(self.state_history_lags),
++                )
++            ],
++            outputs=[droid_policy.DroidOutputs()],
++        )
++        model_transforms = ModelTransformFactory()(model_config)
++
++        return dataclasses.replace(
++            self.create_base_config(assets_dirs, model_config),
++            repack_transforms=repack_transform,
++            data_transforms=data_transforms,
++            model_transforms=model_transforms,
++            state_history_lags=self.state_history_lags,
++        )
++
++
++@dataclasses.dataclass(frozen=True)
++class LeRobotMixDataConfig(DataConfigFactory):
++    """Data config for B0 Mix post-training in LeRobot format.
++
++    The conversion script writes a canonical schema with three image fields,
++    a proprio/state vector, and an unpadded action vector. This config maps
++    those fields into the pi0/pi0.5 model convention and optionally converts
++    absolute actions into deltas for the leading action dimensions.
++    """
++
++    action_dim: int = mix_policy.DEFAULT_MIX_ACTION_DIM
++    use_delta_actions: bool = False
++    delta_action_dims: int = 6
++    right_wrist_is_padding: bool = True
++    default_prompt: str | None = None
++
++    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
++        default=_transforms.Group(
++            inputs=[
++                _transforms.RepackTransform(
++                    {
++                        "observation/base_image": "base_image",
++                        "observation/left_wrist_image": "left_wrist_image",
++                        "observation/right_wrist_image": "right_wrist_image",
++                        "observation/state": "state",
++                        "actions": "actions",
++                        "prompt": "prompt",
++                    }
++                )
++            ]
++        )
++    )
++    action_sequence_keys: Sequence[str] = ("actions",)
++
++    @override
++    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
++        data_transforms = _transforms.Group(
++            inputs=[
++                mix_policy.MixInputs(
++                    model_type=model_config.model_type,
++                    right_wrist_is_padding=self.right_wrist_is_padding,
++                )
++            ],
++            outputs=[mix_policy.MixOutputs(action_dim=self.action_dim)],
++        )
++
++        if self.use_delta_actions:
++            if self.delta_action_dims > self.action_dim:
++                raise ValueError(
++                    f"delta_action_dims={self.delta_action_dims} exceeds action_dim={self.action_dim}."
++                )
++            absolute_dims = self.action_dim - self.delta_action_dims
++            delta_action_mask = (
++                _transforms.make_bool_mask(self.delta_action_dims, -absolute_dims)
++                if absolute_dims
++                else _transforms.make_bool_mask(self.delta_action_dims)
++            )
++            data_transforms = data_transforms.push(
++                inputs=[_transforms.DeltaActions(delta_action_mask)],
++                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
++            )
++
++        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
++
++        return dataclasses.replace(
++            self.create_base_config(assets_dirs, model_config),
++            repack_transforms=self.repack_transforms,
++            data_transforms=data_transforms,
++            model_transforms=model_transforms,
++            action_sequence_keys=self.action_sequence_keys,
++        )
++
++
++@dataclasses.dataclass(frozen=True)
++class LeRobotCocktailDataConfig(DataConfigFactory):
++    # Data config for the OneTwoVLA Cocktail LeRobot parquet schema.
++
++    action_dim: int = cocktail_policy.COCKTAIL_ACTION_DIM
++    use_delta_actions: bool = False
++    delta_action_dims: int = 6
++    include_demo_start_pose: bool = False
++    default_prompt: str | None = None
++    action_sequence_keys: Sequence[str] = ("actions",)
++
++    @override
++    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
++        data_transforms = _transforms.Group(
++            inputs=[
++                cocktail_policy.CocktailInputs(
++                    model_type=model_config.model_type,
++                    include_demo_start_pose=self.include_demo_start_pose,
++                )
++            ],
++            outputs=[cocktail_policy.CocktailOutputs(action_dim=self.action_dim)],
++        )
++
++        if self.use_delta_actions:
++            if self.delta_action_dims > self.action_dim:
++                raise ValueError(
++                    f"delta_action_dims={self.delta_action_dims} exceeds action_dim={self.action_dim}."
++                )
++            absolute_dims = self.action_dim - self.delta_action_dims
++            delta_action_mask = (
++                _transforms.make_bool_mask(self.delta_action_dims, -absolute_dims)
++                if absolute_dims
++                else _transforms.make_bool_mask(self.delta_action_dims)
++            )
++            data_transforms = data_transforms.push(
++                inputs=[_transforms.DeltaActions(delta_action_mask)],
++                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
++            )
++
++        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
++
++        return dataclasses.replace(
++            self.create_base_config(assets_dirs, model_config),
++            data_transforms=data_transforms,
++            model_transforms=model_transforms,
++            action_sequence_keys=self.action_sequence_keys,
++        )
++
++
+ @dataclasses.dataclass(frozen=True)
+ class TrainConfig:
+     # Name of the config. Must be unique. Will be used to reference this config.
+@@ -517,6 +702,34 @@ class TrainConfig:
+     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
+     keep_period: int | None = 5000
+ 
++    # Episode indices held out from training and used as the validation split. Splitting by whole
++    # episodes (rather than by frame) is required: neighbouring frames of one episode are nearly
++    # identical, so a frame-level split leaks the validation data into training.
++    val_episodes: tuple[int, ...] = ()
++    # How often (in steps) to run validation. 0 disables validation entirely. Validation also always
++    # runs immediately before a checkpoint save, so that every checkpoint carries a metric.
++    eval_interval: int = 0
++    # Number of validation batches per evaluation. Higher is less noisy but slower.
++    eval_num_batches: int = 8
++    # Seed for the validation noise/time draws. Held fixed across steps and across runs so that the
++    # validation loss of different checkpoints is directly comparable.
++    eval_seed: int = 0
++    # If true, retain only two checkpoints: the most recent one and the one with the best validation
++    # metric. Requires validation to be enabled; overrides max_to_keep/keep_period.
++    keep_best_checkpoint: bool = False
++    # Metric used to rank checkpoints, and the direction that counts as better.
++    #
++    # Do not default this to `val_loss` without thinking. On franka_pour_wine the flow-matching
++    # denoising loss rose monotonically from step 1000 to 17500 while action MAE *fell* over the
++    # same range (0.0691 -> 0.0588) and creep_ratio improved fivefold. Ranking by val_loss there
++    # would keep the worst checkpoint of the run. `action_mae_phys` needs eval_sample_actions.
++    best_metric: str = "val_loss"
++    best_metric_mode: str = "min"
++    # If true, in-loop validation also samples actions and reports action-space errors (MAE, gripper
++    # MAE, creep). Costs num_denoise_steps forward passes per batch on top of the denoising loss.
++    eval_sample_actions: bool = False
++    eval_num_denoise_steps: int = 10
++
+     # If true, will overwrite the checkpoint directory if it already exists.
+     overwrite: bool = False
+     # If true, will resume training from the last checkpoint.
+@@ -551,10 +764,49 @@ class TrainConfig:
+         """Get the filter for the trainable parameters."""
+         return nnx.All(nnx.Param, nnx.Not(self.freeze_filter))
+ 
++    @property
++    def eval_enabled(self) -> bool:
++        """Whether validation is configured to run during training."""
++        return self.eval_interval > 0 and len(self.val_episodes) > 0
++
+     def __post_init__(self) -> None:
+         if self.resume and self.overwrite:
+             raise ValueError("Cannot resume and overwrite at the same time.")
+-
++        if self.eval_interval > 0 and not self.val_episodes:
++            raise ValueError("eval_interval is set but val_episodes is empty; nothing to validate on.")
++        if self.keep_best_checkpoint and not self.eval_enabled:
++            raise ValueError("keep_best_checkpoint requires validation (set val_episodes and eval_interval).")
++        if self.best_metric != "val_loss" and not self.eval_sample_actions:
++            raise ValueError(f"best_metric={self.best_metric!r} is only produced when eval_sample_actions is set.")
++
++
++
++_PI05_MIX_HYBRID_MODEL = pi0_config.Pi0Config(
++    pi05=True,
++    action_dim=32,
++    action_horizon=16,
++    discrete_state_input=False,
++    paligemma_variant="gemma_2b_lora_r32",
++    action_expert_variant="gemma_300m_lora",
++)
++# Same LoRA recipe as B0, but with the state pathway switched on: `discrete_state_input=True` is
++# what feeds proprioception at all on pi0.5, and it also restores the prompt format used in
++# pretraining.
++_PI05_WINE_MODEL = pi0_config.Pi0Config(
++    pi05=True,
++    action_dim=32,
++    action_horizon=16,
++    discrete_state_input=True,
++    paligemma_variant="gemma_2b_lora_r32",
++    action_expert_variant="gemma_300m_lora",
++)
++_PI05_MIX_LR_SCHEDULE = _optimizer.CosineDecaySchedule(
++    warmup_steps=1_000,
++    peak_lr=5e-5,
++    decay_steps=1_000_000,
++    decay_lr=5e-5,
++)
++_PI05_MIX_OPTIMIZER = _optimizer.AdamW(clip_gradient_norm=1.0)
+ 
+ # Use `get_config` if you need to get a config by name in your code.
+ _CONFIGS = [
+@@ -826,6 +1078,254 @@ _CONFIGS = [
+         batch_size=64,
+     ),
+     #
++    # B0 Mix post-training configs.
++    #
++    TrainConfig(
++        name="pi05_mix_hybrid_tiny",
++        project_name="openpi_mix_b0",
++        model=_PI05_MIX_HYBRID_MODEL,
++        data=LeRobotMixDataConfig(
++            repo_id="local/mix_tiny",
++            assets=AssetsConfig(assets_dir="./assets/pi05_mix_hybrid", asset_id="local/mix"),
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
++        lr_schedule=_PI05_MIX_LR_SCHEDULE,
++        optimizer=_PI05_MIX_OPTIMIZER,
++        freeze_filter=_PI05_MIX_HYBRID_MODEL.get_freeze_filter(),
++        ema_decay=None,
++        num_train_steps=2_000,
++        batch_size=64,
++        log_interval=100,
++        save_interval=5_000,
++        keep_period=10_000,
++        fsdp_devices=1,
++    ),
++    TrainConfig(
++        name="pi05_mix_hybrid",
++        project_name="openpi_mix_b0",
++        model=_PI05_MIX_HYBRID_MODEL,
++        data=LeRobotMixDataConfig(
++            repo_id="local/mix",
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
++        lr_schedule=_PI05_MIX_LR_SCHEDULE,
++        optimizer=_PI05_MIX_OPTIMIZER,
++        freeze_filter=_PI05_MIX_HYBRID_MODEL.get_freeze_filter(),
++        ema_decay=None,
++        num_train_steps=30_000,
++        batch_size=64,
++        log_interval=100,
++        save_interval=5_000,
++        keep_period=10_000,
++        fsdp_devices=1,
++    ),
++    #
++    # B0 OneTwoVLA Cocktail post-training configs.
++    #
++    TrainConfig(
++        name="pi05_cocktail_hybrid_tiny",
++        project_name="openpi_cocktail_b0",
++        model=_PI05_MIX_HYBRID_MODEL,
++        data=LeRobotCocktailDataConfig(
++            repo_id="local/cocktail_tiny",
++            assets=AssetsConfig(assets_dir="./assets/pi05_cocktail_hybrid", asset_id="local/cocktail"),
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
++        lr_schedule=_PI05_MIX_LR_SCHEDULE,
++        optimizer=_PI05_MIX_OPTIMIZER,
++        freeze_filter=_PI05_MIX_HYBRID_MODEL.get_freeze_filter(),
++        ema_decay=None,
++        num_train_steps=2_000,
++        batch_size=64,
++        log_interval=100,
++        save_interval=5_000,
++        keep_period=10_000,
++        fsdp_devices=1,
++    ),
++    TrainConfig(
++        name="pi05_cocktail_hybrid",
++        project_name="openpi_cocktail_b0",
++        model=_PI05_MIX_HYBRID_MODEL,
++        data=LeRobotCocktailDataConfig(
++            repo_id="local/cocktail",
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
++        lr_schedule=_PI05_MIX_LR_SCHEDULE,
++        optimizer=_PI05_MIX_OPTIMIZER,
++        freeze_filter=_PI05_MIX_HYBRID_MODEL.get_freeze_filter(),
++        ema_decay=None,
++        num_train_steps=30_000,
++        batch_size=64,
++        log_interval=100,
++        save_interval=5_000,
++        keep_period=10_000,
++        fsdp_devices=1,
++    ),
++    #
++    # B0 custom DROID post-training configs (fitz0401/custom_droid, LeRobot v2.1).
++    # Same hybrid recipe as the Cocktail tiny test: pi05_base + trainable SigLIP,
++    # LoRA r32 on the VLM and the action expert, trainable state/action/time projections.
++    #
++    TrainConfig(
++        name="pi05_custom_droid_hybrid",
++        project_name="openpi_custom_droid_b0",
++        model=_PI05_MIX_HYBRID_MODEL,
++        data=LeRobotDROIDDataConfig(
++            repo_id="fitz0401/custom_droid",
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
++        lr_schedule=_PI05_MIX_LR_SCHEDULE,
++        optimizer=_PI05_MIX_OPTIMIZER,
++        freeze_filter=_PI05_MIX_HYBRID_MODEL.get_freeze_filter(),
++        ema_decay=None,
++        num_train_steps=15_000,
++        batch_size=64,
++        log_interval=100,
++        save_interval=2_500,
++        keep_period=5_000,
++        fsdp_devices=1,
++    ),
++    # Same recipe as above, but with a held-out validation split, in-loop validation, and
++    # best-checkpoint retention. This is the config to use for any *new* custom_droid run;
++    # `pi05_custom_droid_hybrid` is kept unchanged so the finished 15k run stays reproducible.
++    #
++    # The split is by whole episodes: 4 (990 frames), 12 (691) and 17 (630) are held out, 2,311 of
++    # 15,367 frames = 15.0%, leaving 17 episodes for training. Norm stats are deliberately reused
++    # from `pi05_custom_droid_hybrid` (via AssetsConfig) rather than recomputed: it keeps the two
++    # runs directly comparable, and the resulting leakage is limited to quantiles of a single-task
++    # dataset shifting by ~15% of their support.
++    TrainConfig(
++        name="pi05_custom_droid_hybrid_val",
++        project_name="openpi_custom_droid_b0",
++        model=_PI05_MIX_HYBRID_MODEL,
++        data=LeRobotDROIDDataConfig(
++            repo_id="fitz0401/custom_droid",
++            assets=AssetsConfig(assets_dir="./assets/pi05_custom_droid_hybrid"),
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
++        lr_schedule=_PI05_MIX_LR_SCHEDULE,
++        optimizer=_PI05_MIX_OPTIMIZER,
++        freeze_filter=_PI05_MIX_HYBRID_MODEL.get_freeze_filter(),
++        ema_decay=None,
++        num_train_steps=15_000,
++        batch_size=64,
++        log_interval=100,
++        save_interval=2_500,
++        val_episodes=(4, 12, 17),
++        eval_interval=500,
++        eval_num_batches=8,
++        keep_best_checkpoint=True,
++        keep_period=None,
++        fsdp_devices=1,
++    ),
++    # B1: pi05_base -> fitz0401/franka_pour_wine (40 episodes, 57,564 frames, two tasks:
++    # "pour lillet into the jigger" / "pour gin into the jigger", fr3, 15 fps).
++    #
++    # Three changes over the custom_droid recipe, all driven by what the deployed B0 model showed:
++    #   1. discrete_state_input=True. B0 had it False, which on pi0.5 removes the *only* state
++    #      pathway -- proven in job 53195955, where changing the joint configuration left the actions
++    #      bit-identical. The same switch also restores the pi0.5 prompt format that pi05_base was
++    #      pretrained on.
++    #   2. Lagged proprioception at 3 s and 5 s, so the policy can tell "carrying the bottle over"
++    #      from "carrying it back". Lags are in frames and were chosen from the quantisation sweep:
++    #      at 15 frames the median displacement is only 2.1 of 256 bins, at 45 it is 5.9 and at 75
++    #      it is 9.2.
++    #   3. A real validation split, two episodes per task, avoiding the 3,537-frame outlier.
++    #
++    # Actions are unchanged from B0 -- joint velocities, no delta transform, horizon 16 -- because
++    # that recipe was validated on the robot. Keeping horizon 16 also keeps pi05_base as the base
++    # (pi05_droid defaults to 15), which in turn is why the wrist images are not rotated to the DROID
++    # convention.
++    TrainConfig(
++        name="pi05_wine_hybrid",
++        project_name="openpi_wine_b1",
++        model=_PI05_WINE_MODEL,
++        data=LeRobotDroidHistoryDataConfig(
++            repo_id="fitz0401/franka_pour_wine",
++            state_history_lags=(45, 75),
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
++        lr_schedule=_PI05_MIX_LR_SCHEDULE,
++        optimizer=_PI05_MIX_OPTIMIZER,
++        freeze_filter=_PI05_WINE_MODEL.get_freeze_filter(),
++        ema_decay=None,
++        # 30k x 64 / 52,555 train frames = 36.5 epochs. B0 used 15k steps, but on a dataset a third
++        # the size that was 62.5 epochs; matching the step count here would have been 18.3. Rather
++        # than guess the right number, run long and let validation decide: with eval every 500 steps
++        # and best-checkpoint retention, overrunning costs GPU hours while the retained artefact is
++        # still the best checkpoint, whereas underrunning costs another full run.
++        num_train_steps=30_000,
++        batch_size=64,
++        # 8 rather than the default 2: each batch decodes 128 PNGs, and at two workers the sustained
++        # rate was 2.46 s/step against 1.66 s/step measured over the probe's short prefetch-fed run.
++        # The node has 32 CPUs. Worker count does not affect the sample order, which comes from the
++        # seeded sampler.
++        num_workers=8,
++        log_interval=100,
++        save_interval=2_500,
++        # Two episodes per task, closest to each task's median length: gin 20 (1,132) and 28 (1,140),
++        # lillet 8 (1,380) and 16 (1,357). 5,009 of 57,564 frames = 8.7%.
++        val_episodes=(8, 16, 20, 28),
++        eval_interval=500,
++        # 16 batches, matching scripts/eval_offline.py exactly (same fixed seed, same unshuffled
++        # windows), so in-loop and offline numbers are the same quantity and can share a ranking.
++        eval_num_batches=16,
++        # Rank by action-space error, not by the denoising loss. Measured on this dataset over
++        # 1k->17.5k steps: val_loss rose 0.0384 -> 0.0682 while action MAE fell 0.0691 -> 0.0588
++        # and creep_ratio fell 0.378 -> 0.076. Ranking by val_loss keeps the worst checkpoint.
++        eval_sample_actions=True,
++        best_metric="action_mae_phys",
++        keep_best_checkpoint=True,
++        keep_period=None,
++        fsdp_devices=1,
++    ),
++    # B1-AE: identical to pi05_wine_hybrid except that the action expert is trained in full instead
++    # of through LoRA. The vision encoder stays fully trainable: cocktail making is not a common
++    # manipulation scenario, so the visual domain is unlikely to be well covered by pretraining.
++    #
++    # Trainable goes 494.8M -> 1034.6M (the action expert base is 561.9M). Forward cost is
++    # unchanged and gradients already flowed through the expert for its LoRA, so the extra cost is
++    # materialising full-weight gradients and optimiser state: about +7.9 GB of device memory
++    # (34 -> ~42 GB of 64) and an expected 5-15% on step time.
++    TrainConfig(
++        name="pi05_wine_ae_full",
++        project_name="openpi_wine_b1",
++        model=dataclasses.replace(_PI05_WINE_MODEL, action_expert_variant="gemma_300m"),
++        data=LeRobotDroidHistoryDataConfig(
++            repo_id="fitz0401/franka_pour_wine",
++            state_history_lags=(45, 75),
++            assets=AssetsConfig(assets_dir="./assets/pi05_wine_hybrid"),
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
++        lr_schedule=_PI05_MIX_LR_SCHEDULE,
++        optimizer=_PI05_MIX_OPTIMIZER,
++        freeze_filter=dataclasses.replace(
++            _PI05_WINE_MODEL, action_expert_variant="gemma_300m"
++        ).get_freeze_filter(),
++        ema_decay=None,
++        num_train_steps=30_000,
++        batch_size=64,
++        num_workers=8,
++        log_interval=100,
++        save_interval=2_500,
++        val_episodes=(8, 16, 20, 28),
++        eval_interval=500,
++        eval_num_batches=16,
++        eval_sample_actions=True,
++        best_metric="action_mae_phys",
++        keep_best_checkpoint=True,
++        keep_period=None,
++        fsdp_devices=1,
++    ),
++    #
+     # Fine-tuning DROID configs.
+     #
+     TrainConfig(
+diff --git a/src/openpi/training/data_loader.py b/src/openpi/training/data_loader.py
+index e2ee7dd..5c38e39 100644
+--- a/src/openpi/training/data_loader.py
++++ b/src/openpi/training/data_loader.py
+@@ -18,6 +18,9 @@ import openpi.transforms as _transforms
+ 
+ T_co = TypeVar("T_co", covariant=True)
+ 
++# Fixed permutation seed for the validation split; see `create_torch_dataset`.
++VAL_SHUFFLE_SEED = 0
++
+ 
+ class Dataset(Protocol[T_co]):
+     """Interface for a dataset with random access."""
+@@ -127,10 +130,49 @@ class FakeDataset(Dataset):
+         return self._num_samples
+ 
+ 
++class Subset(Dataset[T_co]):
++    """A view of a dataset restricted to the given indices."""
++
++    def __init__(self, dataset: Dataset, indices: Sequence[int]):
++        self._dataset = dataset
++        self._indices = list(indices)
++
++    def __getitem__(self, index: SupportsIndex) -> T_co:
++        return self._dataset[self._indices[index.__index__()]]
++
++    def __len__(self) -> int:
++        return len(self._indices)
++
++
++def episode_frame_indices(dataset: lerobot_dataset.LeRobotDataset, episodes: Sequence[int]) -> list[int]:
++    """Frame indices belonging to the given episodes, in dataset order."""
++    ep_index = dataset.episode_data_index
++    num_episodes = len(ep_index["from"])
++    indices: list[int] = []
++    for episode in episodes:
++        if not 0 <= episode < num_episodes:
++            raise ValueError(f"Episode {episode} is out of range for a dataset with {num_episodes} episodes.")
++        indices.extend(range(int(ep_index["from"][episode]), int(ep_index["to"][episode])))
++    return indices
++
++
+ def create_torch_dataset(
+-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
++    data_config: _config.DataConfig,
++    action_horizon: int,
++    model_config: _model.BaseModelConfig,
++    *,
++    split: Literal["all", "train", "val"] = "all",
++    val_episodes: Sequence[int] = (),
+ ) -> Dataset:
+-    """Create a dataset for training."""
++    """Create a dataset for training.
++
++    Args:
++        split: Which part of the dataset to return. "train" excludes `val_episodes`, "val" keeps only
++            them, and "all" ignores the split. Splitting is done by whole episodes, because
++            neighbouring frames within an episode are near-duplicates and a frame-level split would
++            leak validation data into training.
++        val_episodes: Episode indices that form the validation split.
++    """
+     repo_id = data_config.repo_id
+     if repo_id is None:
+         raise ValueError("Repo ID is not set. Cannot create dataset.")
+@@ -138,12 +180,40 @@ def create_torch_dataset(
+         return FakeDataset(model_config, num_samples=1024)
+ 
+     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+-    dataset = lerobot_dataset.LeRobotDataset(
+-        data_config.repo_id,
+-        delta_timestamps={
+-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+-        },
+-    )
++    delta_timestamps = {
++        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
++    }
++    if data_config.state_history_lags:
++        # Current first, then one entry per lag. LeRobot preserves this order verbatim
++        # (`get_delta_indices` is just `[round(d * fps) for d in delta_ts]`), so index 0 of the stacked
++        # axis is the present and index i+1 is `state_history_lags[i]`. `DroidInputs` relies on exactly
++        # this layout. Indices that fall before the start of an episode are clamped to its first frame.
++        offsets = [0.0, *(-lag / dataset_meta.fps for lag in data_config.state_history_lags)]
++        for key in data_config.state_history_keys:
++            if key in delta_timestamps:
++                raise ValueError(f"{key} is both an action sequence key and a state history key.")
++            delta_timestamps[key] = offsets
++        logging.info(f"State history enabled: lags {list(data_config.state_history_lags)} frames on {list(data_config.state_history_keys)}")
++    dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id, delta_timestamps=delta_timestamps)
++
++    if split != "all" and val_episodes:
++        val_indices = set(episode_frame_indices(dataset, val_episodes))
++        if split == "val":
++            # Permuted with a fixed seed rather than left in episode order. Validation reads the
++            # first N batches of an unshuffled loader, and in episode order those all come from the
++            # first held-out episode; the permutation makes any N batches cover all of them, while
++            # staying identical across evaluations and across checkpoints.
++            indices = sorted(val_indices)
++            indices = [indices[i] for i in np.random.default_rng(VAL_SHUFFLE_SEED).permutation(len(indices))]
++        else:
++            indices = [i for i in range(len(dataset)) if i not in val_indices]
++        logging.info(
++            f"Dataset split '{split}': {len(indices)} of {len(dataset)} frames "
++            f"(val episodes {sorted(val_episodes)})"
++        )
++        if not indices:
++            raise ValueError(f"Dataset split '{split}' is empty for val_episodes={sorted(val_episodes)}.")
++        dataset = Subset(dataset, indices)
+ 
+     if data_config.prompt_from_task:
+         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+@@ -228,6 +298,9 @@ def create_data_loader(
+     num_batches: int | None = None,
+     skip_norm_stats: bool = False,
+     framework: Literal["jax", "pytorch"] = "jax",
++    split: Literal["all", "train", "val"] = "all",
++    val_episodes: Sequence[int] | None = None,
++    batch_size: int | None = None,
+ ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+     """Create a data loader for training.
+ 
+@@ -238,15 +311,22 @@ def create_data_loader(
+         num_batches: Determines the number of batches to return.
+         skip_norm_stats: Whether to skip data normalization.
+         framework: The framework to use ("jax" or "pytorch").
++        split: Which part of the dataset to load; see `create_torch_dataset`.
++        val_episodes: Validation episodes. Defaults to `config.val_episodes`.
++        batch_size: Overrides `config.batch_size`.
+     """
+     data_config = config.data.create(config.assets_dirs, config.model)
+     logging.info(f"data_config: {data_config}")
++    val_episodes = config.val_episodes if val_episodes is None else val_episodes
++    batch_size = config.batch_size if batch_size is None else batch_size
+ 
+     if data_config.rlds_data_dir is not None:
++        if split != "all":
++            raise NotImplementedError("Episode-level train/val splitting is not supported for RLDS datasets.")
+         return create_rlds_data_loader(
+             data_config,
+             action_horizon=config.model.action_horizon,
+-            batch_size=config.batch_size,
++            batch_size=batch_size,
+             sharding=sharding,
+             shuffle=shuffle,
+             num_batches=num_batches,
+@@ -257,7 +337,7 @@ def create_data_loader(
+         data_config,
+         model_config=config.model,
+         action_horizon=config.model.action_horizon,
+-        batch_size=config.batch_size,
++        batch_size=batch_size,
+         sharding=sharding,
+         shuffle=shuffle,
+         num_batches=num_batches,
+@@ -265,6 +345,8 @@ def create_data_loader(
+         seed=config.seed,
+         skip_norm_stats=skip_norm_stats,
+         framework=framework,
++        split=split,
++        val_episodes=val_episodes,
+     )
+ 
+ 
+@@ -281,6 +363,8 @@ def create_torch_data_loader(
+     num_workers: int = 0,
+     seed: int = 0,
+     framework: str = "jax",
++    split: Literal["all", "train", "val"] = "all",
++    val_episodes: Sequence[int] = (),
+ ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+     """Create a data loader for training.
+ 
+@@ -299,7 +383,9 @@ def create_torch_data_loader(
+             execute in the main process.
+         seed: The seed to use for shuffling the data.
+     """
+-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
++    dataset = create_torch_dataset(
++        data_config, action_horizon, model_config, split=split, val_episodes=val_episodes
++    )
+     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+ 
+     # Use TorchDataLoader for both frameworks
+diff --git a/src/openpi/training/evaluation.py b/src/openpi/training/evaluation.py
+new file mode 100644
+index 0000000..cda7f96
+--- /dev/null
++++ b/src/openpi/training/evaluation.py
+@@ -0,0 +1,234 @@
++"""Validation metrics shared by in-loop training validation and the offline eval script.
++
++Keeping the metric definitions in one place means a number reported by `scripts/eval_offline.py`
++means exactly the same thing as the one logged during training.
++
++Two families of metrics are computed:
++
++* `val_loss` -- the flow-matching denoising loss with `train=False`. It is cheap (one forward pass)
++  and is what training uses to rank checkpoints. It is only comparable across checkpoints if the
++  noise and timestep draws are held fixed, which is why the rng is derived from a fixed seed and
++  the batch index rather than from the training rng.
++* action-space errors -- obtained by actually sampling actions with the flow-matching solver and
++  comparing against the demonstration. These are what a human can interpret (rad/s of joint
++  velocity error), but they cost `num_denoise_steps` forward passes, so by default only the offline
++  script computes them.
++"""
++
++from collections.abc import Iterator
++import dataclasses
++
++import flax.nnx as nnx
++import jax
++import jax.numpy as jnp
++import numpy as np
++
++import openpi.models.model as _model
++import openpi.shared.array_typing as at
++import openpi.shared.nnx_utils as nnx_utils
++import openpi.transforms as _transforms
++
++
++def eval_loss(
++    model: _model.BaseModel,
++    rng: at.KeyArrayLike,
++    observation: _model.Observation,
++    actions: _model.Actions,
++) -> at.Array:
++    """Mean denoising loss of one batch, with dropout and other train-time randomness disabled."""
++    model.eval()
++    return jnp.mean(model.compute_loss(rng, observation, actions, train=False))
++
++
++def eval_loss_from_state(
++    model_def: nnx.GraphDef,
++    params: nnx.State,
++    rng: at.KeyArrayLike,
++    batch: tuple[_model.Observation, _model.Actions],
++) -> at.Array:
++    """`eval_loss` against a train state's (model_def, params) pair, so it can be jitted in-loop."""
++    model = nnx.merge(model_def, params)
++    observation, actions = batch
++    return eval_loss(model, rng, observation, actions)
++
++
++def unnormalize_actions(actions: np.ndarray, norm_stats, *, use_quantiles: bool) -> np.ndarray:
++    """Map normalized actions back to physical units, dropping the padding dimensions.
++
++    Mirrors `openpi.transforms.Unnormalize`, but returns only the real (unpadded) action
++    dimensions, since errors on the zero-padding are meaningless.
++    """
++    stats = norm_stats["actions"]
++    if use_quantiles:
++        q01, q99 = np.asarray(stats.q01), np.asarray(stats.q99)
++        dim = q01.shape[-1]
++        return (actions[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
++    mean, std = np.asarray(stats.mean), np.asarray(stats.std)
++    dim = mean.shape[-1]
++    return actions[..., :dim] * (std + 1e-6) + mean
++
++
++@dataclasses.dataclass
++class ActionErrorAccumulator:
++    """Accumulates action-space errors over batches.
++
++    `gripper_index` is the index of the gripper dimension within the real action dims; the
++    remaining dims are treated as joint velocities. For this dataset actions are
++    7 joint velocities + 1 gripper, so the gripper is the last of 8 dims.
++    """
++
++    gripper_index: int = -1
++    # A joint-velocity command whose L-infinity norm is below this is treated as "not moving".
++    # 1e-3 rad/s is well below the smallest commanded motion in the data and above float noise.
++    stall_threshold: float = 1e-3
++
++    def __post_init__(self):
++        self._n = 0
++        self._sq_err = None  # [horizon, dim]
++        self._abs_err = None  # [horizon, dim]
++        self._sq_err_norm = 0.0
++        self._pred_stall = 0
++        self._gt_stall = 0
++        self._steps = 0
++        self._pred_absmean = 0.0
++        self._gt_absmean = 0.0
++        # Predicted joint speed split by whether the demonstration is holding still, kept as raw
++        # values so percentiles can be reported. `pred_stall_frac` alone is misleading for a
++        # continuous-output policy: exact zeros are a measure-zero event, so it is near zero by
++        # construction. What matters for deployment is how fast the arm creeps when it should hold.
++        self._pred_speed_gt_zero: list[np.ndarray] = []
++        self._pred_speed_gt_move: list[np.ndarray] = []
++
++    def _joint_dims(self, dim: int) -> tuple[int, list[int]]:
++        gripper = self.gripper_index % dim
++        return gripper, [i for i in range(dim) if i != gripper]
++
++    def update(self, pred_phys: np.ndarray, gt_phys: np.ndarray, pred_norm: np.ndarray, gt_norm: np.ndarray) -> None:
++        """Add one batch. `*_phys` are [batch, horizon, dim] in physical units, `*_norm` normalized."""
++        err = pred_phys - gt_phys
++        sq, ab = np.square(err).sum(axis=0), np.abs(err).sum(axis=0)
++        self._sq_err = sq if self._sq_err is None else self._sq_err + sq
++        self._abs_err = ab if self._abs_err is None else self._abs_err + ab
++        self._n += pred_phys.shape[0]
++        self._sq_err_norm += float(np.square(pred_norm - gt_norm).sum())
++
++        _, joints = self._joint_dims(pred_phys.shape[-1])
++        pred_j, gt_j = pred_phys[..., joints], gt_phys[..., joints]
++        pred_speed, gt_speed = np.abs(pred_j).max(axis=-1), np.abs(gt_j).max(axis=-1)
++        gt_holding = gt_speed < self.stall_threshold
++        self._pred_stall += int((pred_speed < self.stall_threshold).sum())
++        self._gt_stall += int(gt_holding.sum())
++        self._steps += int(pred_j.shape[0] * pred_j.shape[1])
++        self._pred_absmean += float(np.abs(pred_j).sum())
++        self._gt_absmean += float(np.abs(gt_j).sum())
++        self._pred_speed_gt_zero.append(pred_speed[gt_holding])
++        self._pred_speed_gt_move.append(pred_speed[~gt_holding])
++
++    def result(self) -> dict:
++        if self._n == 0:
++            raise ValueError("No batches accumulated.")
++        horizon, dim = self._sq_err.shape
++        gripper, joints = self._joint_dims(dim)
++        mse_per_dim = self._sq_err / self._n  # [horizon, dim]
++        mae_per_dim = self._abs_err / self._n
++        joint_scale = self._n * horizon * len(joints)
++        return {
++            # Headline numbers, in physical units (rad/s for joints, [0,1] for the gripper).
++            "action_mse_phys": float(mse_per_dim[:, joints].mean()),
++            "action_mae_phys": float(mae_per_dim[:, joints].mean()),
++            "gripper_mae": float(mae_per_dim[:, gripper].mean()),
++            # Normalized-space MSE, comparable to the training loss scale.
++            "action_mse_norm": float(self._sq_err_norm / (self._n * horizon * dim)),
++            # Per-dimension and per-horizon-step breakdowns.
++            "mae_per_joint": [float(v) for v in mae_per_dim[:, joints].mean(axis=0)],
++            "mae_per_horizon": [float(v) for v in mae_per_dim[:, joints].mean(axis=-1)],
++            # Stall diagnostics: 27.2% of frames in this dataset carry an exactly-zero action, so a
++            # policy that learns to freeze would still score a decent loss. A predicted stall rate
++            # far above the ground-truth one is the signature of that failure.
++            "pred_stall_frac": self._pred_stall / self._steps,
++            "gt_stall_frac": self._gt_stall / self._steps,
++            "pred_abs_joint_mean": self._pred_absmean / joint_scale,
++            "gt_abs_joint_mean": self._gt_absmean / joint_scale,
++            "num_samples": self._n,
++            **self._creep_metrics(),
++        }
++
++    def _creep_metrics(self) -> dict:
++        """How fast the policy moves on the steps where the demonstration holds still.
++
++        `creep_ratio` is the headline: the median predicted speed during a demonstrated hold,
++        divided by the median predicted speed while the demonstration is moving. Near 0 means the
++        policy reproduces holds; near 1 means it ignores them and keeps drifting.
++        """
++        held = np.concatenate(self._pred_speed_gt_zero) if self._pred_speed_gt_zero else np.zeros(0)
++        moving = np.concatenate(self._pred_speed_gt_move) if self._pred_speed_gt_move else np.zeros(0)
++        if held.size == 0 or moving.size == 0:
++            return {}
++        held_p50, held_p90 = (float(v) for v in np.percentile(held, [50, 90]))
++        moving_p50 = float(np.percentile(moving, 50))
++        return {
++            "creep_speed_p50": held_p50,
++            "creep_speed_p90": held_p90,
++            "creep_speed_mean": float(held.mean()),
++            "moving_speed_p50": moving_p50,
++            "creep_ratio": held_p50 / (moving_p50 + 1e-9),
++            "num_held_steps": int(held.size),
++        }
++
++
++def iter_batches(data_loader, num_batches: int) -> Iterator:
++    """First `num_batches` batches of a (possibly infinite) data loader."""
++    it = iter(data_loader)
++    for _ in range(num_batches):
++        yield next(it)
++
++
++def evaluate_model(
++    model: _model.BaseModel,
++    data_loader,
++    *,
++    num_batches: int,
++    seed: int = 0,
++    sample_actions: bool = False,
++    num_denoise_steps: int = 10,
++) -> dict:
++    """Run validation over `num_batches` batches and return the aggregated metrics."""
++    data_config = data_loader.data_config()
++    eval_rng = jax.random.key(seed)
++
++    # Freeze the module state and jit the two methods: running a 3B-parameter model op-by-op in
++    # eager mode is orders of magnitude slower than a single compiled call.
++    model.eval()
++    loss_fn = nnx_utils.module_jit(model.compute_loss, static_argnames=("train",))
++    sample_fn = nnx_utils.module_jit(model.sample_actions, static_argnames=("num_steps",)) if sample_actions else None
++
++    losses = []
++    errors = ActionErrorAccumulator() if sample_actions else None
++    for i, (observation, actions) in enumerate(iter_batches(data_loader, num_batches)):
++        batch_rng = jax.random.fold_in(eval_rng, i)
++        losses.append(float(jnp.mean(loss_fn(batch_rng, observation, actions, train=False))))
++
++        if errors is not None:
++            pred = np.asarray(jax.device_get(sample_fn(batch_rng, observation, num_steps=num_denoise_steps)))
++            gt = np.asarray(jax.device_get(actions))
++            dim = np.asarray(data_config.norm_stats["actions"].q01).shape[-1]
++            errors.update(
++                unnormalize_actions(pred, data_config.norm_stats, use_quantiles=data_config.use_quantile_norm),
++                unnormalize_actions(gt, data_config.norm_stats, use_quantiles=data_config.use_quantile_norm),
++                pred[..., :dim],
++                gt[..., :dim],
++            )
++
++    metrics = {
++        "val_loss": float(np.mean(losses)),
++        "val_loss_std": float(np.std(losses)),
++        "num_batches": num_batches,
++    }
++    if errors is not None:
++        metrics |= errors.result()
++    return metrics
++
++
++def unnormalize_transform(data_config) -> _transforms.Unnormalize:
++    """The Unnormalize transform matching a data config, for callers that want the full pipeline."""
++    return _transforms.Unnormalize(data_config.norm_stats, use_quantiles=data_config.use_quantile_norm)
