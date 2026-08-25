@@ -1,5 +1,7 @@
 # FR3 teleoperation and demonstration collection
 
+[简体中文快速流程](README_CN.md)
+
 Joystick teleoperation, synchronized RealSense recording, LeRobot conversion,
 and guarded OpenPI pi0.5 execution for a Franka Research 3. Robot
 control runs through [fitz0401/bamboo](https://github.com/fitz0401/bamboo) on

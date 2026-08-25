@@ -61,7 +61,7 @@ max = [1.00, 1.50, 1.00]
 [pi05]
 transport = "zmq"
 # Enable only for a checkpoint trained with exterior_image_2_left.
-use_external2 = false
+use_external2 = true
 # Contract profile; GPU weight paths are selected by the server launcher.
 checkpoint = "wine_hybrid"
 # Dedicated inference LAN: GPU enp103s0 ↔ robot workstation eno1.
