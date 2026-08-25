@@ -116,6 +116,8 @@ class Pi05RunnerTest(unittest.TestCase):
         }
 
         _validate_policy_contract("wine_hybrid", metadata)
+        metadata["action_expert_variant"] = "gemma_300m"
+        _validate_policy_contract("wine_hybrid", metadata)
         metadata["joint_observation_shape"] = [21]
         with self.assertRaisesRegex(RuntimeError, "history contract"):
             _validate_policy_contract("wine_hybrid", metadata)

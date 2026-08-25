@@ -6,10 +6,27 @@ from pathlib import Path
 import numpy as np
 
 from fr3_pi05.protocol import OpenPiWebsocketClient, OpenPiZmqClient, packb, unpackb
-from fr3_pi05.remote.serve_pi05_zmq import handle_request, load_policy, warm_up
+from fr3_pi05.remote.serve_pi05_zmq import (
+    handle_request,
+    load_policy,
+    resolve_action_expert_variant,
+    warm_up,
+)
 
 
 class Pi05ProtocolTest(unittest.TestCase):
+    def test_wine_variant_is_inferred_from_checkpoint_name(self) -> None:
+        self.assertEqual(
+            resolve_action_expert_variant("/models/pi05_wine_hybrid_17500", "auto"),
+            "gemma_300m_lora",
+        )
+        self.assertEqual(
+            resolve_action_expert_variant("/models/pi05_wine_aefull_17500", "auto"),
+            "gemma_300m",
+        )
+        with self.assertRaisesRegex(RuntimeError, "Cannot determine"):
+            resolve_action_expert_variant("/models/checkpoint_17500", "auto")
+
     def test_numpy_msgpack_round_trip(self) -> None:
         original = {
             "image": np.arange(24, dtype=np.uint8).reshape(2, 4, 3),

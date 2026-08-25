@@ -20,6 +20,22 @@ from fr3_pi05.protocol import packb, unpackb
 LOG = logging.getLogger("pi05_zmq_server")
 
 
+def resolve_action_expert_variant(checkpoint: str, requested: str) -> str:
+    """Resolve Wine LoRA/full mode from an explicit value or checkpoint name."""
+
+    if requested != "auto":
+        return requested
+    name = Path(checkpoint).name.lower().replace("-", "_")
+    if any(marker in name for marker in ("aefull", "ae_full", "full")):
+        return "gemma_300m"
+    if any(marker in name for marker in ("lora", "hybrid")):
+        return "gemma_300m_lora"
+    raise RuntimeError(
+        "Cannot determine whether this Wine checkpoint is LoRA or full from its directory name. "
+        "Include 'lora'/'hybrid' or 'aefull'/'full' in the checkpoint directory name."
+    )
+
+
 def _build_wine_policy(
     module: Any,
     checkpoint: str,
@@ -177,10 +193,19 @@ def load_policy(
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
         resolved_asset_id = asset_id or getattr(module, "DEFAULT_ASSET_ID", "fitz0401/franka_pour_wine")
+        resolved_action_expert_variant = resolve_action_expert_variant(
+            checkpoint,
+            action_expert_variant,
+        )
+        LOG.info(
+            "Wine action expert: %s (%s)",
+            resolved_action_expert_variant,
+            "auto-detected" if action_expert_variant == "auto" else "configured",
+        )
         policy = _build_wine_policy(
             module,
             checkpoint,
-            action_expert_variant,
+            resolved_action_expert_variant,
             resolved_asset_id,
             use_exterior2,
         )
@@ -189,8 +214,8 @@ def load_policy(
         resolved_tasks = tasks or []
         return policy, {
             "model": "pi05_wine_hybrid",
-            "action_horizon": int(module._model(action_expert_variant).action_horizon),
-            "action_expert_variant": action_expert_variant,
+            "action_horizon": int(module._model(resolved_action_expert_variant).action_horizon),
+            "action_expert_variant": resolved_action_expert_variant,
             "state_history_lags": history_lags,
             "proprio_history_offsets": [0, *history_lags],
             "num_state_frames": num_frames,
@@ -299,8 +324,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--action-expert-variant",
-        choices=("gemma_300m_lora", "gemma_300m"),
-        default="gemma_300m_lora",
+        choices=("auto", "gemma_300m_lora", "gemma_300m"),
+        default="auto",
     )
     parser.add_argument(
         "--proprio-history-offsets",

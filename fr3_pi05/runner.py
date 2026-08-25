@@ -398,7 +398,6 @@ def _validate_policy_contract(checkpoint: str, metadata: dict[str, Any]) -> None
     expected = {
         "model": "pi05_wine_hybrid",
         "loader": "wine",
-        "action_expert_variant": "gemma_300m_lora",
         "action_horizon": WINE_ACTION_HORIZON,
         "state_history_lags": [45, 75],
         "num_state_frames": 3,
@@ -419,6 +418,12 @@ def _validate_policy_contract(checkpoint: str, metadata: dict[str, Any]) -> None
             "wine_hybrid server does not advertise the required history contract: "
             + "; ".join(mismatches)
             + ". Pull the latest fr3_demo on the GPU machine and restart the wine server."
+        )
+    action_expert_variant = metadata.get("action_expert_variant")
+    if action_expert_variant not in {"gemma_300m_lora", "gemma_300m"}:
+        raise RuntimeError(
+            "wine_hybrid server returned an invalid action expert variant: "
+            f"{action_expert_variant!r}"
         )
     tasks = metadata.get("tasks")
     if not isinstance(tasks, list) or not all(isinstance(task, str) and task.strip() for task in tasks):
