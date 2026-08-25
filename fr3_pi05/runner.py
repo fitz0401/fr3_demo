@@ -35,7 +35,6 @@ from fr3_pi05.policy import (
 
 LOG = logging.getLogger("fr3_pi05")
 WINE_ACTION_HORIZON = 16
-WINE_TASKS = ("pour lillet into the jigger", "pour gin into the jigger")
 
 
 class WineHistorySampler:
@@ -81,9 +80,10 @@ class WineHistorySampler:
 class GripperWorker:
     """Own the blocking Bamboo gripper calls without starving arm streaming."""
 
-    def __init__(self, robot: BambooRobot, enabled: bool) -> None:
+    def __init__(self, robot: BambooRobot, enabled: bool, threshold: float = 0.9) -> None:
         self._robot = robot
         self._enabled = enabled
+        self._threshold = threshold
         self._position = 0.0
         self._desired: float | None = None
         self._moving = False
@@ -151,7 +151,7 @@ class GripperWorker:
     def command(self, desired: float) -> bool:
         if not self._enabled:
             return False
-        binary = 1.0 if desired > 0.5 else 0.0
+        binary = 1.0 if desired > self._threshold else 0.0
         with self._lock:
             if binary == self._desired:
                 return False
@@ -210,9 +210,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-gripper", action="store_true")
     parser.add_argument("--external-camera-serial")
     parser.add_argument("--wrist-camera-serial")
+    parser.add_argument("--external2-camera-serial", help="optional second exterior RealSense")
     parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
+    parser.add_argument("--external2-camera-fps", type=int, default=30)
+    parser.add_argument("--external2-camera-width", type=int, default=960)
+    parser.add_argument("--external2-camera-height", type=int, default=540)
     parser.add_argument(
         "--wrist-rotate-180",
         action=argparse.BooleanOptionalAction,
@@ -220,10 +224,21 @@ def _parser() -> argparse.ArgumentParser:
         help="rotate wrist images 180 degrees before RViz, recording, and policy inference",
     )
     parser.add_argument("--joystick", default="/dev/input/js0", help="Back button is the software abort")
+    parser.add_argument(
+        "--require-joystick",
+        action="store_true",
+        help="refuse execution when the optional Back-button abort joystick is unavailable",
+    )
     parser.add_argument("--control-hz", type=float, default=15.0)
     parser.add_argument("--stream-hz", type=float, default=30.0)
     parser.add_argument("--open-loop-horizon", type=int, default=15)
     parser.add_argument("--prefetch-actions", type=int, default=4)
+    parser.add_argument(
+        "--gripper-threshold",
+        type=float,
+        default=0.9,
+        help="model gripper value must exceed this threshold to open; otherwise close",
+    )
     parser.add_argument("--max-joint-speed", type=float, default=0.20)
     parser.add_argument("--max-joint-acceleration", type=float, default=1.0)
     parser.add_argument("--home-speed", type=float, default=0.20)
@@ -251,6 +266,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--check", action="store_true", help="perform one inference and safety preview; never move")
     parser.add_argument("--server-only", action="store_true", help="check policy transport/metadata without robot or cameras")
     parser.add_argument("--offline", action="store_true", help="validate configuration and math without hardware/network")
+    parser.add_argument(
+        "--debug-chunks",
+        action="store_true",
+        help="print every received action chunk and its thresholded gripper decisions",
+    )
     parser.add_argument("--execute", action="store_true", help="allow policy actions to reach Bamboo")
     return parser
 
@@ -270,6 +290,7 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         "policy_host": os.environ.get("FR3_PI05_HOST"),
         "external_camera_serial": os.environ.get("FR3_EXTERNAL_CAMERA_SERIAL"),
         "wrist_camera_serial": os.environ.get("FR3_WRIST_CAMERA_SERIAL"),
+        "external2_camera_serial": os.environ.get("FR3_EXTERNAL2_CAMERA_SERIAL"),
     }
     defaults.update({key: value for key, value in environment.items() if value})
     parser.set_defaults(config=bootstrap_args.config, **defaults)
@@ -300,10 +321,14 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         parser.error("max-steps must be non-negative (0 disables the limit)")
     if args.camera_width < 1 or args.camera_height < 1 or args.camera_fps < 1:
         parser.error("camera width, height, and fps must be positive")
+    if args.external2_camera_width < 1 or args.external2_camera_height < 1 or args.external2_camera_fps < 1:
+        parser.error("optional camera width, height, and fps must be positive")
     if args.home_speed <= 0 or args.home_timeout <= 0:
         parser.error("home speed and timeout must be positive")
     if not 0.0 <= args.gripper_force <= 1.0:
         parser.error("--gripper-force must be in [0.0, 1.0]")
+    if not 0.0 <= args.gripper_threshold <= 1.0:
+        parser.error("--gripper-threshold must be in [0.0, 1.0]")
     if args.transport != "zmq" and args.zmq_mode != "connect":
         parser.error("--zmq-mode bind is only valid with --transport zmq")
     return args
@@ -332,6 +357,23 @@ def _check_port(host: str, port: int, timeout: float = 5.0) -> None:
         raise RuntimeError(f"Cannot reach pi0.5 server at {host}:{port}: {error}") from error
 
 
+def _build_camera_observation(
+    frames: dict[str, Any],
+    joint_position: np.ndarray,
+    gripper_position: float | np.ndarray,
+    prompt: str,
+) -> dict[str, Any]:
+    exterior2 = frames.get("exterior_image_2_left")
+    return build_droid_observation(
+        frames["exterior_image_left"].image,
+        frames["wrist_image"].image,
+        joint_position,
+        gripper_position,
+        prompt,
+        exterior2_image=None if exterior2 is None else exterior2.image,
+    )
+
+
 def _make_observation(
     cameras: RealSensePair,
     robot: BambooRobot,
@@ -346,13 +388,7 @@ def _make_observation(
     observation_gripper: float | np.ndarray = gripper.position
     if history is not None:
         observation_joints, observation_gripper = history.observation()
-    observation = build_droid_observation(
-        frames["exterior_image_left"].image,
-        frames["wrist_image"].image,
-        observation_joints,
-        observation_gripper,
-        prompt,
-    )
+    observation = _build_camera_observation(frames, observation_joints, observation_gripper, prompt)
     return observation, frames, q, state
 
 
@@ -372,7 +408,6 @@ def _validate_policy_contract(checkpoint: str, metadata: dict[str, Any]) -> None
         "gripper_observation_shape": [3],
         "image_observation_shape": [180, 320, 3],
         "proprio_history_offsets": list(WINE_HISTORY_OFFSETS),
-        "tasks": list(WINE_TASKS),
     }
     mismatches = [
         f"{key}={metadata.get(key)!r} (expected {value!r})"
@@ -384,6 +419,29 @@ def _validate_policy_contract(checkpoint: str, metadata: dict[str, Any]) -> None
             "wine_hybrid server does not advertise the required history contract: "
             + "; ".join(mismatches)
             + ". Pull the latest fr3_demo on the GPU machine and restart the wine server."
+        )
+    tasks = metadata.get("tasks")
+    if not isinstance(tasks, list) or not all(isinstance(task, str) and task.strip() for task in tasks):
+        raise RuntimeError("wine_hybrid server returned an invalid task allowlist")
+    asset_id = metadata.get("asset_id")
+    if not isinstance(asset_id, str) or not asset_id.strip():
+        raise RuntimeError("wine_hybrid server did not advertise its normalization asset ID")
+
+
+def _validate_prompt(prompt: str, metadata: dict[str, Any]) -> None:
+    tasks = metadata.get("tasks") or []
+    if tasks and prompt not in tasks:
+        choices = " or ".join(repr(task) for task in tasks)
+        raise RuntimeError(f"Prompt must exactly match {choices}; got {prompt!r}")
+
+
+def _validate_exterior2_contract(metadata: dict[str, Any], observation: dict[str, Any]) -> None:
+    """Require the optional camera only when the loaded checkpoint consumes it."""
+
+    if metadata.get("uses_exterior2") is True and "observation/exterior_image_2_left" not in observation:
+        raise RuntimeError(
+            "The policy was launched with USE_EXTERNAL2=1, but exterior_image_2_left is unavailable. "
+            "Connect/configure the L515 or restart the GPU server without USE_EXTERNAL2=1."
         )
 
 
@@ -435,7 +493,41 @@ def _announce_execution(args: argparse.Namespace) -> None:
     if not args.execute:
         return
     print("\nPOLICY EXECUTION WILL MOVE THE FR3.")
-    print("Clear the workspace, keep a hand on the physical E-stop, and use Back to abort.")
+    print("Clear the workspace and keep a hand on the physical E-stop. Use Back when a joystick is connected.")
+
+
+def _open_abort_joystick(path: str, required: bool) -> tuple[LinuxJoystick | None, int]:
+    """Open the optional Back-button abort device and return its initial press count."""
+
+    joystick: LinuxJoystick | None = None
+    try:
+        joystick = LinuxJoystick(path).open()
+        snapshot = joystick.snapshot()
+        if len(snapshot.buttons) <= Mapping().quit_button:
+            raise RuntimeError("Joystick does not expose the configured Back abort button")
+        return joystick, snapshot.press_counts[Mapping().quit_button]
+    except RuntimeError as error:
+        if joystick is not None:
+            joystick.close()
+        if required:
+            raise
+        LOG.warning("Joystick unavailable; Back abort disabled: %s", error)
+        return None, 0
+
+
+def _print_action_chunk(actions: np.ndarray, sequence: int, source: str, gripper_threshold: float) -> None:
+    """Print one validated policy chunk with explicit gripper interpretation."""
+
+    chunk = np.asarray(actions, dtype=float)
+    gripper = chunk[:, 7]
+    decisions = ["OPEN" if value > gripper_threshold else "CLOSE" for value in gripper]
+    print(f"\nDEBUG ACTION CHUNK #{sequence} ({source}), shape={chunk.shape}")
+    print("columns: dq0 dq1 dq2 dq3 dq4 dq5 dq6 gripper")
+    print(np.array2string(chunk, precision=4, suppress_small=False, max_line_width=180))
+    print(
+        f"gripper decisions (>{gripper_threshold:g} OPEN, <={gripper_threshold:g} CLOSE): "
+        + " ".join(f"{index}:{value:.4f}->{decision}" for index, (value, decision) in enumerate(zip(gripper, decisions)))
+    )
 
 
 def _home_robot(robot: BambooRobot, args: argparse.Namespace, stopped: threading.Event) -> np.ndarray:
@@ -497,9 +589,6 @@ def run(args: argparse.Namespace) -> int:
     prompt = args.prompt or input("Language instruction: ").strip()
     if not prompt:
         raise RuntimeError("Language instruction cannot be empty")
-    if args.checkpoint == "wine_hybrid" and prompt not in WINE_TASKS:
-        choices = " or ".join(repr(task) for task in WINE_TASKS)
-        raise RuntimeError(f"wine_hybrid prompt must exactly match {choices}; got {prompt!r}")
     workspace = WorkspaceBounds(tuple(args.workspace_min), tuple(args.workspace_max))
     policy_host, endpoint_label = _policy_endpoint(args)
     if args.transport != "zmq" or args.zmq_mode == "connect":
@@ -539,21 +628,26 @@ def run(args: argparse.Namespace) -> int:
         if not args.check and not args.no_gripper:
             _open_gripper(robot)
 
-        gripper = GripperWorker(robot, not args.no_gripper)
+        gripper = GripperWorker(robot, not args.no_gripper, args.gripper_threshold)
         gripper.wait_ready()
         cameras = RealSensePair(
             args.external_camera_serial,
             args.wrist_camera_serial,
+            args.external2_camera_serial,
             width=args.camera_width,
             height=args.camera_height,
             fps=args.camera_fps,
+            exterior2_width=args.external2_camera_width,
+            exterior2_height=args.external2_camera_height,
+            exterior2_fps=args.external2_camera_fps,
             wrist_rotate_180=args.wrist_rotate_180,
         ).start()
         print(
-            f"Cameras ready: {cameras.serials}; "
-            f"{args.camera_width}x{args.camera_height}@{args.camera_fps} Hz; "
+            f"Cameras ready: {cameras.serials}; modes={cameras.modes}; "
             f"wrist_rotate_180={args.wrist_rotate_180}"
         )
+        if cameras.optional_camera_error:
+            print(f"Optional exterior camera unavailable; continuing without it: {cameras.optional_camera_error}")
         policy = InferenceWorker(
             policy_host,
             args.policy_port,
@@ -568,6 +662,7 @@ def run(args: argparse.Namespace) -> int:
         if policy.metadata:
             print(f"Server metadata keys: {', '.join(sorted(policy.metadata))}")
         _validate_policy_contract(args.checkpoint, policy.metadata)
+        _validate_prompt(prompt, policy.metadata)
         if not args.no_rviz:
             from fr3_pi05.visualization import RvizBridge
 
@@ -584,6 +679,7 @@ def run(args: argparse.Namespace) -> int:
             args.max_camera_age,
             history_sampler.history if history_sampler is not None else None,
         )
+        _validate_exterior2_contract(policy.metadata, observation)
         policy.submit(observation)
         first = _wait_result(
             policy,
@@ -594,6 +690,9 @@ def run(args: argparse.Namespace) -> int:
         age = first.completed_at - first.requested_at
         if age > args.max_inference_age:
             raise RuntimeError(f"Initial inference was stale ({age:.2f}s > {args.max_inference_age:.2f}s)")
+        chunk_sequence = 1
+        if args.debug_chunks:
+            _print_action_chunk(first.actions, chunk_sequence, "initial", args.gripper_threshold)
         predicted = predict_joint_path(
             q,
             first.actions,
@@ -609,6 +708,9 @@ def run(args: argparse.Namespace) -> int:
                 frames["wrist_image"].image,
                 q,
                 predicted,
+                None
+                if "exterior_image_2_left" not in frames
+                else frames["exterior_image_2_left"].image,
             )
         print(
             f"Inference check: actions={first.actions.shape}, latency={age:.3f}s, "
@@ -623,6 +725,9 @@ def run(args: argparse.Namespace) -> int:
                         frames["wrist_image"].image,
                         q,
                         predicted,
+                        None
+                        if "exterior_image_2_left" not in frames
+                        else frames["exterior_image_2_left"].image,
                     )
                     time.sleep(0.1)
             print("CHECK PASSED. Bamboo streaming was not started; the robot did not move.")
@@ -630,14 +735,11 @@ def run(args: argparse.Namespace) -> int:
 
         _announce_execution(args)
         if args.execute:
-            joystick = LinuxJoystick(args.joystick).open()
-            snapshot = joystick.snapshot()
-            if len(snapshot.buttons) <= Mapping().quit_button:
-                raise RuntimeError("Joystick does not expose the configured Back abort button")
-            initial_back_count = snapshot.press_counts[Mapping().quit_button]
+            joystick, initial_back_count = _open_abort_joystick(args.joystick, args.require_joystick)
             robot.start_stream(args.watchdog_ms, args.max_joint_speed, args.max_joint_acceleration)
             stream_started = True
-            print("Bamboo policy streaming ARMED. Press Back, Ctrl+C, or the physical E-stop to stop.")
+            abort_controls = "Back, Ctrl+C, or the physical E-stop" if joystick is not None else "Ctrl+C or the physical E-stop"
+            print(f"Bamboo policy streaming ARMED. Use {abort_controls} to stop.")
         else:
             initial_back_count = 0
             print("Inference-only rollout. Add --execute to allow robot motion.")
@@ -660,8 +762,13 @@ def run(args: argparse.Namespace) -> int:
             if joystick is not None:
                 snapshot = joystick.snapshot()
                 if not snapshot.connected:
-                    raise RuntimeError("Joystick disconnected; stopping policy execution")
-                if snapshot.press_counts[Mapping().quit_button] != initial_back_count:
+                    if args.require_joystick:
+                        raise RuntimeError("Joystick disconnected; stopping policy execution")
+                    LOG.warning("Joystick disconnected; Back abort disabled. Use Ctrl+C or the physical E-stop.")
+                    joystick.close()
+                    joystick = None
+                    snapshot = None
+                if snapshot is not None and snapshot.press_counts[Mapping().quit_button] != initial_back_count:
                     print("Back pressed; stopping.")
                     break
 
@@ -672,6 +779,9 @@ def run(args: argparse.Namespace) -> int:
                     raise RuntimeError(
                         f"Discarding stale inference ({inference_age:.2f}s > {args.max_inference_age:.2f}s)"
                     )
+                chunk_sequence += 1
+                if args.debug_chunks:
+                    _print_action_chunk(result.actions, chunk_sequence, "replan", args.gripper_threshold)
                 if action_chunk is None:
                     action_chunk = result.actions
                     action_index = 0
@@ -697,9 +807,24 @@ def run(args: argparse.Namespace) -> int:
                     predicted = None
                 elif action_chunk is not None:
                     action = action_chunk[action_index]
+                    gripper_value = float(action[7])
+                    gripper_decision = "OPEN" if gripper_value > args.gripper_threshold else "CLOSE"
                     gripper_started = False
                     if args.execute:
-                        gripper_started = gripper.command(float(action[7]))
+                        gripper_started = gripper.command(gripper_value)
+                    if args.debug_chunks:
+                        command_status = (
+                            "transition started"
+                            if gripper_started
+                            else "target unchanged"
+                            if args.execute
+                            else "not executed"
+                        )
+                        print(
+                            f"DEBUG GRIPPER step={policy_steps} chunk_index={action_index} "
+                            f"model={gripper_value:.4f} -> {gripper_decision}; "
+                            f"observed={gripper_position:.4f}; {command_status}"
+                        )
                     if args.checkpoint == "wine_hybrid" and gripper_started:
                         # Demonstrations pause the arm during blocking gripper motion. Keep the
                         # Bamboo stream alive with zeros, discard this stale chunk, then replan.
@@ -737,13 +862,10 @@ def run(args: argparse.Namespace) -> int:
                             and next_chunk is None
                             and not policy.busy
                         ):
-                            observation = build_droid_observation(
-                                frames["exterior_image_left"].image,
-                                frames["wrist_image"].image,
-                                observation_joints,
-                                observation_gripper,
-                                prompt,
+                            observation = _build_camera_observation(
+                                frames, observation_joints, observation_gripper, prompt
                             )
+                            _validate_exterior2_contract(policy.metadata, observation)
                             policy.submit(observation)
                         if action_index >= args.open_loop_horizon:
                             action_chunk = next_chunk
@@ -753,13 +875,10 @@ def run(args: argparse.Namespace) -> int:
                     desired_velocity = np.zeros(7)
                     predicted = None
                     if not policy.busy:
-                        observation = build_droid_observation(
-                            frames["exterior_image_left"].image,
-                            frames["wrist_image"].image,
-                            observation_joints,
-                            observation_gripper,
-                            prompt,
+                        observation = _build_camera_observation(
+                            frames, observation_joints, observation_gripper, prompt
                         )
+                        _validate_exterior2_contract(policy.metadata, observation)
                         policy.submit(observation)
 
                 if rviz is not None:
@@ -768,6 +887,9 @@ def run(args: argparse.Namespace) -> int:
                         frames["wrist_image"].image,
                         q,
                         predicted,
+                        None
+                        if "exterior_image_2_left" not in frames
+                        else frames["exterior_image_2_left"].image,
                     )
                 if policy_steps and policy_steps % int(max(1, args.control_hz * 2)) == 0:
                     mode = "EXECUTING" if args.execute else "INFERENCE ONLY"

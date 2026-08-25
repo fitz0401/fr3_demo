@@ -328,9 +328,17 @@ def _create_parser() -> argparse.ArgumentParser:
         default=os.environ.get("FR3_WRIST_CAMERA_SERIAL"),
         help="RealSense serial for wrist_image (or FR3_WRIST_CAMERA_SERIAL)",
     )
+    parser.add_argument(
+        "--external2-camera-serial",
+        default=os.environ.get("FR3_EXTERNAL2_CAMERA_SERIAL"),
+        help="optional RealSense serial for exterior_image_2_left",
+    )
     parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
+    parser.add_argument("--external2-camera-fps", type=int, default=30)
+    parser.add_argument("--external2-camera-width", type=int, default=960)
+    parser.add_argument("--external2-camera-height", type=int, default=540)
     parser.add_argument(
         "--wrist-rotate-180",
         action=argparse.BooleanOptionalAction,
@@ -358,6 +366,9 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         "camera_fps",
         "camera_width",
         "camera_height",
+        "external2_camera_fps",
+        "external2_camera_width",
+        "external2_camera_height",
         "record_fps",
     ):
         if getattr(args, name) <= 0:
@@ -445,11 +456,17 @@ def run(args: argparse.Namespace) -> int:
             cameras = RealSensePair(
                 args.external_camera_serial,
                 args.wrist_camera_serial,
+                args.external2_camera_serial,
                 width=args.camera_width,
                 height=args.camera_height,
                 fps=args.camera_fps,
+                exterior2_width=args.external2_camera_width,
+                exterior2_height=args.external2_camera_height,
+                exterior2_fps=args.external2_camera_fps,
                 wrist_rotate_180=args.wrist_rotate_180,
             ).start()
+            if cameras.optional_camera_error:
+                print(f"Optional exterior camera unavailable; continuing without it: {cameras.optional_camera_error}")
             collector = DemoCollector(
                 cameras,
                 args.data_dir,

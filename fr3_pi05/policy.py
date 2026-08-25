@@ -94,6 +94,8 @@ def build_droid_observation(
     joint_position: np.ndarray,
     gripper_position: float | np.ndarray,
     prompt: str,
+    *,
+    exterior2_image: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Build the exact observation dictionary expected by ``pi05_droid``."""
 
@@ -108,13 +110,18 @@ def build_droid_observation(
     if gripper.shape not in ((1,), (3,)) or not np.all(np.isfinite(gripper)):
         raise ValueError("DROID observation requires 1 or 3 finite gripper positions")
     resize_image = _resize_wine if joints.shape == (3, 7) else _resize
-    return {
+    observation = {
         "observation/exterior_image_1_left": resize_image(np.asarray(exterior_image, dtype=np.uint8)),
         "observation/wrist_image_left": resize_image(np.asarray(wrist_image, dtype=np.uint8)),
         "observation/joint_position": joints,
         "observation/gripper_position": np.clip(gripper, 0.0, 1.0).astype(np.float32, copy=False),
         "prompt": prompt.strip(),
     }
+    if exterior2_image is not None:
+        observation["observation/exterior_image_2_left"] = resize_image(
+            np.asarray(exterior2_image, dtype=np.uint8)
+        )
+    return observation
 
 
 def validate_action_chunk(response: dict[str, Any], minimum_horizon: int) -> np.ndarray:

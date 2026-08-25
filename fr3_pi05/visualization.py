@@ -45,6 +45,9 @@ class RvizBridge:
         self._external = self._node.create_publisher(
             Image, "/fr3_pi05/exterior_image_left", qos_profile_sensor_data
         )
+        self._external2 = self._node.create_publisher(
+            Image, "/fr3_pi05/exterior_image_2_left", qos_profile_sensor_data
+        )
         self._wrist = self._node.create_publisher(Image, "/fr3_pi05/wrist_image", qos_profile_sensor_data)
         self._markers = self._node.create_publisher(MarkerArray, "/fr3_pi05/markers", 10)
         self._rviz: subprocess.Popen[Any] | None = None
@@ -98,8 +101,11 @@ class RvizBridge:
         wrist_image: np.ndarray,
         joint_position: np.ndarray,
         predicted_joint_path: np.ndarray | None,
+        exterior2_image: np.ndarray | None = None,
     ) -> None:
         self._external.publish(self._image_message(exterior_image, "exterior_camera"))
+        if exterior2_image is not None:
+            self._external2.publish(self._image_message(exterior2_image, "exterior_camera_2"))
         self._wrist.publish(self._image_message(wrist_image, "wrist_camera"))
 
         markers = self._marker_array_type()

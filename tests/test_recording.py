@@ -11,18 +11,23 @@ from fr3_demo.convert_lerobot import convert
 from fr3_demo.recording import RawEpisodeWriter
 
 
-def _write_episode(session: Path) -> Path:
+def _write_episode(session: Path, *, include_exterior2: bool = False) -> Path:
+    camera_serials = {"exterior_image_left": "external", "wrist_image": "wrist"}
+    if include_exterior2:
+        camera_serials["exterior_image_2_left"] = "external2"
     writer = RawEpisodeWriter(
         session,
         episode_index=0,
         fps=15.0,
-        camera_serials={"exterior_image_left": "external", "wrist_image": "wrist"},
+        camera_serials=camera_serials,
     )
     image = np.full((8, 12, 3), 127, dtype=np.uint8)
     frames = {
         "exterior_image_left": CameraFrame(image, 10.0, 1.0, 1),
         "wrist_image": CameraFrame(image, 10.0, 1.0, 1),
     }
+    if include_exterior2:
+        frames["exterior_image_2_left"] = CameraFrame(np.full_like(image, 200), 10.0, 1.0, 1)
     for index in range(2):
         writer.add_sample(
             captured_monotonic=writer.started_monotonic + index / 15,
@@ -60,7 +65,7 @@ class RawRecordingTest(unittest.TestCase):
             first_root = root / "raw_a"
             second_root = root / "raw_b"
             first_episode = _write_episode(first_root)
-            second_episode = _write_episode(second_root)
+            second_episode = _write_episode(second_root, include_exterior2=True)
             for episode, language in (
                 (first_episode, "pick up the block"),
                 (second_episode, "pour the liquid"),
@@ -107,6 +112,7 @@ class RawRecordingTest(unittest.TestCase):
             self.assertEqual(frame["actions"].shape, (8,))
             self.assertEqual(frame["task"], "pick up the block")
             self.assertEqual(dataset.frames[-1]["task"], "pour the liquid")
+            self.assertTrue(dataset.frames[-1]["exterior_image_2_left"].any())
 
 
 if __name__ == "__main__":

@@ -39,6 +39,16 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Best Effort
         Value: /fr3_pi05/wrist_image
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: Exterior Image 2 Left (optional)
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /fr3_pi05/exterior_image_2_left
   Enabled: true
   Global Options:
     Background Color: 35; 35; 35

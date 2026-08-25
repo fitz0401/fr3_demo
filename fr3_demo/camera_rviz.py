@@ -59,9 +59,13 @@ def rviz_main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--external-camera-serial")
     parser.add_argument("--wrist-camera-serial")
+    parser.add_argument("--external2-camera-serial", help="optional second exterior RealSense")
     parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
+    parser.add_argument("--external2-camera-fps", type=int, default=30)
+    parser.add_argument("--external2-camera-width", type=int, default=960)
+    parser.add_argument("--external2-camera-height", type=int, default=540)
     parser.add_argument(
         "--wrist-rotate-180",
         action=argparse.BooleanOptionalAction,
@@ -78,6 +82,7 @@ def rviz_main(argv: list[str] | None = None) -> int:
     environment_defaults = {
         "external_camera_serial": os.environ.get("FR3_EXTERNAL_CAMERA_SERIAL"),
         "wrist_camera_serial": os.environ.get("FR3_WRIST_CAMERA_SERIAL"),
+        "external2_camera_serial": os.environ.get("FR3_EXTERNAL2_CAMERA_SERIAL"),
     }
     defaults.update({key: value for key, value in environment_defaults.items() if value})
     parser.set_defaults(config=bootstrap_args.config, **defaults)
@@ -96,19 +101,30 @@ def rviz_main(argv: list[str] | None = None) -> int:
     cameras = RealSensePair(
         args.external_camera_serial,
         args.wrist_camera_serial,
+        args.external2_camera_serial,
         width=args.camera_width,
         height=args.camera_height,
         fps=args.camera_fps,
+        exterior2_width=args.external2_camera_width,
+        exterior2_height=args.external2_camera_height,
+        exterior2_fps=args.external2_camera_fps,
         wrist_rotate_180=args.wrist_rotate_180,
     ).start()
     rclpy.init()
     node = Node("fr3_demo_camera_preview")
     exterior_publisher = node.create_publisher(Image, "/fr3_demo/exterior_image_left", qos_profile_sensor_data)
+    exterior2_publisher = node.create_publisher(
+        Image, "/fr3_demo/exterior_image_2_left", qos_profile_sensor_data
+    )
     wrist_publisher = node.create_publisher(Image, "/fr3_demo/wrist_image", qos_profile_sensor_data)
 
     def publish() -> None:
         frames = cameras.snapshot()
         exterior_publisher.publish(_image_message(frames["exterior_image_left"].image, "exterior_camera", node))
+        if "exterior_image_2_left" in frames:
+            exterior2_publisher.publish(
+                _image_message(frames["exterior_image_2_left"].image, "exterior_camera_2", node)
+            )
         wrist_publisher.publish(_image_message(frames["wrist_image"].image, "wrist_camera", node))
 
     node.create_timer(1.0 / 15.0, publish)
@@ -122,9 +138,11 @@ def rviz_main(argv: list[str] | None = None) -> int:
             )
 
     print(
-        f"Publishing {args.camera_width}x{args.camera_height}@{args.camera_fps} Hz camera views; "
-        f"wrist_rotate_180={args.wrist_rotate_180}. Press Ctrl+C to stop."
+        f"Publishing camera views {cameras.modes}; wrist_rotate_180={args.wrist_rotate_180}. "
+        "Press Ctrl+C to stop."
     )
+    if cameras.optional_camera_error:
+        print(f"Optional exterior camera unavailable; continuing without it: {cameras.optional_camera_error}")
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

@@ -107,12 +107,16 @@ def convert(
         with np.load(episode / "trajectory.npz") as trajectory:
             frame_count = len(trajectory["joint_position"])
             exterior_paths = sorted((episode / "frames" / "exterior_image_left").glob("frame_*.jpg"))
+            exterior2_paths = sorted((episode / "frames" / "exterior_image_2_left").glob("frame_*.jpg"))
             wrist_paths = sorted((episode / "frames" / "wrist_image").glob("frame_*.jpg"))
             if len(exterior_paths) != frame_count or len(wrist_paths) != frame_count:
                 raise RuntimeError(f"Camera/numeric frame count mismatch in {episode}")
+            if exterior2_paths and len(exterior2_paths) != frame_count:
+                raise RuntimeError(f"Optional exterior camera/frame count mismatch in {episode}")
             black_exterior = np.zeros((180, 320, 3), dtype=np.uint8)
             for index in range(frame_count):
                 exterior = _load_rgb(exterior_paths[index])
+                exterior2 = _load_rgb(exterior2_paths[index]) if exterior2_paths else black_exterior
                 wrist = _load_rgb(wrist_paths[index])
                 action = np.concatenate(
                     [trajectory["action_joint_velocity"][index], trajectory["action_gripper_position"][index]],
@@ -121,7 +125,7 @@ def convert(
                 dataset.add_frame(
                     {
                         "exterior_image_1_left": exterior,
-                        "exterior_image_2_left": black_exterior,
+                        "exterior_image_2_left": exterior2,
                         "wrist_image_left": wrist,
                         "joint_position": np.asarray(trajectory["joint_position"][index], dtype=np.float32),
                         "gripper_position": np.asarray(trajectory["gripper_position"][index], dtype=np.float32),

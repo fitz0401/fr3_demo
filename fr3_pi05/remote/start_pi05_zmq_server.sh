@@ -35,10 +35,33 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 2
 fi
 
-CUSTOM_ASSET_ID=
+CUSTOM_ASSET_ID=${ASSET_ID:-}
 PROPRIO_HISTORY_OFFSETS=(0)
 WINE_LOADER_PATH=
 ACTION_EXPERT_VARIANT=${ACTION_EXPERT_VARIANT:-gemma_300m_lora}
+TASKS_JSON=${TASKS_JSON:-}
+if [ -z "${USE_EXTERNAL2+x}" ]; then
+  CONFIG_PYTHON=$OPENPI_DIR/.venv/bin/python
+  if [ ! -x "$CONFIG_PYTHON" ]; then
+    CONFIG_PYTHON=$(command -v python3)
+  fi
+  USE_EXTERNAL2=$(
+    "$CONFIG_PYTHON" - "$FR3_DEMO_DIR/config.toml" <<'PY'
+import pathlib
+import sys
+
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+
+path = pathlib.Path(sys.argv[1])
+with path.open("rb") as stream:
+    config = tomllib.load(stream)
+print("1" if config.get("pi05", {}).get("use_external2", False) else "0")
+PY
+  )
+fi
 case "$MODEL_PROFILE" in
   pi05_droid)
     LOADER=official
@@ -47,12 +70,11 @@ case "$MODEL_PROFILE" in
   custom_droid)
     LOADER=custom_droid
     CONFIG_NAME=pi05_droid
-    CUSTOM_ASSET_ID=fitz0401/custom_droid
+    CUSTOM_ASSET_ID=${CUSTOM_ASSET_ID:-fitz0401/custom_droid}
     ;;
   wine_hybrid)
     LOADER=wine
     CONFIG_NAME=pi05_droid
-    CUSTOM_ASSET_ID=fitz0401/franka_pour_wine
     PROPRIO_HISTORY_OFFSETS=(0 45 75)
     WINE_LOADER_PATH=$FR3_DEMO_DIR/fr3_train/serve_wine.py
     ;;
@@ -61,6 +83,17 @@ case "$MODEL_PROFILE" in
     exit 2
     ;;
 esac
+if [ "$LOADER" = wine ] && [ -z "$CUSTOM_ASSET_ID" ]; then
+  mapfile -t NORM_FILES < <(find "$CHECKPOINT/assets" -type f -name norm_stats.json 2>/dev/null | sort)
+  if [ "${#NORM_FILES[@]}" -ne 1 ]; then
+    echo "Expected exactly one normalization file under $CHECKPOINT/assets; found ${#NORM_FILES[@]}." >&2
+    echo "Set ASSET_ID=owner/dataset to select one explicitly." >&2
+    exit 2
+  fi
+  CUSTOM_ASSET_ID=${NORM_FILES[0]#"$CHECKPOINT/assets/"}
+  CUSTOM_ASSET_ID=${CUSTOM_ASSET_ID%/norm_stats.json}
+  echo "Auto-detected normalization asset: $CUSTOM_ASSET_ID"
+fi
 if [ "$LOADER" = custom_droid ]; then
   if [ ! -f "$CHECKPOINT/serve_custom_droid.py" ]; then
     echo "Custom loader is missing: $CHECKPOINT/serve_custom_droid.py" >&2
@@ -113,7 +146,22 @@ if [ ! -w "$OPENPI_DATA_HOME" ] || [ ! -w "$UV_CACHE_DIR" ]; then
 fi
 EXTRA_ARGS=()
 if [ -n "$WINE_LOADER_PATH" ]; then
-  EXTRA_ARGS+=(--wine-loader-path "$WINE_LOADER_PATH" --action-expert-variant "$ACTION_EXPERT_VARIANT")
+  EXTRA_ARGS+=(
+    --wine-loader-path "$WINE_LOADER_PATH"
+    --action-expert-variant "$ACTION_EXPERT_VARIANT"
+    --asset-id "$CUSTOM_ASSET_ID"
+  )
+  if [ -n "$TASKS_JSON" ]; then
+    EXTRA_ARGS+=(--tasks-json "$TASKS_JSON")
+  fi
+  case "$USE_EXTERNAL2" in
+    1|true|TRUE|yes|YES) EXTRA_ARGS+=(--use-exterior2) ;;
+    0|false|FALSE|no|NO|'') ;;
+    *)
+      echo "USE_EXTERNAL2 must be 0/1, false/true, or no/yes." >&2
+      exit 2
+      ;;
+  esac
 fi
 if [ -n "$CONNECT_ENDPOINT" ]; then
   case "$CONNECT_ENDPOINT" in

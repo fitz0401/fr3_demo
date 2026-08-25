@@ -18,7 +18,8 @@ dependencies = [
 recording = [
     "evdev>=1.7",
     "Pillow>=10",
-    "pyrealsense2==2.55.1.6486",
+    # 2.55 removed L515 support; 2.54.1 supports L515 and the current D400 cameras.
+    "pyrealsense2==2.54.1.5217",
 ]
 convert = [
     "lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
@@ -27,7 +28,7 @@ convert = [
 pi05 = [
     "msgpack>=1.0.5",
     "Pillow>=10",
-    "pyrealsense2==2.55.1.6486",
+    "pyrealsense2==2.54.1.5217",
     "pyzmq>=22",
     "websockets>=14",
 ]

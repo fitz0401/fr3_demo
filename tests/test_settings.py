@@ -23,6 +23,10 @@ close_force = 0.7
 [cameras]
 external_serial = "external"
 wrist_serial = "wrist"
+external2_serial = "external2"
+external2_width = 960
+external2_height = 540
+external2_fps = 30
 width = 424
 height = 240
 fps = 30
@@ -35,6 +39,7 @@ speed = 0.18
 timeout = 20.0
 [pi05]
 transport = "zmq"
+use_external2 = true
 checkpoint = "wine_hybrid"
 server_host = "gpu"
 server_port = 8001
@@ -42,6 +47,7 @@ server_ports = { pi05_droid = 8000, custom_droid = 8001, wine_hybrid = 8002 }
 zmq_mode = "bind"
 zmq_bind_host = "0.0.0.0"
 open_loop_horizon = 15
+gripper_threshold = 0.85
 max_rollout_steps = 0
 """,
                 encoding="utf-8",
@@ -58,6 +64,10 @@ max_rollout_steps = 0
             self.assertEqual(teleop["workspace_min"], [0.1, -0.2, 0.3])
             self.assertEqual(cameras["external_camera_serial"], "external")
             self.assertEqual(cameras["wrist_camera_serial"], "wrist")
+            self.assertEqual(cameras["external2_camera_serial"], "external2")
+            self.assertEqual(cameras["external2_camera_width"], 960)
+            self.assertEqual(cameras["external2_camera_height"], 540)
+            self.assertEqual(cameras["external2_camera_fps"], 30)
             self.assertEqual(cameras["camera_fps"], 30)
             self.assertEqual(cameras["camera_width"], 424)
             self.assertEqual(cameras["camera_height"], 240)
@@ -69,11 +79,13 @@ max_rollout_steps = 0
             self.assertEqual(pi05["home_timeout"], 20.0)
             self.assertEqual(pi05["policy_host"], "gpu")
             self.assertEqual(pi05["transport"], "zmq")
+            self.assertTrue(pi05["use_external2"])
             self.assertEqual(pi05["checkpoint"], "wine_hybrid")
             self.assertEqual(pi05["policy_port"], 8002)
             self.assertEqual(pi05["zmq_mode"], "bind")
             self.assertEqual(pi05["zmq_bind_host"], "0.0.0.0")
             self.assertEqual(pi05["open_loop_horizon"], 15)
+            self.assertEqual(pi05["gripper_threshold"], 0.85)
             self.assertEqual(pi05["max_steps"], 0)
 
     def test_unknown_key_is_rejected(self) -> None:

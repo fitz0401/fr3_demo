@@ -145,15 +145,19 @@ class RealSenseCamera:
 
 
 class RealSensePair:
-    """Named exterior and wrist RealSense color streams."""
+    """Two required RealSense streams plus an optional second exterior stream."""
 
     def __init__(
         self,
         exterior_serial: str,
         wrist_serial: str,
+        exterior2_serial: str | None = None,
         width: int = 640,
         height: int = 480,
         fps: int = 30,
+        exterior2_width: int | None = None,
+        exterior2_height: int | None = None,
+        exterior2_fps: int | None = None,
         wrist_rotate_180: bool = False,
     ):
         if not exterior_serial or not wrist_serial:
@@ -164,13 +168,39 @@ class RealSensePair:
             )
         if exterior_serial == wrist_serial:
             raise ValueError("Exterior and wrist camera serial numbers must be different")
+        exterior2_serial = exterior2_serial or None
+        if exterior2_serial in {exterior_serial, wrist_serial}:
+            raise ValueError("Optional exterior camera serial must differ from the required cameras")
         self.exterior = RealSenseCamera(exterior_serial, width, height, fps)
         self.wrist = RealSenseCamera(wrist_serial, width, height, fps)
+        self.exterior2 = (
+            None
+            if exterior2_serial is None
+            else RealSenseCamera(
+                exterior2_serial,
+                exterior2_width or width,
+                exterior2_height or height,
+                exterior2_fps or fps,
+            )
+        )
+        self.optional_camera_error: str | None = None
         self.wrist_rotate_180 = wrist_rotate_180
 
     @property
     def serials(self) -> dict[str, str]:
-        return {"exterior_image_left": self.exterior.serial, "wrist_image": self.wrist.serial}
+        serials = {"exterior_image_left": self.exterior.serial, "wrist_image": self.wrist.serial}
+        exterior2 = getattr(self, "exterior2", None)
+        if exterior2 is not None:
+            serials["exterior_image_2_left"] = exterior2.serial
+        return serials
+
+    @property
+    def modes(self) -> dict[str, str]:
+        cameras = {"exterior_image_left": self.exterior, "wrist_image": self.wrist}
+        exterior2 = getattr(self, "exterior2", None)
+        if exterior2 is not None:
+            cameras["exterior_image_2_left"] = exterior2
+        return {name: f"{camera.width}x{camera.height}@{camera.fps}" for name, camera in cameras.items()}
 
     def start(self) -> RealSensePair:
         try:
@@ -181,6 +211,15 @@ class RealSensePair:
         except Exception:
             self.close()
             raise
+        if self.exterior2 is not None:
+            try:
+                self.exterior2.start()
+                self.exterior2.wait_until_ready()
+            except Exception as error:  # noqa: BLE001 - this camera is explicitly optional
+                self.optional_camera_error = str(error)
+                LOG.warning("Optional exterior camera disabled: %s", error)
+                self.exterior2.close()
+                self.exterior2 = None
         return self
 
     def snapshot(self, max_age: float = 0.25) -> dict[str, CameraFrame]:
@@ -192,12 +231,25 @@ class RealSensePair:
                 wrist.hardware_timestamp,
                 wrist.frame_number,
             )
-        return {
+        frames = {
             "exterior_image_left": self.exterior.snapshot(max_age),
             "wrist_image": wrist,
         }
+        exterior2 = getattr(self, "exterior2", None)
+        if exterior2 is not None:
+            try:
+                frames["exterior_image_2_left"] = exterior2.snapshot(max_age)
+            except RuntimeError as error:
+                self.optional_camera_error = str(error)
+                LOG.warning("Optional exterior camera disconnected; disabling it: %s", error)
+                exterior2.close()
+                self.exterior2 = None
+        return frames
 
     def close(self) -> None:
+        exterior2 = getattr(self, "exterior2", None)
+        if exterior2 is not None:
+            exterior2.close()
         self.wrist.close()
         self.exterior.close()
 

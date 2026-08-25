@@ -50,6 +50,23 @@ class Pi05PolicyTest(unittest.TestCase):
         np.testing.assert_allclose(gripper, [0.75, 0.30, 0.0])
 
     @patch("fr3_pi05.policy._resize", side_effect=lambda image: image[:224, :224])
+    def test_optional_second_exterior_is_included_when_available(self, _resize) -> None:
+        image = np.zeros((480, 640, 3), dtype=np.uint8)
+        second = np.ones_like(image)
+
+        observation = build_droid_observation(
+            image,
+            image,
+            self.Q,
+            1.0,
+            "test",
+            exterior2_image=second,
+        )
+
+        self.assertIn("observation/exterior_image_2_left", observation)
+        self.assertTrue(observation["observation/exterior_image_2_left"].all())
+
+    @patch("fr3_pi05.policy._resize", side_effect=lambda image: image[:224, :224])
     def test_wine_observation_accepts_history_shapes(self, _resize) -> None:
         image = np.zeros((240, 424, 3), dtype=np.uint8)
         observation = build_droid_observation(

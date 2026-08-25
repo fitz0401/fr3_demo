@@ -1,7 +1,7 @@
 # FR3 teleoperation and demonstration collection
 
-Joystick teleoperation, synchronized two-RealSense recording, LeRobot
-conversion, and guarded OpenPI pi0.5 execution for a Franka Research 3. Robot
+Joystick teleoperation, synchronized RealSense recording, LeRobot conversion,
+and guarded OpenPI pi0.5 execution for a Franka Research 3. Robot
 control runs through [fitz0401/bamboo](https://github.com/fitz0401/bamboo) on
 the real-time machine; this repository runs on the operator workstation.
 
@@ -45,6 +45,9 @@ Useful details:
   base frame. They remain base-frame limits in tool mode.
 - `gripper.close_force` is normalized from `0.0` to `1.0`.
 - `cameras.wrist_rotate_180` changes image orientation only, not motion axes.
+- `cameras.external2_serial` is optional. Leave it empty to use only the
+  required exterior and wrist cameras. When configured and connected, the L515
+  is recorded as `exterior_image_2_left`; its default mode is `960x540@30`.
 
 CLI options override the file for one run. Use `--config PATH` or set
 `FR3_DEMO_CONFIG` to load a different configuration.
@@ -171,8 +174,9 @@ fr3-convert \
 Add `--public` only when the images are safe to publish. Conversion rejects
 missing language, mismatched frames, and an existing output directory. The
 output follows the OpenPI DROID layout with exterior and wrist RGB, joint and
-gripper state, eight-dimensional actions, and per-episode tasks. The required
-second exterior image is a black compatibility field ignored by pi0.5.
+gripper state, eight-dimensional actions, and per-episode tasks. The second
+exterior image uses the optional camera when recorded and falls back to the
+black DROID compatibility image for older/two-camera episodes.
 
 ## 7. Run pi0.5
 

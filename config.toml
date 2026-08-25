@@ -21,6 +21,11 @@ device = "/dev/input/js0"
 [cameras]
 external_serial = "047322071010"
 wrist_serial = "309622300781"
+# Optional second exterior camera. Leave empty to run with the two required cameras.
+external2_serial = "f1421698"
+external2_width = 960
+external2_height = 540
+external2_fps = 30
 # Pinhao's validated RealSense adaptation: wide 16:9 modes with low transport
 # latency. The policy still samples/actions at DROID's 15 Hz control rate.
 width = 424
@@ -55,10 +60,13 @@ max = [1.00, 1.50, 1.00]
 # Physical Intelligence pi0.5 DROID inference and guarded execution.
 [pi05]
 transport = "zmq"
-checkpoint = "pi05_droid"
+# Enable only for a checkpoint trained with exterior_image_2_left.
+use_external2 = false
+# Contract profile; GPU weight paths are selected by the server launcher.
+checkpoint = "wine_hybrid"
 # Dedicated inference LAN: GPU enp103s0 ↔ robot workstation eno1.
 server_host = "172.16.0.30"
-server_port = 8000
+server_port = 8002
 # "connect": this workstation connects to the GPU. If that inter-subnet path is
 # filtered, use "bind" and launch the GPU wrapper with CONNECT_ENDPOINT pointing
 # to this workstation.
@@ -70,6 +78,8 @@ control_hz = 15.0
 stream_hz = 30.0
 open_loop_horizon = 15
 prefetch_actions = 4
+# Model gripper action must be above this value to request open; otherwise close.
+gripper_threshold = 0.9
 # Match the controller envelope used while collecting the wine demonstrations.
 # Workspace and joint-limit prediction remain active for every policy action.
 max_joint_speed = 0.35

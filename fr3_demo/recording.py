@@ -41,16 +41,17 @@ class RawEpisodeWriter:
         self.started_monotonic = time.monotonic()
         self.path = session_dir / f"episode_{episode_index:06d}.inprogress"
         self.final_path = session_dir / f"episode_{episode_index:06d}"
+        required_cameras = {"exterior_image_left", "wrist_image"}
+        if not required_cameras.issubset(camera_serials):
+            raise ValueError("Recording requires exterior_image_left and wrist_image")
+        self._camera_keys = tuple(camera_serials)
         if self.path.exists() or self.final_path.exists():
             raise FileExistsError(f"Episode {episode_index} already exists in {session_dir}")
-        (self.path / "frames" / "exterior_image_left").mkdir(parents=True)
-        (self.path / "frames" / "wrist_image").mkdir(parents=True)
+        for key in self._camera_keys:
+            (self.path / "frames" / key).mkdir(parents=True)
         self._timestamps: list[float] = []
         self._robot_timestamps: list[float] = []
-        self._camera_timestamps: dict[str, list[float]] = {
-            "exterior_image_left": [],
-            "wrist_image": [],
-        }
+        self._camera_timestamps: dict[str, list[float]] = {key: [] for key in self._camera_keys}
         self._joint_positions: list[np.ndarray] = []
         self._joint_velocities: list[np.ndarray] = []
         self._action_joint_velocities: list[np.ndarray] = []
@@ -64,8 +65,8 @@ class RawEpisodeWriter:
             "fps": fps,
             "camera_serials": camera_serials,
             "camera_transforms": {
-                "exterior_image_left": "none",
-                "wrist_image": "rotate_180" if wrist_rotate_180 else "none",
+                key: "rotate_180" if key == "wrist_image" and wrist_rotate_180 else "none"
+                for key in self._camera_keys
             },
             "language_instruction": None,
             "frame_count": 0,
@@ -91,7 +92,11 @@ class RawEpisodeWriter:
             raise RuntimeError("Image recording requires: pip install -e '.[recording]'") from error
 
         index = self.frame_count
-        for key in ("exterior_image_left", "wrist_image"):
+        missing_cameras = set(self._camera_keys) - set(camera_frames)
+        if missing_cameras:
+            missing = ", ".join(sorted(missing_cameras))
+            raise RuntimeError(f"Active recording camera disappeared: {missing}")
+        for key in self._camera_keys:
             frame = camera_frames[key]
             image_path = self.path / "frames" / key / f"frame_{index:06d}.jpg"
             Image.fromarray(frame.image, mode="RGB").save(image_path, quality=92, subsampling=0)
@@ -108,18 +113,24 @@ class RawEpisodeWriter:
     def finish(self) -> Path:
         if self.frame_count < 2:
             raise RuntimeError("An episode needs at least two synchronized frames")
-        np.savez_compressed(
-            self.path / "trajectory.npz",
-            timestamp=np.asarray(self._timestamps, dtype=np.float64),
-            robot_timestamp=np.asarray(self._robot_timestamps, dtype=np.float64),
-            exterior_camera_timestamp=np.asarray(self._camera_timestamps["exterior_image_left"], dtype=np.float64),
-            wrist_camera_timestamp=np.asarray(self._camera_timestamps["wrist_image"], dtype=np.float64),
-            joint_position=np.stack(self._joint_positions),
-            joint_velocity=np.stack(self._joint_velocities),
-            action_joint_velocity=np.stack(self._action_joint_velocities),
-            gripper_position=np.asarray(self._gripper_positions, dtype=np.float32)[:, None],
-            action_gripper_position=np.asarray(self._action_gripper_positions, dtype=np.float32)[:, None],
-        )
+        trajectory = {
+            "timestamp": np.asarray(self._timestamps, dtype=np.float64),
+            "robot_timestamp": np.asarray(self._robot_timestamps, dtype=np.float64),
+            "exterior_camera_timestamp": np.asarray(
+                self._camera_timestamps["exterior_image_left"], dtype=np.float64
+            ),
+            "wrist_camera_timestamp": np.asarray(self._camera_timestamps["wrist_image"], dtype=np.float64),
+            "joint_position": np.stack(self._joint_positions),
+            "joint_velocity": np.stack(self._joint_velocities),
+            "action_joint_velocity": np.stack(self._action_joint_velocities),
+            "gripper_position": np.asarray(self._gripper_positions, dtype=np.float32)[:, None],
+            "action_gripper_position": np.asarray(self._action_gripper_positions, dtype=np.float32)[:, None],
+        }
+        if "exterior_image_2_left" in self._camera_timestamps:
+            trajectory["exterior2_camera_timestamp"] = np.asarray(
+                self._camera_timestamps["exterior_image_2_left"], dtype=np.float64
+            )
+        np.savez_compressed(self.path / "trajectory.npz", **trajectory)
         self._metadata.update(
             {
                 "complete": True,
@@ -145,7 +156,7 @@ class RawEpisodeWriter:
 
 
 class DemoCollector:
-    """Record robot state and the latest two camera frames at a fixed rate."""
+    """Record robot state and all active camera frames at a fixed rate."""
 
     def __init__(
         self,
@@ -169,8 +180,8 @@ class DemoCollector:
                 "fps": fps,
                 "camera_serials": cameras.serials,
                 "camera_transforms": {
-                    "exterior_image_left": "none",
-                    "wrist_image": "rotate_180" if cameras.wrist_rotate_180 else "none",
+                    key: "rotate_180" if key == "wrist_image" and cameras.wrist_rotate_180 else "none"
+                    for key in cameras.serials
                 },
                 "format": "fr3_demo_raw",
             },

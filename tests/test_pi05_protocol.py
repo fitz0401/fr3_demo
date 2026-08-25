@@ -190,13 +190,14 @@ def build_policy(args):
                 """
 STATE_HISTORY_LAGS = (45, 75)
 NUM_STATE_FRAMES = 3
+DEFAULT_ASSET_ID = "fitz0401/franka_pour_wine"
 TASKS = ("pour lillet into the jigger", "pour gin into the jigger")
 class Model:
     action_horizon = 16
 def _model(action_expert_variant):
     return Model()
-def build_policy(checkpoint, action_expert_variant):
-    return {"checkpoint": checkpoint, "variant": action_expert_variant}
+def build_policy(checkpoint, action_expert_variant, asset_id, use_exterior2=False):
+    return {"checkpoint": checkpoint, "variant": action_expert_variant, "asset_id": asset_id, "use_exterior2": use_exterior2}
 """,
                 encoding="utf-8",
             )
@@ -214,7 +215,74 @@ def build_policy(checkpoint, action_expert_variant):
         self.assertEqual(metadata["action_horizon"], 16)
         self.assertEqual(metadata["joint_observation_shape"], [3, 7])
         self.assertEqual(metadata["image_observation_shape"], [180, 320, 3])
-        self.assertEqual(metadata["tasks"], ["pour lillet into the jigger", "pour gin into the jigger"])
+        self.assertEqual(metadata["asset_id"], "fitz0401/franka_pour_wine")
+        self.assertEqual(metadata["tasks"], [])
+        self.assertFalse(metadata["uses_exterior2"])
+
+    def test_wine_loader_accepts_new_dataset_asset_and_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            loader_path = root / "serve_wine.py"
+            loader_path.write_text(
+                """
+STATE_HISTORY_LAGS = (45, 75)
+NUM_STATE_FRAMES = 3
+DEFAULT_ASSET_ID = "old/dataset"
+TASKS = ("old task",)
+class Model:
+    action_horizon = 16
+def _model(action_expert_variant):
+    return Model()
+def build_policy(checkpoint, action_expert_variant, asset_id, use_exterior2=False):
+    return {"asset_id": asset_id, "use_exterior2": use_exterior2}
+""",
+                encoding="utf-8",
+            )
+
+            policy, metadata = load_policy(
+                "wine",
+                "unused",
+                str(root / "checkpoint"),
+                None,
+                str(loader_path),
+                asset_id="fitz0401/new_dataset",
+                tasks=["new task"],
+            )
+
+        self.assertEqual(policy["asset_id"], "fitz0401/new_dataset")
+        self.assertEqual(metadata["asset_id"], "fitz0401/new_dataset")
+        self.assertEqual(metadata["tasks"], ["new task"])
+
+    def test_wine_loader_can_enable_second_exterior_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            loader_path = root / "serve_wine.py"
+            loader_path.write_text(
+                """
+STATE_HISTORY_LAGS = (45, 75)
+NUM_STATE_FRAMES = 3
+DEFAULT_ASSET_ID = "owner/dataset"
+class Model:
+    action_horizon = 16
+def _model(action_expert_variant):
+    return Model()
+def build_policy(checkpoint, action_expert_variant, asset_id, use_exterior2=False):
+    return {"use_exterior2": use_exterior2}
+""",
+                encoding="utf-8",
+            )
+
+            policy, metadata = load_policy(
+                "wine",
+                "unused",
+                str(root / "checkpoint"),
+                None,
+                str(loader_path),
+                use_exterior2=True,
+            )
+
+        self.assertTrue(policy["use_exterior2"])
+        self.assertTrue(metadata["uses_exterior2"])
 
     def test_server_warmup_uses_wine_history_contract(self) -> None:
         class FakePolicy:
@@ -231,6 +299,20 @@ def build_policy(checkpoint, action_expert_variant):
 
         with self.assertRaisesRegex(RuntimeError, "expected 16"):
             warm_up(policy, "pour the wine", (0, 45, 75), action_horizon=16)
+
+    def test_server_warmup_includes_exterior2_when_enabled(self) -> None:
+        class FakePolicy:
+            def infer(self, observation):
+                self.observation = observation
+                return {"actions": np.zeros((16, 8), dtype=np.float32)}
+
+        policy = FakePolicy()
+        warm_up(policy, "pour the wine", (0, 45, 75), action_horizon=16, use_exterior2=True)
+
+        self.assertEqual(
+            policy.observation["observation/exterior_image_2_left"].shape,
+            (180, 320, 3),
+        )
 
 
 if __name__ == "__main__":

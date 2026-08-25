@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import importlib.util
+import json
 import logging
 import sys
 import time
@@ -16,6 +18,88 @@ import numpy as np
 from fr3_pi05.protocol import packb, unpackb
 
 LOG = logging.getLogger("pi05_zmq_server")
+
+
+def _build_wine_policy(
+    module: Any,
+    checkpoint: str,
+    action_expert_variant: str,
+    asset_id: str,
+    use_exterior2: bool,
+) -> Any:
+    """Compose the deployment data contract without changing training-owned code."""
+
+    required = (
+        "_WineDataConfig",
+        "_config",
+        "_model",
+        "_policy_config",
+        "_transforms",
+        "DroidInputsWithStateHistory",
+        "droid_policy",
+    )
+    if not all(hasattr(module, name) for name in required):
+        # Lightweight compatibility path used by protocol tests and older standalone loaders.
+        try:
+            return module.build_policy(checkpoint, action_expert_variant, asset_id, use_exterior2)
+        except TypeError:
+            return module.build_policy(checkpoint, action_expert_variant, asset_id)
+
+    data_factory: Any
+    if use_exterior2:
+
+        @dataclasses.dataclass(frozen=True)
+        class Exterior2Inputs(module.DroidInputsWithStateHistory):
+            def __call__(self, data: dict) -> dict:
+                inputs = super().__call__(data)
+                inputs["image"]["right_wrist_0_rgb"] = module.droid_policy._parse_image(
+                    data["observation/exterior_image_2_left"]
+                )
+                inputs["image_mask"]["right_wrist_0_rgb"] = np.True_
+                return inputs
+
+        @dataclasses.dataclass(frozen=True)
+        class Exterior2WineDataConfig(module._WineDataConfig):
+            def create(self, assets_dirs, model_config):
+                config = super().create(assets_dirs, model_config)
+                return dataclasses.replace(
+                    config,
+                    repack_transforms=module._transforms.Group(
+                        inputs=[
+                            module._transforms.RepackTransform(
+                                {
+                                    "observation/exterior_image_1_left": "exterior_image_1_left",
+                                    "observation/exterior_image_2_left": "exterior_image_2_left",
+                                    "observation/wrist_image_left": "wrist_image_left",
+                                    "observation/joint_position": "joint_position",
+                                    "observation/gripper_position": "gripper_position",
+                                    "prompt": "prompt",
+                                }
+                            )
+                        ]
+                    ),
+                    data_transforms=module._transforms.Group(
+                        inputs=[Exterior2Inputs(model_config.model_type, self.num_state_frames)],
+                        outputs=[module.droid_policy.DroidOutputs()],
+                    ),
+                )
+
+        data_factory = Exterior2WineDataConfig
+    else:
+        data_factory = module._WineDataConfig
+
+    model_config = module._model(action_expert_variant)
+    config = module._config.TrainConfig(
+        name="pi05_wine_hybrid",
+        exp_name="deploy",
+        model=model_config,
+        data=data_factory(
+            repo_id=asset_id,
+            num_state_frames=int(module.NUM_STATE_FRAMES),
+            base_config=module._config.DataConfig(prompt_from_task=True),
+        ),
+    )
+    return module._policy_config.create_trained_policy(config, checkpoint)
 
 
 def handle_request(policy: Any, metadata: dict[str, Any], request: Any) -> dict[str, Any]:
@@ -52,6 +136,9 @@ def load_policy(
     default_prompt: str | None,
     wine_loader_path: str | None = None,
     action_expert_variant: str = "gemma_300m_lora",
+    asset_id: str | None = None,
+    tasks: list[str] | None = None,
+    use_exterior2: bool = False,
 ) -> tuple[Any, dict[str, Any]]:
     """Load OpenPI lazily so protocol tests do not need the GPU stack."""
 
@@ -89,9 +176,17 @@ def load_policy(
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
-        policy = module.build_policy(checkpoint, action_expert_variant)
+        resolved_asset_id = asset_id or getattr(module, "DEFAULT_ASSET_ID", "fitz0401/franka_pour_wine")
+        policy = _build_wine_policy(
+            module,
+            checkpoint,
+            action_expert_variant,
+            resolved_asset_id,
+            use_exterior2,
+        )
         history_lags = list(module.STATE_HISTORY_LAGS)
         num_frames = int(module.NUM_STATE_FRAMES)
+        resolved_tasks = tasks or []
         return policy, {
             "model": "pi05_wine_hybrid",
             "action_horizon": int(module._model(action_expert_variant).action_horizon),
@@ -104,7 +199,9 @@ def load_policy(
             "image_observation_shape": [180, 320, 3],
             "joint_observation_dim": num_frames * 7,
             "gripper_observation_dim": num_frames,
-            "tasks": list(module.TASKS),
+            "asset_id": resolved_asset_id,
+            "tasks": resolved_tasks,
+            "uses_exterior2": use_exterior2,
         }
     if loader != "official":
         raise ValueError(f"Unknown policy loader: {loader}")
@@ -124,6 +221,7 @@ def warm_up(
     prompt: str,
     proprio_history_offsets: tuple[int, ...] = (0,),
     action_horizon: int | None = None,
+    use_exterior2: bool = False,
 ) -> float:
     """Compile one inference before exposing the network endpoint."""
 
@@ -143,6 +241,8 @@ def warm_up(
         "observation/gripper_position": np.zeros(len(proprio_history_offsets), dtype=np.float32),
         "prompt": prompt,
     }
+    if use_exterior2:
+        observation["observation/exterior_image_2_left"] = np.zeros(image_shape, dtype=np.uint8)
     started = time.monotonic()
     result = policy.infer(observation)
     actions = np.asarray(result.get("actions")) if isinstance(result, dict) else np.empty(0)
@@ -190,6 +290,13 @@ def main() -> int:
     parser.add_argument("--checkpoint", required=True, help="existing local checkpoint directory; never downloaded here")
     parser.add_argument("--default-prompt")
     parser.add_argument("--wine-loader-path")
+    parser.add_argument("--asset-id", help="checkpoint normalization asset ID, for example owner/dataset")
+    parser.add_argument("--tasks-json", help="optional JSON array restricting accepted language instructions")
+    parser.add_argument(
+        "--use-exterior2",
+        action="store_true",
+        help="feed exterior_image_2_left to a checkpoint trained with that camera",
+    )
     parser.add_argument(
         "--action-expert-variant",
         choices=("gemma_300m_lora", "gemma_300m"),
@@ -209,6 +316,17 @@ def main() -> int:
         help="connect the REP socket outward (for example tcp://10.34.97.197:8000) instead of binding",
     )
     args = parser.parse_args()
+    tasks: list[str] | None = None
+    if args.tasks_json is not None:
+        try:
+            decoded_tasks = json.loads(args.tasks_json)
+        except json.JSONDecodeError as error:
+            parser.error(f"--tasks-json is invalid JSON: {error}")
+        if not isinstance(decoded_tasks, list) or not all(
+            isinstance(task, str) and task.strip() for task in decoded_tasks
+        ):
+            parser.error("--tasks-json must be a JSON array of non-empty strings")
+        tasks = [task.strip() for task in decoded_tasks]
     history_offsets = tuple(args.proprio_history_offsets)
     if not history_offsets or history_offsets[0] != 0 or any(offset < 0 for offset in history_offsets):
         parser.error("--proprio-history-offsets must start with 0 and contain non-negative frame offsets")
@@ -220,6 +338,9 @@ def main() -> int:
         args.default_prompt,
         args.wine_loader_path,
         args.action_expert_variant,
+        args.asset_id,
+        tasks,
+        args.use_exterior2,
     )
     metadata = dict(getattr(policy, "metadata", {}) or {})
     metadata.update(loader_metadata)
@@ -234,6 +355,7 @@ def main() -> int:
             str(prompt),
             history_offsets,
             int(loader_metadata["action_horizon"]) if "action_horizon" in loader_metadata else None,
+            bool(loader_metadata.get("uses_exterior2", False)),
         )
         metadata["warmup_ms"] = warmup_ms
         LOG.info("policy warm-up complete in %.1f ms", warmup_ms)
