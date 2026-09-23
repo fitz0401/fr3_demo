@@ -49,7 +49,10 @@ Useful details:
 - `cameras.wrist_rotate_180` changes image orientation only, not motion axes.
 - `cameras.external2_serial` is optional. Leave it empty to use only the
   required exterior and wrist cameras. When configured and connected, the L515
-  is recorded as `exterior_image_2_left`; its default mode is `960x540@30`.
+  is recorded as `exterior_image_2_left`; its configured mode is `960x540@60`.
+- `[recording]` contains the synchronization limits. The defaults sample Bamboo
+  at 60 Hz, align every stream to an exact 15 Hz Ubuntu monotonic-time grid,
+  and reject camera/robot samples outside the configured tolerances.
 
 CLI options override the file for one run. Use `--config PATH` or set
 `FR3_DEMO_CONFIG` to load a different configuration.
@@ -107,15 +110,28 @@ fr3-camera-rviz
 ```
 
 Use `fr3-camera-rviz --no-wrist-rotate-180` to inspect the raw wrist
-orientation. Stop the preview before collection because a RealSense device can
-only have one owner.
+orientation. Stop the preview with `Ctrl+C` before collection: a RealSense
+device can only have one owner, so `fr3-camera-rviz` and `fr3-collect` cannot
+run at the same time. `fr3-collect` opens its own RViz instead — see below.
 
 Start collection:
 
 ```bash
+source /opt/ros/humble/setup.bash
 source .venv/bin/activate
 fr3-collect
 ```
+
+`fr3-collect` opens RViz and previews the recorder's own frames without opening
+the cameras a second time. A preview failure does not stop recording.
+
+- `--no-preview` records without RViz (also `preview = false` in `config.toml`).
+- `--preview-publish-only` publishes the topics without launching RViz, for
+  viewing from another machine.
+- `--preview-rate-hz` changes only the preview rate.
+
+If ROS 2 is not sourced, collection still runs and logs
+`Camera preview disabled: ROS 2 is not sourced`.
 
 - Press X once to start: `⬆️ Recording started` and one vibration.
 - Press X again to finish: `✅ Recording stopped` and two vibrations.
@@ -124,6 +140,25 @@ fr3-collect
 
 Sessions are stored under `data/raw/session_YYYYMMDD_HHMMSS`. Incomplete
 episodes retain an `.inprogress` suffix and are ignored during conversion.
+
+### Recording format
+
+- Cameras capture at 60 Hz; all streams are aligned to an exact 15 Hz Ubuntu
+  monotonic-time grid. Each completed episode includes `sync_report.json`, and
+  an out-of-tolerance episode is aborted.
+- Robot position, velocity, and measured joint torque (`tau_J`, Nm), gripper
+  state, actions, and camera timing metadata share that timeline.
+- JPEGs are stored at the DROID size, 320x180. Set both configured image
+  dimensions to `0` for native resolution. Collection stops before the disk
+  falls below `min_free_gb`.
+
+To shrink older native-resolution recordings, preview the change and then apply
+it (rewriting JPEGs is lossy):
+
+```bash
+fr3-downsize --data-dir data/raw/session_20260821_122332_lillet
+fr3-downsize --data-dir data/raw/session_20260821_122332_lillet --apply
+```
 
 ## 5. Add language instructions
 
@@ -180,6 +215,13 @@ gripper state, eight-dimensional actions, and per-episode tasks. The second
 exterior image uses the optional camera when recorded and falls back to the
 black DROID compatibility image for older/two-camera episodes.
 
+Schema-v1 recordings used loop-index alignment and are rejected by default. To
+convert an old episode only after inspecting its timing, add:
+
+```bash
+fr3-convert ... --allow-legacy-unsynchronized
+```
+
 ## 7. Run pi0.5
 
 GPU deployment, checkpoint selection, networking, safety checks, and RViz
@@ -202,9 +244,10 @@ the gripper before inference; policy motion additionally requires `--execute`.
 | `fr3-teleop` | Joystick teleoperation |
 | `fr3-collect` | Teleoperation with synchronized recording |
 | `fr3-camera-list` | List RealSense serial numbers |
-| `fr3-camera-rviz` | Preview both cameras in RViz |
+| `fr3-camera-rviz` | Preview all cameras in RViz (standalone; not while collecting) |
 | `fr3-annotate` | Add episode language instructions |
 | `fr3-convert` | Build and optionally upload a LeRobot dataset |
+| `fr3-downsize` | Rewrite older native-resolution episodes at the stored size |
 | `fr3-pi05-check` | Non-moving policy integration check |
 | `fr3-pi05-run` | Guarded pi0.5 rollout |
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
 from importlib import resources
 from typing import Any
@@ -10,17 +9,7 @@ from typing import Any
 import numpy as np
 
 from fr3_demo.kinematics import forward_kinematics, link_positions
-
-
-def _rviz_environment() -> dict[str, str]:
-    """Remove editor Snap runtime paths that are binary-incompatible with ROS."""
-
-    environment = os.environ.copy()
-    incompatible_prefixes = ("SNAP", "GTK_", "GIO_")
-    for key in tuple(environment):
-        if key.startswith(incompatible_prefixes) or key == "LD_PRELOAD":
-            environment.pop(key, None)
-    return environment
+from fr3_demo.preview import image_message, rviz_environment, stop_rviz
 
 
 class RvizBridge:
@@ -56,20 +45,8 @@ class RvizBridge:
             with resources.as_file(config) as config_path:
                 self._rviz = subprocess.Popen(
                     ["rviz2", "-d", str(config_path)],
-                    env=_rviz_environment(),
+                    env=rviz_environment(),
                 )
-
-    def _image_message(self, image: np.ndarray, frame_id: str) -> Any:
-        message = self._image_type()
-        message.header.stamp = self._node.get_clock().now().to_msg()
-        message.header.frame_id = frame_id
-        message.height = int(image.shape[0])
-        message.width = int(image.shape[1])
-        message.encoding = "rgb8"
-        message.is_bigendian = False
-        message.step = message.width * 3
-        message.data = np.ascontiguousarray(image, dtype=np.uint8).tobytes()
-        return message
 
     def _line_marker(
         self,
@@ -103,10 +80,12 @@ class RvizBridge:
         predicted_joint_path: np.ndarray | None,
         exterior2_image: np.ndarray | None = None,
     ) -> None:
-        self._external.publish(self._image_message(exterior_image, "exterior_camera"))
+        self._external.publish(image_message(self._image_type, self._node, exterior_image, "exterior_camera"))
         if exterior2_image is not None:
-            self._external2.publish(self._image_message(exterior2_image, "exterior_camera_2"))
-        self._wrist.publish(self._image_message(wrist_image, "wrist_camera"))
+            self._external2.publish(
+                image_message(self._image_type, self._node, exterior2_image, "exterior_camera_2")
+            )
+        self._wrist.publish(image_message(self._image_type, self._node, wrist_image, "wrist_camera"))
 
         markers = self._marker_array_type()
         markers.markers.append(
@@ -130,12 +109,7 @@ class RvizBridge:
         self._rclpy.spin_once(self._node, timeout_sec=0.0)
 
     def close(self) -> None:
-        if self._rviz is not None:
-            self._rviz.terminate()
-            try:
-                self._rviz.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                self._rviz.kill()
+        stop_rviz(self._rviz)
         self._node.destroy_node()
         if self._rclpy.ok():
             self._rclpy.shutdown()

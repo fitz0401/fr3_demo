@@ -5,12 +5,25 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
 
+from fr3_demo.synchronization import AffineClockMapper
+
 LOG = logging.getLogger("fr3_teleop.cameras")
+GLOBAL_TIMESTAMP_DOMAINS = frozenset({"global_time", "system_time"})
+
+
+def _shared_clock_mapper() -> AffineClockMapper:
+    return AffineClockMapper(
+        max_samples=1800,
+        lower_envelope=True,
+        fit_scale=False,
+        reset_on_discontinuity=False,
+    )
 
 
 def _load_realsense() -> Any:
@@ -42,12 +55,27 @@ class CameraFrame:
     captured_monotonic: float
     hardware_timestamp: float
     frame_number: int
+    timestamp_domain: str = "unknown"
+    synchronized_monotonic: float | None = None
+
+    @property
+    def alignment_timestamp(self) -> float:
+        """Best estimate of exposure time on the host monotonic clock."""
+
+        return self.captured_monotonic if self.synchronized_monotonic is None else self.synchronized_monotonic
 
 
 class RealSenseCamera:
     """Continuously capture the latest RGB frame from one RealSense device."""
 
-    def __init__(self, serial: str, width: int = 640, height: int = 480, fps: int = 30) -> None:
+    def __init__(
+        self,
+        serial: str,
+        width: int = 640,
+        height: int = 480,
+        fps: int = 30,
+        global_clock: AffineClockMapper | None = None,
+    ) -> None:
         self.serial = serial
         self.width = width
         self.height = height
@@ -57,7 +85,18 @@ class RealSenseCamera:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._latest: CameraFrame | None = None
+        # Alignment only reaches ~100 ms back, so one second is ample. At
+        # 60 fps a 10-second ring would hold ~900 MB for a 960x540 camera and
+        # make every nearest() call scan 600 frames.
+        self._frames: deque[CameraFrame] = deque(maxlen=max(60, fps))
+        self._clock_sample_count = max(300, fps * 20)
+        self._clock = AffineClockMapper(max_samples=self._clock_sample_count, lower_envelope=True)
+        self._global_clock = global_clock or _shared_clock_mapper()
+        self._timestamp_domain: str | None = None
         self._error: BaseException | None = None
+
+    def _mapper_for(self, timestamp_domain: str) -> AffineClockMapper:
+        return self._global_clock if timestamp_domain in GLOBAL_TIMESTAMP_DOMAINS else self._clock
 
     def start(self) -> RealSenseCamera:
         if self._pipeline is not None:
@@ -68,9 +107,19 @@ class RealSenseCamera:
         config.enable_device(self.serial)
         config.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
         try:
-            pipeline.start(config)
+            profile = pipeline.start(config)
         except RuntimeError as error:
             raise RuntimeError(f"Could not start RealSense {self.serial}: {error}") from error
+
+        # This makes supported devices report timestamps in a common system
+        # domain.  The affine host mapping below is still retained because USB
+        # delivery latency and SDK clock conversion are not deterministic.
+        for sensor in profile.get_device().query_sensors():
+            try:
+                if sensor.supports(rs.option.global_time_enabled):
+                    sensor.set_option(rs.option.global_time_enabled, 1.0)
+            except RuntimeError as error:
+                LOG.warning("Could not enable global timestamps for RealSense %s: %s", self.serial, error)
 
         self._pipeline = pipeline
         self._stop.clear()
@@ -86,14 +135,34 @@ class RealSenseCamera:
                 color = frames.get_color_frame()
                 if not color:
                     continue
+                captured_monotonic = time.monotonic()
+                hardware_timestamp = float(color.get_timestamp()) / 1000.0
+                try:
+                    timestamp_domain = str(color.get_frame_timestamp_domain()).rsplit(".", 1)[-1]
+                except (AttributeError, RuntimeError):
+                    timestamp_domain = "unknown"
                 frame = CameraFrame(
                     image=np.asanyarray(color.get_data()).copy(),
-                    captured_monotonic=time.monotonic(),
-                    hardware_timestamp=float(color.get_timestamp()) / 1000.0,
+                    captured_monotonic=captured_monotonic,
+                    hardware_timestamp=hardware_timestamp,
                     frame_number=int(color.get_frame_number()),
+                    timestamp_domain=timestamp_domain,
                 )
                 with self._lock:
+                    if timestamp_domain != self._timestamp_domain:
+                        # RealSense global/system timestamps already run at the
+                        # host clock rate; only their epoch/transport offset is
+                        # unknown. Hardware clocks retain affine drift fitting.
+                        self._clock = AffineClockMapper(
+                            max_samples=self._clock_sample_count,
+                            lower_envelope=True,
+                            fit_scale=timestamp_domain not in GLOBAL_TIMESTAMP_DOMAINS,
+                        )
+                        self._frames.clear()
+                        self._timestamp_domain = timestamp_domain
+                    self._mapper_for(timestamp_domain).add(hardware_timestamp, captured_monotonic)
                     self._latest = frame
+                    self._frames.append(frame)
         except RuntimeError as error:
             if not self._stop.is_set():
                 with self._lock:
@@ -110,6 +179,21 @@ class RealSenseCamera:
             time.sleep(0.02)
         raise RuntimeError(f"Timed out waiting for frames from RealSense {self.serial}")
 
+    def latest_image(self, max_age: float = 0.5) -> np.ndarray | None:
+        """Return the newest image, or None, without competing with acquisition.
+
+        Preview consumers only need pixels.  Unlike ``snapshot`` this runs no
+        clock-mapper estimate under the capture lock and copies nothing: it
+        holds the lock just long enough to read a reference to a frame the
+        capture thread has already published and never mutates again.
+        """
+
+        with self._lock:
+            frame = self._latest
+        if frame is None or time.monotonic() - frame.captured_monotonic > max_age:
+            return None
+        return frame.image
+
     def snapshot(self, max_age: float = 0.25) -> CameraFrame:
         with self._lock:
             error = self._error
@@ -121,7 +205,55 @@ class RealSenseCamera:
         age = time.monotonic() - frame.captured_monotonic
         if age > max_age:
             raise RuntimeError(f"RealSense {self.serial} frame is stale ({age:.3f}s)")
-        return CameraFrame(frame.image.copy(), frame.captured_monotonic, frame.hardware_timestamp, frame.frame_number)
+        with self._lock:
+            mapper = self._mapper_for(frame.timestamp_domain)
+        synchronized = mapper.to_host(frame.hardware_timestamp)
+        return replace(frame, image=frame.image.copy(), synchronized_monotonic=synchronized)
+
+    def nearest(
+        self,
+        target_monotonic: float,
+        max_delta: float,
+        after_frame_number: int | None = None,
+    ) -> CameraFrame:
+        """Return the nearest unused buffered frame on the host timeline."""
+
+        with self._lock:
+            error = self._error
+            frames = list(self._frames)
+            mapper = self._mapper_for(frames[-1].timestamp_domain) if frames else None
+        if error is not None:
+            raise RuntimeError(f"RealSense {self.serial} failed: {error}") from error
+        mapped: list[tuple[CameraFrame, float]] = []
+        if mapper is not None:
+            estimate = mapper.estimate()
+            mapped = [
+                (frame, estimate.scale * frame.hardware_timestamp + estimate.offset)
+                for frame in frames
+            ]
+        if after_frame_number is not None:
+            mapped = [(frame, host_time) for frame, host_time in mapped if frame.frame_number > after_frame_number]
+        if not mapped:
+            raise RuntimeError(f"RealSense {self.serial} has no unused buffered frame")
+        frame, synchronized = min(mapped, key=lambda item: abs(item[1] - target_monotonic))
+        delta = abs(synchronized - target_monotonic)
+        if delta > max_delta:
+            raise RuntimeError(
+                f"RealSense {self.serial} cannot align target: nearest frame is {delta * 1000.0:.1f} ms away"
+            )
+        return replace(frame, image=frame.image.copy(), synchronized_monotonic=synchronized)
+
+    @property
+    def clock_estimate(self) -> dict[str, float | int]:
+        with self._lock:
+            mapper = self._mapper_for(self._timestamp_domain or "unknown")
+        estimate = mapper.estimate()
+        return {
+            "scale": estimate.scale,
+            "offset": estimate.offset,
+            "sample_count": estimate.sample_count,
+            "residual_p95_ms": estimate.residual_p95 * 1000.0,
+        }
 
     def close(self) -> None:
         self._stop.set()
@@ -171,8 +303,9 @@ class RealSensePair:
         exterior2_serial = exterior2_serial or None
         if exterior2_serial in {exterior_serial, wrist_serial}:
             raise ValueError("Optional exterior camera serial must differ from the required cameras")
-        self.exterior = RealSenseCamera(exterior_serial, width, height, fps)
-        self.wrist = RealSenseCamera(wrist_serial, width, height, fps)
+        global_clock = _shared_clock_mapper()
+        self.exterior = RealSenseCamera(exterior_serial, width, height, fps, global_clock)
+        self.wrist = RealSenseCamera(wrist_serial, width, height, fps, global_clock)
         self.exterior2 = (
             None
             if exterior2_serial is None
@@ -181,26 +314,43 @@ class RealSensePair:
                 exterior2_width or width,
                 exterior2_height or height,
                 exterior2_fps or fps,
+                global_clock,
             )
         )
         self.optional_camera_error: str | None = None
         self.wrist_rotate_180 = wrist_rotate_180
 
     @property
+    def active_cameras(self) -> dict[str, RealSenseCamera]:
+        cameras = {
+            "exterior_image_left": self.exterior,
+            "wrist_image": self.wrist,
+        }
+        if self.exterior2 is not None:
+            cameras["exterior_image_2_left"] = self.exterior2
+        return cameras
+
+    def transform_image(self, key: str, image: np.ndarray) -> np.ndarray:
+        if key == "wrist_image" and self.wrist_rotate_180:
+            return np.rot90(image, k=2).copy()
+        return image
+
+    def _transform_frame(self, key: str, frame: CameraFrame) -> CameraFrame:
+        image = self.transform_image(key, frame.image)
+        if image is not frame.image:
+            return replace(frame, image=image)
+        return frame
+
+    @property
     def serials(self) -> dict[str, str]:
-        serials = {"exterior_image_left": self.exterior.serial, "wrist_image": self.wrist.serial}
-        exterior2 = getattr(self, "exterior2", None)
-        if exterior2 is not None:
-            serials["exterior_image_2_left"] = exterior2.serial
-        return serials
+        return {key: camera.serial for key, camera in self.active_cameras.items()}
 
     @property
     def modes(self) -> dict[str, str]:
-        cameras = {"exterior_image_left": self.exterior, "wrist_image": self.wrist}
-        exterior2 = getattr(self, "exterior2", None)
-        if exterior2 is not None:
-            cameras["exterior_image_2_left"] = exterior2
-        return {name: f"{camera.width}x{camera.height}@{camera.fps}" for name, camera in cameras.items()}
+        return {
+            key: f"{camera.width}x{camera.height}@{camera.fps}"
+            for key, camera in self.active_cameras.items()
+        }
 
     def start(self) -> RealSensePair:
         try:
@@ -223,19 +373,11 @@ class RealSensePair:
         return self
 
     def snapshot(self, max_age: float = 0.25) -> dict[str, CameraFrame]:
-        wrist = self.wrist.snapshot(max_age)
-        if self.wrist_rotate_180:
-            wrist = CameraFrame(
-                np.rot90(wrist.image, k=2).copy(),
-                wrist.captured_monotonic,
-                wrist.hardware_timestamp,
-                wrist.frame_number,
-            )
         frames = {
             "exterior_image_left": self.exterior.snapshot(max_age),
-            "wrist_image": wrist,
+            "wrist_image": self._transform_frame("wrist_image", self.wrist.snapshot(max_age)),
         }
-        exterior2 = getattr(self, "exterior2", None)
+        exterior2 = self.exterior2
         if exterior2 is not None:
             try:
                 frames["exterior_image_2_left"] = exterior2.snapshot(max_age)
@@ -246,12 +388,31 @@ class RealSensePair:
                 self.exterior2 = None
         return frames
 
+    def nearest(
+        self,
+        target_monotonic: float,
+        max_delta: float,
+        after_frame_numbers: dict[str, int] | None = None,
+    ) -> dict[str, CameraFrame]:
+        """Select one unique frame per active camera nearest a host-time target."""
+
+        after_frame_numbers = after_frame_numbers or {}
+        selected = {
+            key: self._transform_frame(
+                key,
+                camera.nearest(target_monotonic, max_delta, after_frame_numbers.get(key)),
+            )
+            for key, camera in self.active_cameras.items()
+        }
+        return selected
+
+    @property
+    def clock_estimates(self) -> dict[str, dict[str, float | int]]:
+        return {key: camera.clock_estimate for key, camera in self.active_cameras.items()}
+
     def close(self) -> None:
-        exterior2 = getattr(self, "exterior2", None)
-        if exterior2 is not None:
-            exterior2.close()
-        self.wrist.close()
-        self.exterior.close()
+        for camera in reversed(tuple(self.active_cameras.values())):
+            camera.close()
 
     def __enter__(self) -> RealSensePair:  # noqa: PYI034
         return self.start()

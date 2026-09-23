@@ -1,9 +1,10 @@
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from fr3_demo.cameras import CameraFrame, RealSensePair
+from fr3_demo.cameras import CameraFrame, RealSenseCamera, RealSensePair
 
 
 class _FakeCamera:
@@ -12,6 +13,48 @@ class _FakeCamera:
 
     def snapshot(self, _max_age: float) -> CameraFrame:
         return self.frame
+
+
+class LatestImageTest(unittest.TestCase):
+    """The preview path must stay cheap: no clock work, no copy, fresh frames only."""
+
+    def _camera(self, age: float) -> RealSenseCamera:
+        camera = RealSenseCamera("serial")
+        image = np.full((4, 6, 3), 7, dtype=np.uint8)
+        camera._latest = CameraFrame(image, time.monotonic() - age, 2.0, 3)
+        return camera
+
+    def test_returns_the_latest_frame_without_copying_it(self) -> None:
+        camera = self._camera(age=0.0)
+
+        image = camera.latest_image()
+
+        self.assertIs(image, camera._latest.image)
+
+    def test_returns_none_before_the_first_frame(self) -> None:
+        self.assertIsNone(RealSenseCamera("serial").latest_image())
+
+    def test_returns_none_for_a_stale_frame(self) -> None:
+        self.assertIsNone(self._camera(age=1.0).latest_image(max_age=0.5))
+
+    def test_nearest_uses_mapped_exposure_time_and_never_reuses_a_frame(self) -> None:
+        camera = RealSenseCamera("serial", fps=60)
+        image = np.zeros((2, 2, 3), dtype=np.uint8)
+        for frame_number in range(1, 5):
+            hardware = 1.0 + frame_number * 0.01
+            host = 1001.0 + frame_number * 0.01
+            camera._global_clock.add(hardware, host + 0.003)
+            camera._frames.append(
+                CameraFrame(image, host + 0.003, hardware, frame_number, "global_time")
+            )
+
+        first = camera.nearest(1001.021, max_delta=0.01)
+        second = camera.nearest(1001.031, max_delta=0.01, after_frame_number=first.frame_number)
+
+        self.assertEqual(first.frame_number, 2)
+        self.assertEqual(second.frame_number, 3)
+        self.assertAlmostEqual(first.alignment_timestamp, 1001.023)
+        self.assertIsNot(first.image, image)
 
 
 class RealSensePairTest(unittest.TestCase):

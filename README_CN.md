@@ -22,19 +22,35 @@ fr3-camera-list
 fr3-camera-rviz
 ```
 
-确认画面后按 `Ctrl+C` 关闭 RViz 相机程序。
+确认画面后按 `Ctrl+C` 关闭 RViz 相机程序：一台 RealSense 同时只能被一个进程
+打开，`fr3-camera-rviz` 与 `fr3-collect` 不能同时运行。采集时用下面自带的预览。
 
 ## 4. 采集演示
 
 ```bash
+source /opt/ros/humble/setup.bash
 fr3-collect
 ```
+
+`fr3-collect` 会自动打开 RViz，显示全部正在录制的相机画面，话题与
+`fr3-camera-rviz` 相同（`/fr3_demo/*`）；预览不会重复打开相机，也不会因预览错误
+中断录制。
+
+- `--no-preview`：不开预览（也可在 `config.toml` 中设 `preview = false`）。
+- `--preview-publish-only`：只发布话题、不启动 RViz，便于在另一台机器上查看。
+- `--preview-rate-hz`：只调整预览频率。
+
+若未 source ROS 2，采集照常运行，只会提示 `Camera preview disabled`。
 
 - 按手柄 `X`：开始录制。
 - 再按一次 `X`：结束当前演示。
 - 按 `Back`：退出。
 
 数据保存在 `data/raw/session_日期_时间`。
+
+相机、机械臂、夹爪和动作统一对齐到 Ubuntu 单调时钟的 15 Hz 时间线；每个完成的
+episode 都有 `sync_report.json`，超出同步容差会中止。图像按 DROID 的 320x180
+存储，机械臂数据包含关节位置、速度和 `tau_J` 力矩。
 
 ## 5. 添加语言指令
 
@@ -61,6 +77,9 @@ fr3-convert \
   --output-root data/lerobot \
   --push-to-hub
 ```
+
+旧版 v1 数据没有严格同步，默认不能转换。确认旧数据可用后，才添加
+`--allow-legacy-unsynchronized`。
 
 ## 7. 启动新 checkpoint（GPU 机器）
 

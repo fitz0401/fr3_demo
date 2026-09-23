@@ -31,6 +31,12 @@ width = 424
 height = 240
 fps = 30
 wrist_rotate_180 = true
+[recording]
+fps = 15.0
+alignment_delay_ms = 45.0
+camera_max_delta_ms = 25.0
+robot_sample_hz = 60.0
+image_workers = 3
 [workspace]
 min = [0.1, -0.2, 0.3]
 max = [0.7, 0.2, 0.9]
@@ -73,6 +79,10 @@ max_rollout_steps = 0
             self.assertEqual(cameras["camera_height"], 240)
             self.assertTrue(cameras["wrist_rotate_180"])
             self.assertTrue(teleop["wrist_rotate_180"])
+            self.assertEqual(teleop["alignment_delay_ms"], 45.0)
+            self.assertEqual(teleop["camera_max_delta_ms"], 25.0)
+            self.assertEqual(teleop["robot_sample_hz"], 60.0)
+            self.assertEqual(teleop["image_workers"], 3)
             self.assertTrue(pi05["wrist_rotate_180"])
             self.assertEqual(pi05["gripper_force"], 0.7)
             self.assertEqual(pi05["home_speed"], 0.18)

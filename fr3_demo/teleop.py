@@ -346,6 +346,46 @@ def _create_parser() -> argparse.ArgumentParser:
         help="rotate wrist images 180 degrees for an upside-down camera mount",
     )
     parser.add_argument("--record-fps", type=float, default=15.0, help="synchronized dataset sampling rate")
+    parser.add_argument(
+        "--record-image-width",
+        type=int,
+        default=320,
+        help="width of stored JPEGs; 0 records at the native camera resolution",
+    )
+    parser.add_argument(
+        "--record-image-height",
+        type=int,
+        default=180,
+        help="height of stored JPEGs; 0 records at the native camera resolution",
+    )
+    parser.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=5.0,
+        help="refuse to record with less free disk than this",
+    )
+    parser.add_argument(
+        "--preview",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="show the live camera views in RViz while collecting (default: enabled)",
+    )
+    parser.add_argument(
+        "--preview-publish-only",
+        action="store_true",
+        help="publish the preview topics without launching RViz on this machine",
+    )
+    parser.add_argument("--preview-rate-hz", type=float, default=10.0, help="RViz preview publish rate")
+    parser.add_argument("--alignment-delay-ms", type=float, default=80.0)
+    parser.add_argument("--camera-max-delta-ms", type=float, default=25.0)
+    parser.add_argument("--camera-pair-warn-ms", type=float, default=20.0)
+    parser.add_argument("--camera-pair-reject-ms", type=float, default=35.0)
+    parser.add_argument("--robot-sample-hz", type=float, default=60.0)
+    parser.add_argument("--robot-max-gap-ms", type=float, default=30.0)
+    parser.add_argument("--gripper-sample-hz", type=float, default=30.0)
+    parser.add_argument("--gripper-max-age-ms", type=float, default=2000.0)
+    parser.add_argument("--image-workers", type=int, default=3)
+    parser.add_argument("--image-queue-size", type=int, default=120)
     parser.add_argument("--feedback-event", help="force-feedback event device; auto-detected by default")
     parser.add_argument("--verbose", action="store_true")
     return parser
@@ -370,6 +410,17 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         "external2_camera_width",
         "external2_camera_height",
         "record_fps",
+        "alignment_delay_ms",
+        "camera_max_delta_ms",
+        "camera_pair_warn_ms",
+        "camera_pair_reject_ms",
+        "robot_sample_hz",
+        "robot_max_gap_ms",
+        "gripper_sample_hz",
+        "gripper_max_age_ms",
+        "image_workers",
+        "image_queue_size",
+        "preview_rate_hz",
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -379,6 +430,14 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         parser.error("--deadzone must be in [0, 0.9)")
     if not 0.0 <= args.gripper_force <= 1.0:
         parser.error("--gripper-force must be in [0.0, 1.0]")
+    if (args.record_image_width > 0) != (args.record_image_height > 0):
+        parser.error("--record-image-width and --record-image-height must both be set, or both be 0 for native")
+    if args.record_image_width < 0 or args.record_image_height < 0:
+        parser.error("--record-image-width and --record-image-height cannot be negative")
+    if args.min_free_gb < 0:
+        parser.error("--min-free-gb cannot be negative")
+    if args.camera_pair_warn_ms >= args.camera_pair_reject_ms:
+        parser.error("--camera-pair-warn-ms must be below --camera-pair-reject-ms")
     if np.any(np.asarray(args.workspace_min) >= np.asarray(args.workspace_max)):
         parser.error("each --workspace-min value must be below --workspace-max")
     if args.collect and (args.offline or args.dry_run or args.check or args.legacy_waypoints):
@@ -426,6 +485,7 @@ def run(args: argparse.Namespace) -> int:
     robot: BambooRobot | None = None
     cameras: Any | None = None
     collector: Any | None = None
+    preview: Any | None = None
     rumbler: Any | None = None
     streaming_active = False
     stop = False
@@ -476,10 +536,43 @@ def run(args: argparse.Namespace) -> int:
                 gripper_port=args.gripper_port,
                 gripper_type=args.gripper_type,
                 enable_gripper=not args.no_gripper,
+                alignment_delay_ms=args.alignment_delay_ms,
+                camera_max_delta_ms=args.camera_max_delta_ms,
+                camera_pair_warn_ms=args.camera_pair_warn_ms,
+                camera_pair_reject_ms=args.camera_pair_reject_ms,
+                robot_sample_hz=args.robot_sample_hz,
+                robot_max_gap_ms=args.robot_max_gap_ms,
+                gripper_sample_hz=args.gripper_sample_hz,
+                gripper_max_age_ms=args.gripper_max_age_ms,
+                image_workers=args.image_workers,
+                image_queue_size=args.image_queue_size,
+                image_size=(
+                    (args.record_image_width, args.record_image_height)
+                    if args.record_image_width and args.record_image_height
+                    else None
+                ),
+                min_free_gb=args.min_free_gb,
             )
             collector.start()
+            if args.preview:
+                try:
+                    from fr3_demo.preview import CameraPreview
+
+                    preview = CameraPreview(
+                        cameras,
+                        rate_hz=args.preview_rate_hz,
+                        launch_viewer=not args.preview_publish_only,
+                    ).start()
+                    # While recording, the preview shows the recorder's own
+                    # frames instead of competing with it for the cameras.
+                    collector.set_frame_observer(preview.submit)
+                    print("Camera preview publishing on /fr3_demo/* for RViz.")
+                except Exception as error:  # noqa: BLE001 - a preview is never worth losing a session over
+                    LOG.warning("Camera preview disabled: %s", error)
             if robot is not None and not args.no_gripper:
-                collector.set_gripper(robot.gripper_position())
+                initial_gripper = robot.gripper_position()
+                collector.set_gripper_observation(initial_gripper)
+                collector.set_gripper_action(initial_gripper)
             rumbler = Rumbler(args.feedback_event)
             print(f"Raw demonstration session: {collector.session_dir}")
 
@@ -596,13 +689,13 @@ def run(args: argparse.Namespace) -> int:
                     if collector is not None:
                         collector.set_action(np.zeros(7))
                         requested_gripper = 0.0 if close_requested else 1.0
-                        collector.set_gripper(requested_gripper, requested_gripper)
+                        collector.set_gripper_action(requested_gripper)
                     if args.dry_run:
                         print("DRY RUN: gripper close" if close_requested else "DRY RUN: gripper open")
                     elif robot is not None:
                         robot.close_gripper() if close_requested else robot.open_gripper()
                         if collector is not None:
-                            collector.set_gripper(robot.gripper_position())
+                            collector.set_gripper_observation(robot.gripper_position())
                     continue
 
                 twist = joystick_twist(snapshot, mapping, args.linear_speed, args.angular_speed, args.deadzone)
@@ -682,6 +775,11 @@ def run(args: argparse.Namespace) -> int:
                     print(f"✅ Recording stopped during shutdown: {completed}")
             except Exception as error:  # noqa: BLE001 - shutdown must continue to camera and robot cleanup
                 LOG.error("Could not finalize active recording: %s", error)
+        if preview is not None:
+            try:
+                preview.close()
+            except Exception as error:  # noqa: BLE001 - shutdown must continue to camera and robot cleanup
+                LOG.warning("Could not stop the camera preview: %s", error)
         if cameras is not None:
             cameras.close()
         if robot is not None:

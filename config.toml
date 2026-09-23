@@ -19,24 +19,58 @@ device = "/dev/input/js0"
 # feedback_event = "/dev/input/event22"
 
 [cameras]
-external_serial = "047322071010"
+external_serial = "244222074182"
 wrist_serial = "309622300781"
 # Optional second exterior camera. Leave empty to run with the two required cameras.
 external2_serial = "f1421698"
+# The L515 has no RGB mode below 960x540; it does sustain 60 fps there.
 external2_width = 960
 external2_height = 540
-external2_fps = 30
+external2_fps = 60
 # Pinhao's validated RealSense adaptation: wide 16:9 modes with low transport
 # latency. The policy still samples/actions at DROID's 15 Hz control rate.
+# 60 fps halves the phase error between free-running cameras: nearest-frame
+# selection lands within +-8.3 ms of the target instead of +-16.7 ms, which
+# roughly halves inter-camera skew. 424x240 is the only 60 fps mode the wrist
+# D456 offers.
 width = 424
 height = 240
-fps = 30
+fps = 60
 # The wrist camera mount is upside-down relative to the DROID hand camera.
 wrist_rotate_180 = true
 
 [recording]
 data_dir = "data/raw"
 fps = 15.0
+# Synchronized collection: all streams are aligned to Ubuntu monotonic time.
+# 80 ms covers the measured USB delivery tail of the L515 without changing the
+# timestamp assigned to a frame; it only delays when an aligned row is emitted.
+alignment_delay_ms = 80.0
+# Tightened for 60 fps capture, where the worst possible pair skew is 16.7 ms
+# rather than 33.3 ms. Loosen these again if the cameras drop back to 30 fps.
+camera_max_delta_ms = 15.0
+camera_pair_warn_ms = 12.0
+camera_pair_reject_ms = 25.0
+robot_sample_hz = 60.0
+robot_max_gap_ms = 30.0
+gripper_sample_hz = 30.0
+# The gripper server can be busy during a blocking close/open command.
+gripper_max_age_ms = 2000.0
+# JPEG compression runs outside the acquisition/alignment threads.
+image_workers = 3
+image_queue_size = 120
+# Stored JPEG size. DROID uses 320x180 and the LeRobot conversion resizes to it,
+# so recording larger only costs disk (about 3.5x here). Set both to 0 to keep
+# the native camera resolution.
+image_width = 320
+image_height = 180
+# Refuse to start a session, or a new episode, below this much free disk.
+min_free_gb = 5.0
+# Live RViz view of every camera while collecting. The recorder owns the
+# RealSense handles, so this republishes its frames instead of reopening them;
+# fr3-camera-rviz cannot run at the same time.
+preview = true
+preview_rate_hz = 10.0
 
 [teleop]
 linear_speed = 0.08

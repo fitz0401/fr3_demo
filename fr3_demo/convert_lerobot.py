@@ -66,12 +66,71 @@ def _features() -> dict[str, dict[str, Any]]:
     }
 
 
+def _validate_episode_sync(
+    episode: Path,
+    metadata: dict[str, Any],
+    *,
+    allow_legacy_unsynchronized: bool,
+) -> dict[str, Any] | None:
+    """Reject unverified/index-aligned raw data unless explicitly requested."""
+
+    schema_version = int(metadata.get("schema_version", 1))
+    if schema_version < 2:
+        if allow_legacy_unsynchronized:
+            return None
+        raise RuntimeError(
+            f"{episode} uses legacy schema v{schema_version}, which only aligns streams by loop index. "
+            "Re-record it with the synchronized collector, or use --allow-legacy-unsynchronized "
+            "only after auditing the episode."
+        )
+    if metadata.get("timebase") != "host_monotonic":
+        raise RuntimeError(f"Synchronized episode has an unknown timebase: {episode}")
+    report_path = episode / "sync_report.json"
+    if not report_path.is_file():
+        raise RuntimeError(f"Synchronized episode is missing sync_report.json: {episode}")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if report.get("valid") is not True or metadata.get("sync", {}).get("valid") is not True:
+        raise RuntimeError(f"Episode failed synchronization validation: {episode}")
+    with np.load(episode / "trajectory.npz") as trajectory:
+        required = {
+            "host_monotonic_timestamp",
+            "robot_before_host_timestamp",
+            "robot_after_host_timestamp",
+            "exterior_camera_hardware_timestamp",
+            "exterior_camera_aligned_timestamp",
+            "exterior_camera_frame_number",
+            "wrist_camera_hardware_timestamp",
+            "wrist_camera_aligned_timestamp",
+            "wrist_camera_frame_number",
+            "action_joint_host_timestamp",
+        }
+        missing = required - set(trajectory.files)
+        if missing:
+            raise RuntimeError(f"Synchronized timing fields are missing in {episode}: {', '.join(sorted(missing))}")
+        timestamps = np.asarray(trajectory["timestamp"], dtype=np.float64)
+        if len(timestamps) > 1:
+            expected_period = 1.0 / float(metadata["fps"])
+            maximum_error = float(np.max(np.abs(np.diff(timestamps) - expected_period)))
+            if maximum_error > 1e-5:
+                raise RuntimeError(f"Episode is not on its declared fixed-rate timeline: {episode}")
+        for key in ("exterior_camera_frame_number", "wrist_camera_frame_number"):
+            numbers = np.asarray(trajectory[key], dtype=np.int64)
+            if len(np.unique(numbers)) != len(numbers):
+                raise RuntimeError(f"Duplicate camera frame detected in {episode}: {key}")
+        if "exterior2_camera_frame_number" in trajectory:
+            numbers = np.asarray(trajectory["exterior2_camera_frame_number"], dtype=np.int64)
+            if len(np.unique(numbers)) != len(numbers):
+                raise RuntimeError(f"Duplicate camera frame detected in {episode}: exterior2_camera_frame_number")
+    return report
+
+
 def convert(
     data_dirs: Path | Sequence[Path],
     repo_id: str,
     output_root: Path | None = None,
     push: bool = False,
     public: bool = False,
+    allow_legacy_unsynchronized: bool = False,
 ) -> Path:
     episodes = find_episodes(data_dirs)
     if not episodes:
@@ -79,10 +138,18 @@ def convert(
         joined = ", ".join(str(path) for path in roots)
         raise RuntimeError(f"No completed raw episodes found under: {joined}")
     missing_language = []
+    episode_metadata: dict[Path, dict[str, Any]] = {}
+    sync_reports: dict[Path, dict[str, Any] | None] = {}
     for episode in episodes:
         metadata = json.loads((episode / "metadata.json").read_text(encoding="utf-8"))
+        episode_metadata[episode] = metadata
         if not str(metadata.get("language_instruction") or "").strip():
             missing_language.append(str(episode))
+        sync_reports[episode] = _validate_episode_sync(
+            episode,
+            metadata,
+            allow_legacy_unsynchronized=allow_legacy_unsynchronized,
+        )
     if missing_language:
         joined = "\n  ".join(missing_language)
         raise RuntimeError(f"Language is missing for:\n  {joined}\nRun fr3-annotate before conversion.")
@@ -91,10 +158,16 @@ def convert(
     root = None if output_root is None else output_root.expanduser().resolve() / repo_id
     if root is not None and root.exists():
         raise FileExistsError(f"Output already exists: {root}")
+    episode_fps = {float(metadata.get("fps", 15.0)) for metadata in episode_metadata.values()}
+    if len(episode_fps) != 1:
+        raise RuntimeError(f"Input sessions use different recording rates: {sorted(episode_fps)}")
+    dataset_fps = episode_fps.pop()
+    if not dataset_fps.is_integer():
+        raise RuntimeError(f"LeRobot requires an integer dataset fps, got {dataset_fps}")
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
         robot_type="fr3",
-        fps=15,
+        fps=int(dataset_fps),
         root=root,
         features=_features(),
         use_videos=True,
@@ -102,7 +175,7 @@ def convert(
     )
 
     for episode in episodes:
-        metadata = json.loads((episode / "metadata.json").read_text(encoding="utf-8"))
+        metadata = episode_metadata[episode]
         task = str(metadata["language_instruction"]).strip()
         with np.load(episode / "trajectory.npz") as trajectory:
             frame_count = len(trajectory["joint_position"])
@@ -134,7 +207,13 @@ def convert(
                     }
                 )
         dataset.save_episode()
-        print(f"Converted {episode.name}: {frame_count} frames, task={task!r}")
+        report = sync_reports[episode]
+        sync_status = "legacy/index-aligned"
+        if report is not None:
+            camera_p95 = report["camera_pair_skew_ms"]["p95"]
+            robot_p95 = report["robot_interpolation_gap_ms"]["p95"]
+            sync_status = f"camera skew p95={camera_p95:.1f} ms, robot gap p95={robot_p95:.1f} ms"
+        print(f"Converted {episode.name}: {frame_count} frames, {sync_status}, task={task!r}")
 
     finalize = getattr(dataset, "finalize", None)
     if callable(finalize):
@@ -166,8 +245,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", type=Path, help="defaults to LeRobot's HF_LEROBOT_HOME")
     parser.add_argument("--push-to-hub", action="store_true")
     parser.add_argument("--public", action="store_true", help="make an uploaded dataset public (default: private)")
+    parser.add_argument(
+        "--allow-legacy-unsynchronized",
+        action="store_true",
+        help="allow schema-v1 episodes that were aligned only by recorder-loop index",
+    )
     args = parser.parse_args(argv)
-    output = convert(args.data_dirs, args.repo_id, args.output_root, args.push_to_hub, args.public)
+    output = convert(
+        args.data_dirs,
+        args.repo_id,
+        args.output_root,
+        args.push_to_hub,
+        args.public,
+        args.allow_legacy_unsynchronized,
+    )
     print(f"LeRobot dataset: {output}")
     return 0
 
