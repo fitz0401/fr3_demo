@@ -36,10 +36,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="prompt once and apply the instruction to every unlabeled episode",
     )
-    parser.add_argument("--overwrite", action="store_true", help="replace existing non-empty annotations")
+    parser.add_argument(
+        "--replace",
+        "--overwrite",
+        dest="replace",
+        action="store_true",
+        help="replace existing non-empty annotations; with --all, replace every episode from one prompt",
+    )
     args = parser.parse_args(argv)
-    if args.one_for_all and args.overwrite:
-        parser.error("--all always preserves labeled episodes and cannot be combined with --overwrite")
 
     paths = episode_metadata_paths(args.data_dir)
     if not paths:
@@ -47,18 +51,19 @@ def main(argv: list[str] | None = None) -> int:
 
     shared_instruction: str | None = None
     if args.one_for_all:
-        has_unlabeled = any(
+        has_target = args.replace or any(
             not str(json.loads(path.read_text(encoding="utf-8")).get("language_instruction") or "").strip()
             for path in paths
         )
-        if has_unlabeled:
-            shared_instruction = input("Language for all unlabeled episodes (blank to skip): ").strip()
+        if has_target:
+            target = "all episodes" if args.replace else "all unlabeled episodes"
+            shared_instruction = input(f"Language for {target} (blank to skip): ").strip()
 
     updated = 0
     for path in paths:
         metadata = json.loads(path.read_text(encoding="utf-8"))
         existing = str(metadata.get("language_instruction") or "").strip()
-        if existing and not args.overwrite:
+        if existing and not args.replace:
             print(f"{path.parent}: {existing!r} (kept)")
             continue
         if args.one_for_all:

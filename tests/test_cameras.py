@@ -75,20 +75,46 @@ class RealSensePairTest(unittest.TestCase):
         exterior.close.assert_not_called()
         wrist.close.assert_not_called()
 
-    def test_only_wrist_image_is_rotated_180_degrees(self) -> None:
+    def test_each_configured_image_is_rotated_180_degrees(self) -> None:
         image = np.arange(18, dtype=np.uint8).reshape(3, 2, 3)
         pair = object.__new__(RealSensePair)
         pair.exterior = _FakeCamera(image)
         pair.exterior2 = _FakeCamera(image + 1)
         pair.wrist = _FakeCamera(image)
-        pair.wrist_rotate_180 = True
+        pair._rotate_180 = {
+            "exterior_image_left": False,
+            "wrist_image": True,
+            "exterior_image_2_left": True,
+        }
 
         frames = pair.snapshot()
 
         np.testing.assert_array_equal(frames["exterior_image_left"].image, image)
-        np.testing.assert_array_equal(frames["exterior_image_2_left"].image, image + 1)
+        np.testing.assert_array_equal(frames["exterior_image_2_left"].image, (image + 1)[::-1, ::-1])
         np.testing.assert_array_equal(frames["wrist_image"].image, image[::-1, ::-1])
         self.assertEqual(frames["wrist_image"].frame_number, 3)
+        self.assertEqual(
+            pair.camera_transforms,
+            {
+                "exterior_image_left": "none",
+                "wrist_image": "rotate_180",
+                "exterior_image_2_left": "rotate_180",
+            },
+        )
+
+    def test_main_exterior_rotation_is_independent(self) -> None:
+        image = np.arange(18, dtype=np.uint8).reshape(3, 2, 3)
+        pair = object.__new__(RealSensePair)
+        pair._rotate_180 = {
+            "exterior_image_left": True,
+            "wrist_image": False,
+            "exterior_image_2_left": False,
+        }
+
+        np.testing.assert_array_equal(
+            pair.transform_image("exterior_image_left", image), image[::-1, ::-1]
+        )
+        self.assertIs(pair.transform_image("wrist_image", image), image)
 
     def test_optional_runtime_disconnect_keeps_required_frames(self) -> None:
         image = np.zeros((2, 2, 3), dtype=np.uint8)
@@ -98,7 +124,11 @@ class RealSensePairTest(unittest.TestCase):
         pair.exterior = _FakeCamera(image)
         pair.wrist = _FakeCamera(image)
         pair.exterior2 = optional
-        pair.wrist_rotate_180 = False
+        pair._rotate_180 = {
+            "exterior_image_left": False,
+            "wrist_image": False,
+            "exterior_image_2_left": False,
+        }
         pair.optional_camera_error = None
 
         frames = pair.snapshot()

@@ -204,7 +204,7 @@ class RawEpisodeWriter:
         fps: float,
         camera_serials: dict[str, str],
         *,
-        wrist_rotate_180: bool = False,
+        camera_transforms: dict[str, str] | None = None,
         image_workers: int = 3,
         image_queue_size: int = 120,
         sync_thresholds: dict[str, float] | None = None,
@@ -219,6 +219,12 @@ class RawEpisodeWriter:
         if not required_cameras.issubset(camera_serials):
             raise ValueError("Recording requires exterior_image_left and wrist_image")
         self._camera_keys = tuple(camera_serials)
+        transforms = {
+            key: (camera_transforms or {}).get(key, "none")
+            for key in self._camera_keys
+        }
+        if set(transforms.values()) - {"none", "rotate_180"}:
+            raise ValueError("Camera transforms must be 'none' or 'rotate_180'")
         if self.path.exists() or self.final_path.exists():
             raise FileExistsError(f"Episode {episode_index} already exists in {session_dir}")
         for key in self._camera_keys:
@@ -291,10 +297,7 @@ class RawEpisodeWriter:
                 "unit": "Nm",
                 "frame": "joint",
             },
-            "camera_transforms": {
-                key: "rotate_180" if key == "wrist_image" and wrist_rotate_180 else "none"
-                for key in self._camera_keys
-            },
+            "camera_transforms": transforms,
             "language_instruction": None,
             "frame_count": 0,
         }
@@ -566,10 +569,7 @@ class DemoCollector:
                 "timebase": "host_monotonic",
                 "timestamp_unit": "seconds",
                 "camera_serials": cameras.serials,
-                "camera_transforms": {
-                    key: "rotate_180" if key == "wrist_image" and cameras.wrist_rotate_180 else "none"
-                    for key in cameras.serials
-                },
+                "camera_transforms": cameras.camera_transforms,
                 "synchronization": self._sync_thresholds,
                 "image_size": (
                     None
@@ -667,7 +667,7 @@ class DemoCollector:
                 self._next_episode_index(),
                 self.fps,
                 self.cameras.serials,
-                wrist_rotate_180=self.cameras.wrist_rotate_180,
+                camera_transforms=self.cameras.camera_transforms,
                 image_workers=self.image_workers,
                 image_queue_size=self.image_queue_size,
                 sync_thresholds=self._sync_thresholds,

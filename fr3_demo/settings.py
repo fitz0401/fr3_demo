@@ -26,7 +26,9 @@ _SCHEMA: dict[str, set[str]] = {
         "width",
         "height",
         "fps",
+        "external_rotate_180",
         "wrist_rotate_180",
+        "external2_rotate_180",
     },
     "recording": {
         "data_dir",
@@ -153,7 +155,9 @@ def teleop_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "camera_fps": cameras.get("fps"),
         "camera_width": cameras.get("width"),
         "camera_height": cameras.get("height"),
+        "external_rotate_180": cameras.get("external_rotate_180"),
         "wrist_rotate_180": cameras.get("wrist_rotate_180"),
+        "external2_rotate_180": cameras.get("external2_rotate_180"),
         "data_dir": recording.get("data_dir"),
         "record_fps": recording.get("fps"),
         "alignment_delay_ms": recording.get("alignment_delay_ms"),
@@ -202,7 +206,9 @@ def camera_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "camera_fps": cameras.get("fps"),
         "camera_width": cameras.get("width"),
         "camera_height": cameras.get("height"),
+        "external_rotate_180": cameras.get("external_rotate_180"),
         "wrist_rotate_180": cameras.get("wrist_rotate_180"),
+        "external2_rotate_180": cameras.get("external2_rotate_180"),
     }
     return {key: value for key, value in mapping.items() if value is not None}
 
@@ -237,7 +243,9 @@ def pi05_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "camera_fps": cameras.get("fps"),
         "camera_width": cameras.get("width"),
         "camera_height": cameras.get("height"),
+        "external_rotate_180": cameras.get("external_rotate_180"),
         "wrist_rotate_180": cameras.get("wrist_rotate_180"),
+        "external2_rotate_180": cameras.get("external2_rotate_180"),
         "home_speed": home.get("speed"),
         "home_timeout": home.get("timeout"),
         "workspace_min": workspace.get("min"),

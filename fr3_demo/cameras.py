@@ -291,6 +291,8 @@ class RealSensePair:
         exterior2_height: int | None = None,
         exterior2_fps: int | None = None,
         wrist_rotate_180: bool = False,
+        external_rotate_180: bool = False,
+        external2_rotate_180: bool = False,
     ):
         if not exterior_serial or not wrist_serial:
             available = ", ".join(device["serial"] for device in discover_realsense()) or "none"
@@ -318,7 +320,11 @@ class RealSensePair:
             )
         )
         self.optional_camera_error: str | None = None
-        self.wrist_rotate_180 = wrist_rotate_180
+        self._rotate_180 = {
+            "exterior_image_left": external_rotate_180,
+            "wrist_image": wrist_rotate_180,
+            "exterior_image_2_left": external2_rotate_180,
+        }
 
     @property
     def active_cameras(self) -> dict[str, RealSenseCamera]:
@@ -331,7 +337,7 @@ class RealSensePair:
         return cameras
 
     def transform_image(self, key: str, image: np.ndarray) -> np.ndarray:
-        if key == "wrist_image" and self.wrist_rotate_180:
+        if self._rotate_180.get(key, False):
             return np.rot90(image, k=2).copy()
         return image
 
@@ -344,6 +350,13 @@ class RealSensePair:
     @property
     def serials(self) -> dict[str, str]:
         return {key: camera.serial for key, camera in self.active_cameras.items()}
+
+    @property
+    def camera_transforms(self) -> dict[str, str]:
+        return {
+            key: "rotate_180" if self._rotate_180.get(key, False) else "none"
+            for key in self.active_cameras
+        }
 
     @property
     def modes(self) -> dict[str, str]:
@@ -374,13 +387,17 @@ class RealSensePair:
 
     def snapshot(self, max_age: float = 0.25) -> dict[str, CameraFrame]:
         frames = {
-            "exterior_image_left": self.exterior.snapshot(max_age),
+            "exterior_image_left": self._transform_frame(
+                "exterior_image_left", self.exterior.snapshot(max_age)
+            ),
             "wrist_image": self._transform_frame("wrist_image", self.wrist.snapshot(max_age)),
         }
         exterior2 = self.exterior2
         if exterior2 is not None:
             try:
-                frames["exterior_image_2_left"] = exterior2.snapshot(max_age)
+                frames["exterior_image_2_left"] = self._transform_frame(
+                    "exterior_image_2_left", exterior2.snapshot(max_age)
+                )
             except RuntimeError as error:
                 self.optional_camera_error = str(error)
                 LOG.warning("Optional exterior camera disconnected; disabling it: %s", error)

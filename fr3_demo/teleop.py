@@ -39,7 +39,7 @@ class Mapping:
     z_up_button: int = 4  # LB
     roll_axis: int = 2  # right stick horizontal
     pitch_axis: int = 3  # right stick vertical
-    tool_y_axis: int = 4  # D-pad horizontal: left is negative, right is positive
+    tool_y_axis: int = 4  # D-pad horizontal: left is positive, right is negative
     tool_z_axis: int = 5  # D-pad vertical: up is negative, down is positive
     yaw_down_button: int = 7  # RT
     yaw_up_button: int = 5  # RB
@@ -90,7 +90,7 @@ def joystick_tool_y(
 ) -> float:
     """Return D-pad translation along the current EEF Y axis."""
 
-    return shaped_axis(axis(snapshot, mapping.tool_y_axis), deadzone=deadzone) * linear_speed
+    return -shaped_axis(axis(snapshot, mapping.tool_y_axis), deadzone=deadzone) * linear_speed
 
 
 def lock_dpad_axis(tool_y: float, tool_z: float, active_axis: str | None) -> tuple[float, float, str | None]:
@@ -340,10 +340,22 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--external2-camera-width", type=int, default=960)
     parser.add_argument("--external2-camera-height", type=int, default=540)
     parser.add_argument(
+        "--external-rotate-180",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="rotate exterior_image_left by 180 degrees",
+    )
+    parser.add_argument(
         "--wrist-rotate-180",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="rotate wrist images 180 degrees for an upside-down camera mount",
+        help="rotate wrist_image by 180 degrees",
+    )
+    parser.add_argument(
+        "--external2-rotate-180",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="rotate exterior_image_2_left by 180 degrees",
     )
     parser.add_argument("--record-fps", type=float, default=15.0, help="synchronized dataset sampling rate")
     parser.add_argument(
@@ -523,7 +535,9 @@ def run(args: argparse.Namespace) -> int:
                 exterior2_width=args.external2_camera_width,
                 exterior2_height=args.external2_camera_height,
                 exterior2_fps=args.external2_camera_fps,
+                external_rotate_180=args.external_rotate_180,
                 wrist_rotate_180=args.wrist_rotate_180,
+                external2_rotate_180=args.external2_rotate_180,
             ).start()
             if cameras.optional_camera_error:
                 print(f"Optional exterior camera unavailable; continuing without it: {cameras.optional_camera_error}")
@@ -593,7 +607,7 @@ def run(args: argparse.Namespace) -> int:
             print("\nTeleoperation is active; moving a control commands the robot immediately.")
             print(
                 "Left stick: X/Y | LT/LB: selected-frame Z down/up | "
-                "D-pad up/down: tool Z +/- | D-pad left/right: tool Y -/+ | "
+                "D-pad up/down: tool Z +/- | D-pad left/right: tool Y +/- | "
                 "right stick: roll/pitch | RT/RB: yaw"
             )
             controls = "A: close gripper | B: open gripper | Menu: home | Back: quit"

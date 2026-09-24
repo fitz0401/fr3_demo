@@ -30,7 +30,9 @@ external2_fps = 30
 width = 424
 height = 240
 fps = 30
+external_rotate_180 = false
 wrist_rotate_180 = true
+external2_rotate_180 = true
 [recording]
 fps = 15.0
 alignment_delay_ms = 45.0
@@ -77,13 +79,19 @@ max_rollout_steps = 0
             self.assertEqual(cameras["camera_fps"], 30)
             self.assertEqual(cameras["camera_width"], 424)
             self.assertEqual(cameras["camera_height"], 240)
+            self.assertFalse(cameras["external_rotate_180"])
             self.assertTrue(cameras["wrist_rotate_180"])
+            self.assertTrue(cameras["external2_rotate_180"])
+            self.assertFalse(teleop["external_rotate_180"])
             self.assertTrue(teleop["wrist_rotate_180"])
+            self.assertTrue(teleop["external2_rotate_180"])
             self.assertEqual(teleop["alignment_delay_ms"], 45.0)
             self.assertEqual(teleop["camera_max_delta_ms"], 25.0)
             self.assertEqual(teleop["robot_sample_hz"], 60.0)
             self.assertEqual(teleop["image_workers"], 3)
+            self.assertFalse(pi05["external_rotate_180"])
             self.assertTrue(pi05["wrist_rotate_180"])
+            self.assertTrue(pi05["external2_rotate_180"])
             self.assertEqual(pi05["gripper_force"], 0.7)
             self.assertEqual(pi05["home_speed"], 0.18)
             self.assertEqual(pi05["home_timeout"], 20.0)

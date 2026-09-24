@@ -55,8 +55,8 @@ class JoystickMappingTest(unittest.TestCase):
         dpad_left = self.snapshot((0.0, 0.0, 0.0, 0.0, -1.0, 0.0))
         dpad_right = self.snapshot((0.0, 0.0, 0.0, 0.0, 1.0, 0.0))
 
-        self.assertAlmostEqual(joystick_tool_y(dpad_left, Mapping(), 0.1, deadzone=0.0), -0.1)
-        self.assertAlmostEqual(joystick_tool_y(dpad_right, Mapping(), 0.1, deadzone=0.0), 0.1)
+        self.assertAlmostEqual(joystick_tool_y(dpad_left, Mapping(), 0.1, deadzone=0.0), 0.1)
+        self.assertAlmostEqual(joystick_tool_y(dpad_right, Mapping(), 0.1, deadzone=0.0), -0.1)
 
     def test_dpad_locks_to_first_active_axis(self) -> None:
         tool_y, tool_z, active = lock_dpad_axis(-0.1, 0.0, None)

@@ -45,6 +45,39 @@ class AnnotateTest(unittest.TestCase):
             prompt.assert_not_called()
             self.assertEqual(json.loads(labeled.read_text())["language_instruction"], "existing task")
 
+    def test_all_replace_prompts_once_and_replaces_every_episode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = _episode(root, 0, None)
+            labeled = _episode(root, 1, "existing task")
+            third = _episode(root, 2, "another task")
+
+            with patch("builtins.input", return_value="replacement task") as prompt:
+                result = main(["--data-dir", str(root), "--all", "--replace"])
+
+            self.assertEqual(result, 0)
+            prompt.assert_called_once_with("Language for all episodes (blank to skip): ")
+            for path in (first, labeled, third):
+                self.assertEqual(json.loads(path.read_text())["language_instruction"], "replacement task")
+
+    def test_overwrite_remains_an_alias_for_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            labeled = _episode(root, 0, "existing task")
+
+            result = main(
+                [
+                    "--data-dir",
+                    str(root),
+                    "--language",
+                    "replacement task",
+                    "--overwrite",
+                ]
+            )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(json.loads(labeled.read_text())["language_instruction"], "replacement task")
+
 
 if __name__ == "__main__":
     unittest.main()

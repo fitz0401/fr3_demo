@@ -46,7 +46,9 @@ Useful details:
 - `workspace.min` and `workspace.max` are `[x, y, z]` in metres in the robot
   base frame. They remain base-frame limits in tool mode.
 - `gripper.close_force` is normalized from `0.0` to `1.0`.
-- `cameras.wrist_rotate_180` changes image orientation only, not motion axes.
+- `cameras.external_rotate_180`, `wrist_rotate_180`, and
+  `external2_rotate_180` independently rotate each image by 180 degrees. They
+  affect preview, recording, and inference pixels, but never robot motion axes.
 - `cameras.external2_serial` is optional. Leave it empty to use only the
   required exterior and wrist cameras. When configured and connected, the L515
   is recorded as `exterior_image_2_left`; its configured mode is `960x540@60`.
@@ -88,7 +90,7 @@ The check must report `Streaming protocol: available`. Use
 | Left stick left/right | EEF +Y/-Y in the selected frame |
 | LT / LB | EEF -Z/+Z in the selected frame |
 | D-pad up/down | Tool-frame +Z/-Z |
-| D-pad left/right | Tool-frame -Y/+Y |
+| D-pad left/right | Tool-frame +Y/-Y |
 | Right stick left/right | Roll |
 | Right stick up/down | Pitch |
 | RT / RB | Yaw -/+ |
@@ -175,6 +177,13 @@ labels:
 fr3-annotate --data-dir data/raw/session_YYYYMMDD_HHMMSS --all
 ```
 
+Add `--replace` to overwrite every episode, including existing labels, from the
+same single prompt:
+
+```bash
+fr3-annotate --data-dir data/raw/session_YYYYMMDD_HHMMSS --all --replace
+```
+
 For non-interactive use:
 
 ```bash
@@ -184,7 +193,8 @@ fr3-annotate --data-dir data/raw/session_YYYYMMDD_HHMMSS \
 
 ## 6. Convert to LeRobot
 
-Convert locally first:
+Current `fr3-collect` sessions use synchronized schema v3. Convert locally
+first:
 
 ```bash
 fr3-convert \
@@ -216,11 +226,15 @@ exterior image uses the optional camera when recorded and falls back to the
 black DROID compatibility image for older/two-camera episodes.
 
 Schema-v1 recordings used loop-index alignment and are rejected by default. To
-convert an old episode only after inspecting its timing, add:
+convert one only after manually accepting its timing risk, add:
 
 ```bash
 fr3-convert ... --allow-legacy-unsynchronized
 ```
+
+This flag is only a validation bypass for recordings created before synchronized
+collection was added. It is not an upload option and must not be added for
+schema-v2/v3 data; `--push-to-hub` is the upload option.
 
 ## 7. Run pi0.5
 

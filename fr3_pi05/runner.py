@@ -218,10 +218,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--external2-camera-width", type=int, default=960)
     parser.add_argument("--external2-camera-height", type=int, default=540)
     parser.add_argument(
+        "--external-rotate-180",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="rotate exterior_image_left before RViz and policy inference",
+    )
+    parser.add_argument(
         "--wrist-rotate-180",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="rotate wrist images 180 degrees before RViz, recording, and policy inference",
+        help="rotate wrist_image before RViz and policy inference",
+    )
+    parser.add_argument(
+        "--external2-rotate-180",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="rotate exterior_image_2_left before RViz and policy inference",
     )
     parser.add_argument("--joystick", default="/dev/input/js0", help="Back button is the software abort")
     parser.add_argument(
@@ -645,11 +657,13 @@ def run(args: argparse.Namespace) -> int:
             exterior2_width=args.external2_camera_width,
             exterior2_height=args.external2_camera_height,
             exterior2_fps=args.external2_camera_fps,
+            external_rotate_180=args.external_rotate_180,
             wrist_rotate_180=args.wrist_rotate_180,
+            external2_rotate_180=args.external2_rotate_180,
         ).start()
         print(
             f"Cameras ready: {cameras.serials}; modes={cameras.modes}; "
-            f"wrist_rotate_180={args.wrist_rotate_180}"
+            f"transforms={cameras.camera_transforms}"
         )
         if cameras.optional_camera_error:
             print(f"Optional exterior camera unavailable; continuing without it: {cameras.optional_camera_error}")

@@ -19,7 +19,7 @@ device = "/dev/input/js0"
 # feedback_event = "/dev/input/event22"
 
 [cameras]
-external_serial = "244222074182"
+external_serial = "047322071010"
 wrist_serial = "309622300781"
 # Optional second exterior camera. Leave empty to run with the two required cameras.
 external2_serial = "f1421698"
@@ -36,8 +36,10 @@ external2_fps = 60
 width = 424
 height = 240
 fps = 60
-# The wrist camera mount is upside-down relative to the DROID hand camera.
+# Image-only transforms; these do not change robot motion axes.
+external_rotate_180 = false
 wrist_rotate_180 = true
+external2_rotate_180 = true
 
 [recording]
 data_dir = "data/raw"

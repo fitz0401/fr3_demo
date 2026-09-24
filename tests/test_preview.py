@@ -29,11 +29,11 @@ class FakeCamera:
 
 
 class FakePair:
-    def __init__(self, *, exterior2: FakeCamera | None = None, wrist_rotate_180: bool = False) -> None:
+    def __init__(self, *, exterior2: FakeCamera | None = None, rotated: set[str] | None = None) -> None:
         self.exterior = FakeCamera(10)
         self.wrist = FakeCamera(20)
         self.exterior2 = exterior2
-        self.wrist_rotate_180 = wrist_rotate_180
+        self.rotated = rotated or set()
 
     @property
     def active_cameras(self) -> dict[str, FakeCamera]:
@@ -46,7 +46,7 @@ class FakePair:
         return cameras
 
     def transform_image(self, key: str, image: np.ndarray) -> np.ndarray:
-        if key == "wrist_image" and self.wrist_rotate_180:
+        if key in self.rotated:
             return np.rot90(image, k=2).copy()
         return image
 
@@ -127,15 +127,20 @@ class CameraPreviewTest(unittest.TestCase):
 
         self.assertEqual(set(preview._images()), {"exterior_image_left", "wrist_image"})
 
-    def test_applies_the_recorder_wrist_rotation(self) -> None:
-        pair = FakePair(wrist_rotate_180=True)
+    def test_applies_each_camera_rotation(self) -> None:
+        pair = FakePair(
+            exterior2=FakeCamera(30),
+            rotated={"wrist_image", "exterior_image_2_left"},
+        )
         preview = CameraPreview(pair, launch_viewer=False)
 
-        wrist = preview._images()["wrist_image"]
+        images = preview._images()
 
         # The marked corner moves to the opposite corner under a 180° rotation.
-        self.assertEqual(wrist[-1, -1, 0], 255)
-        self.assertEqual(wrist[0, 0, 0], 20)
+        self.assertEqual(images["wrist_image"][-1, -1, 0], 255)
+        self.assertEqual(images["wrist_image"][0, 0, 0], 20)
+        self.assertEqual(images["exterior_image_2_left"][-1, -1, 0], 255)
+        self.assertEqual(images["exterior_image_left"][0, 0, 0], 255)
 
     def test_a_failing_camera_is_skipped_without_disabling_it(self) -> None:
         pair = FakePair(exterior2=FakeCamera(30, error="frame is stale"))
@@ -214,7 +219,7 @@ class CameraPreviewTest(unittest.TestCase):
         self.assertEqual(pair.wrist.reads, 1)
 
     def test_submitted_frames_keep_the_recorder_transforms(self) -> None:
-        pair = FakePair(wrist_rotate_180=True)
+        pair = FakePair(rotated={"wrist_image"})
         preview = CameraPreview(pair, launch_viewer=False)
         recorded = np.full((4, 6, 3), 99, dtype=np.uint8)
         recorded[0, 0] = 255

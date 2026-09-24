@@ -44,7 +44,17 @@ def rviz_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--external2-camera-width", type=int, default=960)
     parser.add_argument("--external2-camera-height", type=int, default=540)
     parser.add_argument(
+        "--external-rotate-180",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
         "--wrist-rotate-180",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--external2-rotate-180",
         action=argparse.BooleanOptionalAction,
         default=False,
     )
@@ -77,13 +87,15 @@ def rviz_main(argv: list[str] | None = None) -> int:
         exterior2_width=args.external2_camera_width,
         exterior2_height=args.external2_camera_height,
         exterior2_fps=args.external2_camera_fps,
+        external_rotate_180=args.external_rotate_180,
         wrist_rotate_180=args.wrist_rotate_180,
+        external2_rotate_180=args.external2_rotate_180,
     ).start()
     preview = CameraPreview(cameras, rate_hz=15.0, launch_viewer=not args.no_rviz)
     try:
         preview.start()
         print(
-            f"Publishing camera views {cameras.modes}; wrist_rotate_180={args.wrist_rotate_180}. "
+            f"Publishing camera views {cameras.modes}; transforms={cameras.camera_transforms}. "
             "Press Ctrl+C to stop."
         )
         if cameras.optional_camera_error:

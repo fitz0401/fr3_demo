@@ -60,6 +60,12 @@ episode 都有 `sync_report.json`，超出同步容差会中止。图像按 DROI
 fr3-annotate --data-dir data/raw/session_日期_时间 --all
 ```
 
+若要用新指令覆盖所有 episode（无论是否已标注）：
+
+```bash
+fr3-annotate --data-dir data/raw/session_日期_时间 --all --replace
+```
+
 每个 episode 使用不同指令：
 
 ```bash
@@ -68,18 +74,25 @@ fr3-annotate --data-dir data/raw/session_日期_时间
 
 ## 6. 转换并上传 LeRobot 数据集
 
+当前 `fr3-collect` 采集的是严格同步的 schema v3 数据，可直接转换并上传：
+
 ```bash
 hf auth login
 
 fr3-convert \
-  --data-dir data/raw/session_1 data/raw/session_2 \
+  --data-dir data/raw/session_日期_时间 \
   --repo-id USERNAME/DATASET_NAME \
   --output-root data/lerobot \
   --push-to-hub
 ```
 
-旧版 v1 数据没有严格同步，默认不能转换。确认旧数据可用后，才添加
-`--allow-legacy-unsynchronized`。
+`--push-to-hub` 才是上传开关。转换前程序会检查语言指令、帧数和
+`sync_report.json`；检查失败的数据不会上传。
+
+`--allow-legacy-unsynchronized` **不用于新数据，也不是上传开关**。它只允许转换本
+项目加入同步采集之前产生的 schema v1 数据；这类旧数据没有 `sync_report.json`，
+传感器只按循环序号配对。只有人工确认旧数据可用并愿意承担时间错位风险时，才添加
+这个参数。schema v2/v3 数据不要添加。
 
 ## 7. 启动新 checkpoint（GPU 机器）
 

@@ -201,10 +201,12 @@ class RawRecordingTest(unittest.TestCase):
 
     def test_collector_runs_independent_samplers_and_writes_fixed_grid(self) -> None:
         class FakeCameras:
-            wrist_rotate_180 = False
-
             def __init__(self) -> None:
                 self.serials = {"exterior_image_left": "external", "wrist_image": "wrist"}
+                self.camera_transforms = {
+                    "exterior_image_left": "none",
+                    "wrist_image": "rotate_180",
+                }
                 self.frame_number = 0
 
             def snapshot(self, _max_age=0.25):
@@ -283,6 +285,10 @@ class RawRecordingTest(unittest.TestCase):
                 np.testing.assert_allclose(trajectory["joint_torque"], 2.0)
             report = json.loads((episode / "sync_report.json").read_text(encoding="utf-8"))
             self.assertTrue(report["valid"])
+            session_metadata = json.loads((collector.session_dir / "session.json").read_text(encoding="utf-8"))
+            episode_metadata = json.loads((episode / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(session_metadata["camera_transforms"], FakeCameras().camera_transforms)
+            self.assertEqual(episode_metadata["camera_transforms"], FakeCameras().camera_transforms)
             # A viewer sees exactly the frames that were recorded.
             self.assertEqual(len(seen_frames), frame_count)
             self.assertEqual(set(seen_frames[0]), {"exterior_image_left", "wrist_image"})
