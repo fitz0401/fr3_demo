@@ -60,6 +60,31 @@ def _write_episode(
     return writer.finish()
 
 
+def _convert_with_fake_dataset(root: Path, *data_dirs: Path):
+    """Run convert() against an in-memory dataset and return what it built."""
+
+    class FakeDataset:
+        instance = None
+
+        @classmethod
+        def create(cls, **kwargs):
+            cls.instance = cls()
+            cls.instance.root = root / "converted"
+            cls.instance.create_args = kwargs
+            cls.instance.frames = []
+            return cls.instance
+
+        def add_frame(self, frame):
+            self.frames.append(frame)
+
+        def save_episode(self):
+            pass
+
+    with patch("fr3_demo.convert_lerobot._load_lerobot_dataset", return_value=FakeDataset):
+        convert(list(data_dirs), "test/fr3", output_root=root / "datasets")
+    return FakeDataset.instance
+
+
 class DiskSpaceTest(unittest.TestCase):
     def test_free_space_is_measured_for_a_directory_that_does_not_exist_yet(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -198,6 +223,42 @@ class RawRecordingTest(unittest.TestCase):
             self.assertEqual(frame["task"], "pick up the block")
             self.assertEqual(dataset.frames[-1]["task"], "pour the liquid")
             self.assertTrue(dataset.frames[-1]["exterior_image_2_left"].any())
+
+    def test_conversion_carries_joint_torque_when_every_episode_has_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            episode = _write_episode(root / "raw")
+            metadata_path = episode / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["language_instruction"] = "pour the lillet"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+            dataset = _convert_with_fake_dataset(root, root / "raw")
+
+            self.assertIn("joint_torque", dataset.create_args["features"])
+            self.assertEqual(dataset.create_args["features"]["joint_torque"]["shape"], (7,))
+            np.testing.assert_allclose(dataset.frames[0]["joint_torque"], np.arange(7) * 1.5)
+
+    def test_conversion_omits_joint_torque_rather_than_fabricating_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("raw_new", "raw_old"):
+                episode = _write_episode(root / name)
+                metadata_path = episode / "metadata.json"
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                metadata["language_instruction"] = "pour the lillet"
+                metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            # Stand in for an episode recorded before torque was captured.
+            legacy = root / "raw_old" / "episode_000000" / "trajectory.npz"
+            with np.load(legacy) as trajectory:
+                kept = {k: trajectory[k] for k in trajectory.files if k != "joint_torque"}
+            np.savez_compressed(legacy, **kept)
+
+            dataset = _convert_with_fake_dataset(root, root / "raw_new", root / "raw_old")
+
+            self.assertNotIn("joint_torque", dataset.create_args["features"])
+            for frame in dataset.frames:
+                self.assertNotIn("joint_torque", frame)
 
     def test_collector_runs_independent_samplers_and_writes_fixed_grid(self) -> None:
         class FakeCameras:

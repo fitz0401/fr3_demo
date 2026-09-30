@@ -42,8 +42,8 @@ def find_episodes(data_dirs: Path | Sequence[Path]) -> list[Path]:
     return sorted(episodes)
 
 
-def _features() -> dict[str, dict[str, Any]]:
-    return {
+def _features(include_joint_torque: bool = False) -> dict[str, dict[str, Any]]:
+    features: dict[str, dict[str, Any]] = {
         "exterior_image_1_left": {
             "dtype": "image",
             "shape": (180, 320, 3),
@@ -64,6 +64,21 @@ def _features() -> dict[str, dict[str, Any]]:
         "gripper_position": {"dtype": "float32", "shape": (1,), "names": ["gripper_position"]},
         "actions": {"dtype": "float32", "shape": (8,), "names": ["actions"]},
     }
+    if include_joint_torque:
+        # Measured link-side joint torque (Franka tau_J, Nm). OpenPI's DROID
+        # config repacks only the keys above and ignores this one, so carrying
+        # it costs nothing today and keeps force available for later training.
+        features["joint_torque"] = {"dtype": "float32", "shape": (7,), "names": ["joint_torque"]}
+    return features
+
+
+def _episodes_with_joint_torque(episodes: Sequence[Path]) -> list[Path]:
+    missing = []
+    for episode in episodes:
+        with np.load(episode / "trajectory.npz") as trajectory:
+            if "joint_torque" not in trajectory.files:
+                missing.append(episode)
+    return missing
 
 
 def _validate_episode_sync(
@@ -164,12 +179,25 @@ def convert(
     dataset_fps = episode_fps.pop()
     if not dataset_fps.is_integer():
         raise RuntimeError(f"LeRobot requires an integer dataset fps, got {dataset_fps}")
+    # Force is only carried when every episode has it: filling gaps with zeros
+    # would put fabricated readings in the training set.
+    without_torque = _episodes_with_joint_torque(episodes)
+    include_joint_torque = not without_torque
+    if without_torque:
+        joined = "\n  ".join(str(path) for path in without_torque[:5])
+        more = f"\n  ... and {len(without_torque) - 5} more" if len(without_torque) > 5 else ""
+        print(
+            f"Omitting joint_torque: {len(without_torque)} of {len(episodes)} episodes were recorded "
+            f"before torque was captured:\n  {joined}{more}"
+        )
+    else:
+        print(f"Including joint_torque from all {len(episodes)} episodes.")
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
         robot_type="fr3",
         fps=int(dataset_fps),
         root=root,
-        features=_features(),
+        features=_features(include_joint_torque),
         use_videos=True,
         image_writer_threads=4,
     )
@@ -195,17 +223,18 @@ def convert(
                     [trajectory["action_joint_velocity"][index], trajectory["action_gripper_position"][index]],
                     dtype=np.float32,
                 )
-                dataset.add_frame(
-                    {
-                        "exterior_image_1_left": exterior,
-                        "exterior_image_2_left": exterior2,
-                        "wrist_image_left": wrist,
-                        "joint_position": np.asarray(trajectory["joint_position"][index], dtype=np.float32),
-                        "gripper_position": np.asarray(trajectory["gripper_position"][index], dtype=np.float32),
-                        "actions": action,
-                        "task": task,
-                    }
-                )
+                frame = {
+                    "exterior_image_1_left": exterior,
+                    "exterior_image_2_left": exterior2,
+                    "wrist_image_left": wrist,
+                    "joint_position": np.asarray(trajectory["joint_position"][index], dtype=np.float32),
+                    "gripper_position": np.asarray(trajectory["gripper_position"][index], dtype=np.float32),
+                    "actions": action,
+                    "task": task,
+                }
+                if include_joint_torque:
+                    frame["joint_torque"] = np.asarray(trajectory["joint_torque"][index], dtype=np.float32)
+                dataset.add_frame(frame)
         dataset.save_episode()
         report = sync_reports[episode]
         sync_status = "legacy/index-aligned"

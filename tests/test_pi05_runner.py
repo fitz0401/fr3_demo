@@ -83,7 +83,9 @@ class Pi05RunnerTest(unittest.TestCase):
         self.assertEqual(args.prefetch_actions, 0)
 
     def test_debug_chunk_flag_and_gripper_threshold_output(self) -> None:
-        args = _parse(["--debug-chunks"])
+        # The threshold is operator-tunable in config.toml, so pass it here
+        # rather than asserting whatever the live config currently holds.
+        args = _parse(["--debug-chunks", "--gripper-threshold", "0.9"])
         self.assertTrue(args.debug_chunks)
         self.assertEqual(args.gripper_threshold, 0.9)
         chunk = np.zeros((2, 8), dtype=float)

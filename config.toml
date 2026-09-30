@@ -115,7 +115,7 @@ stream_hz = 30.0
 open_loop_horizon = 15
 prefetch_actions = 4
 # Model gripper action must be above this value to request open; otherwise close.
-gripper_threshold = 0.9
+gripper_threshold = 0.5
 # Match the controller envelope used while collecting the wine demonstrations.
 # Workspace and joint-limit prediction remain active for every policy action.
 max_joint_speed = 0.35

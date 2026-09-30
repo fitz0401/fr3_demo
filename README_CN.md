@@ -86,13 +86,8 @@ fr3-convert \
   --push-to-hub
 ```
 
-`--push-to-hub` 才是上传开关。转换前程序会检查语言指令、帧数和
+`--push-to-hub` 是上传开关。转换前程序会检查语言指令、帧数和
 `sync_report.json`；检查失败的数据不会上传。
-
-`--allow-legacy-unsynchronized` **不用于新数据，也不是上传开关**。它只允许转换本
-项目加入同步采集之前产生的 schema v1 数据；这类旧数据没有 `sync_report.json`，
-传感器只按循环序号配对。只有人工确认旧数据可用并愿意承担时间错位风险时，才添加
-这个参数。schema v2/v3 数据不要添加。
 
 ## 7. 启动新 checkpoint（GPU 机器）
 
