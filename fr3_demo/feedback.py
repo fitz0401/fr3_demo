@@ -32,6 +32,38 @@ def find_feedback_device(name_contains: str = "BETOP") -> str:
     raise RuntimeError(f"No force-feedback input device containing {name_contains!r} was found")
 
 
+class SilentRumbler:
+    """Stand-in used when no vibration device is available.
+
+    Haptics are a convenience; a demonstration session is not worth losing
+    because the gamepad's rumble motor could not be found.
+    """
+
+    event_path: str | None = None
+
+    def play(self, pulses: int, duration: float = 0.14, gap: float = 0.10) -> None:
+        return
+
+    def recording_started(self) -> None:
+        return
+
+    def recording_stopped(self) -> None:
+        return
+
+    def error(self) -> None:
+        return
+
+
+def open_rumbler(event_path: str | None = None) -> Any:
+    """Return a working rumbler, or a silent one with the reason logged."""
+
+    try:
+        return Rumbler(event_path)
+    except RuntimeError as error:
+        LOG.warning("Joystick vibration disabled: %s", error)
+        return SilentRumbler()
+
+
 class Rumbler:
     """Queue short rumble patterns without blocking the control loop."""
 

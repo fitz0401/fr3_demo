@@ -280,6 +280,68 @@ def _pose_error(model: np.ndarray, measured: np.ndarray) -> tuple[float, float]:
     return position_error, angle_error
 
 
+# The scale readings the operator takes around each pour. Weighing the bottle
+# as well as the cup separates what was poured from what was spilled.
+WEIGHTS_BEFORE = (
+    ("bottle_before_g", "bottle before the pour"),
+    ("cup_before_g", "cup before the pour"),
+)
+WEIGHTS_AFTER = (
+    ("bottle_after_g", "bottle after the pour, back in place"),
+    ("cup_after_g", "cup after the pour"),
+)
+
+
+def _store_weights(episode: Path, readings: dict[str, float]) -> None:
+    if not readings:
+        return
+    from fr3_demo.recording import record_episode_weights
+
+    weights = record_episode_weights(episode, readings)["weights"]
+    summary = "  ".join(
+        f"{key}={weights[key]:.1f}" for key in ("poured_g", "spilled_g") if key in weights
+    )
+    print(f"  Weights saved to {episode.name}/metadata.json" + (f": {summary}" if summary else ""))
+
+
+def prompt_weights(
+    fields: tuple[tuple[str, str], ...],
+    *,
+    pause_stream: Callable[[], None] | None = None,
+    resume_stream: Callable[[], None] | None = None,
+) -> dict[str, float]:
+    """Ask for scale readings in grams; blank skips one, Ctrl-C skips the rest.
+
+    The teleoperation stream has a watchdog measured in milliseconds, so the
+    caller pauses it before this blocks on the terminal and resumes afterwards;
+    otherwise the watchdog brakes the arm while the operator is at the scale.
+    """
+
+    if not sys.stdin.isatty():
+        return {}
+    if pause_stream is not None:
+        pause_stream()
+    readings: dict[str, float] = {}
+    try:
+        for key, label in fields:
+            for attempt in range(2):
+                answer = input(f"  {label} in grams (blank to skip): ").strip()
+                if not answer:
+                    break
+                try:
+                    readings[key] = float(answer)
+                except ValueError:
+                    print("    Enter a number, or leave blank to skip." if attempt == 0 else "    Skipped.")
+                    continue
+                break
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Skipped the remaining weights.")
+    finally:
+        if resume_stream is not None:
+            resume_stream()
+    return readings
+
+
 def _create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Teleoperate a Bamboo-controlled Franka FR3 with a gamepad.")
     parser.add_argument(
@@ -369,6 +431,12 @@ def _create_parser() -> argparse.ArgumentParser:
         type=int,
         default=180,
         help="height of stored JPEGs; 0 records at the native camera resolution",
+    )
+    parser.add_argument(
+        "--weigh",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="after each episode, ask for the liquid weight read off the scale (default: enabled)",
     )
     parser.add_argument(
         "--min-free-gb",
@@ -522,7 +590,7 @@ def run(args: argparse.Namespace) -> int:
 
         if args.collect:
             from fr3_demo.cameras import RealSensePair
-            from fr3_demo.feedback import Rumbler
+            from fr3_demo.feedback import open_rumbler
             from fr3_demo.recording import DemoCollector
 
             cameras = RealSensePair(
@@ -587,7 +655,7 @@ def run(args: argparse.Namespace) -> int:
                 initial_gripper = robot.gripper_position()
                 collector.set_gripper_observation(initial_gripper)
                 collector.set_gripper_action(initial_gripper)
-            rumbler = Rumbler(args.feedback_event)
+            rumbler = open_rumbler(args.feedback_event)
             print(f"Raw demonstration session: {collector.session_dir}")
 
         with LinuxJoystick(args.joystick) as joystick:
@@ -604,6 +672,21 @@ def run(args: argparse.Namespace) -> int:
             elif args.legacy_waypoints and not args.dry_run:
                 LOG.warning("Legacy waypoint mode intentionally stops after every command and will feel laggy")
 
+            def pause_stream() -> None:
+                """Idle the arm before anything blocks for operator input."""
+
+                nonlocal streaming_active
+                if streaming_active and robot is not None:
+                    robot.stream_velocity(np.zeros(7))
+                    robot.stop_stream()
+                    streaming_active = False
+
+            def resume_stream() -> None:
+                nonlocal streaming_active
+                if streaming and robot is not None and not streaming_active:
+                    robot.start_stream(args.watchdog_ms, args.max_joint_speed, args.max_joint_acceleration)
+                    streaming_active = True
+
             print("\nTeleoperation is active; moving a control commands the robot immediately.")
             print(
                 "Left stick: X/Y | LT/LB: selected-frame Z down/up | "
@@ -616,6 +699,7 @@ def run(args: argparse.Namespace) -> int:
             print(controls)
             print("Keep a hand on the physical E-stop.\n")
 
+            pending_weights: dict[str, float] = {}
             initial_snapshot = joystick.snapshot()
             last_close_count = initial_snapshot.press_counts[mapping.close_button]
             last_open_count = initial_snapshot.press_counts[mapping.open_button]
@@ -637,6 +721,16 @@ def run(args: argparse.Namespace) -> int:
                         collector.set_action(np.zeros(7))
                         rumbler.recording_stopped()
                         print(f"\n✅ Recording stopped: {completed}")
+                        if args.weigh:
+                            print("Weigh the cup, and the bottle back in place:")
+                            pending_weights.update(
+                                prompt_weights(
+                                    WEIGHTS_AFTER,
+                                    pause_stream=pause_stream,
+                                    resume_stream=resume_stream,
+                                )
+                            )
+                            _store_weights(completed, pending_weights)
                     break
 
                 if collector is not None:
@@ -662,7 +756,28 @@ def run(args: argparse.Namespace) -> int:
                         completed = collector.stop_episode()
                         rumbler.recording_stopped()
                         print(f"\n✅ Recording stopped: {completed}")
+                        if args.weigh:
+                            print("Weigh the cup, and the bottle back in place:")
+                            pending_weights.update(
+                                prompt_weights(
+                                    WEIGHTS_AFTER,
+                                    pause_stream=pause_stream,
+                                    resume_stream=resume_stream,
+                                )
+                            )
+                            _store_weights(completed, pending_weights)
+                        pending_weights.clear()
                     else:
+                        if args.weigh:
+                            print("\nWeigh the bottle and the cup before this demonstration:")
+                            pending_weights.clear()
+                            pending_weights.update(
+                                prompt_weights(
+                                    WEIGHTS_BEFORE,
+                                    pause_stream=pause_stream,
+                                    resume_stream=resume_stream,
+                                )
+                            )
                         pending = collector.start_episode()
                         rumbler.recording_started()
                         print(f"\n⬆️ Recording started: {pending}")

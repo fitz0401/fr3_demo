@@ -53,7 +53,12 @@ alignment_delay_ms = 80.0
 camera_max_delta_ms = 15.0
 camera_pair_warn_ms = 12.0
 camera_pair_reject_ms = 25.0
-robot_sample_hz = 60.0
+# The FR3 controller publishes state at 1 kHz and Bamboo serves it by
+# request/reply, so this is our polling rate, not a hardware limit. Measured on
+# this rig: 993 calls/s with zero duplicate states, every poll returning a new
+# 1 ms sample. Raw force (raw_force_*) lands at this rate; the 15 Hz columns
+# stay interpolated, but bracket within ~1 ms instead of ~17 ms.
+robot_sample_hz = 1000.0
 robot_max_gap_ms = 30.0
 gripper_sample_hz = 30.0
 # The gripper server can be busy during a blocking close/open command.
