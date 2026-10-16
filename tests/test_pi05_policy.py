@@ -66,6 +66,33 @@ class Pi05PolicyTest(unittest.TestCase):
         self.assertIn("observation/exterior_image_2_left", observation)
         self.assertTrue(observation["observation/exterior_image_2_left"].all())
 
+    @patch("fr3_pi05.policy._resize_wine", side_effect=lambda image: image[:180, :320])
+    def test_bluecup_observation_carries_torque_and_fault_fields(self, _resize) -> None:
+        image = np.zeros((240, 424, 3), dtype=np.uint8)
+        observation = build_droid_observation(
+            image,
+            image,
+            np.zeros((3, 7)),
+            np.ones(3),
+            "pour lillet into the blue cup",
+            exterior2_image=image,
+            joint_torque=[0.4, -40.0, 5.0, 24.0, 1.8, -2.0, -0.2],
+            fault={"fault/absent_cameras": ["wrist_image_left"], "fault/force": "absent"},
+        )
+        self.assertEqual(observation["observation/joint_torque"].dtype, np.float32)
+        self.assertEqual(observation["observation/joint_torque"].shape, (7,))
+        self.assertEqual(observation["fault/absent_cameras"], ["wrist_image_left"])
+        self.assertEqual(observation["fault/force"], "absent")
+
+    def test_bluecup_observation_rejects_bad_torque_and_fault_keys(self) -> None:
+        image = np.zeros((224, 224, 3), dtype=np.uint8)
+        with self.assertRaisesRegex(ValueError, "seven finite"):
+            build_droid_observation(image, image, self.Q, 1.0, "t", joint_torque=np.zeros(6))
+        with self.assertRaisesRegex(ValueError, "seven finite"):
+            build_droid_observation(image, image, self.Q, 1.0, "t", joint_torque=np.full(7, np.nan))
+        with self.assertRaisesRegex(ValueError, "fault/"):
+            build_droid_observation(image, image, self.Q, 1.0, "t", fault={"absent_cameras": ["x"]})
+
     @patch("fr3_pi05.policy._resize", side_effect=lambda image: image[:224, :224])
     def test_wine_observation_accepts_history_shapes(self, _resize) -> None:
         image = np.zeros((240, 424, 3), dtype=np.uint8)

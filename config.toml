@@ -109,7 +109,7 @@ server_port = 8002
 zmq_mode = "connect"
 zmq_bind_host = "0.0.0.0"
 # Run one policy at a time; each profile has a stable workstation endpoint.
-server_ports = { pi05_droid = 8000, custom_droid = 8001, wine_hybrid = 8002 }
+server_ports = { pi05_droid = 8000, custom_droid = 8001, wine_hybrid = 8002, bluecup_force = 8003 }
 control_hz = 15.0
 stream_hz = 30.0
 open_loop_horizon = 15

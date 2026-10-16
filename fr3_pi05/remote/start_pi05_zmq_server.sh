@@ -10,7 +10,7 @@ PORT=${PORT:-8000}
 CONNECT_ENDPOINT=${CONNECT_ENDPOINT:-}
 
 if [ -z "$OPENPI_DIR" ] || [ -z "$FR3_DEMO_DIR" ] || [ -z "$CHECKPOINT" ]; then
-  echo "Usage: CUDA_VISIBLE_DEVICES=<A6000-index> PORT=<port> $0 /path/to/openpi /path/to/fr3_demo /local/checkpoint [pi05_droid|custom_droid|wine_hybrid]" >&2
+  echo "Usage: CUDA_VISIBLE_DEVICES=<A6000-index> PORT=<port> $0 /path/to/openpi /path/to/fr3_demo /local/checkpoint [pi05_droid|custom_droid|wine_hybrid|bluecup_force]" >&2
   exit 2
 fi
 if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
@@ -38,6 +38,7 @@ fi
 CUSTOM_ASSET_ID=${ASSET_ID:-}
 PROPRIO_HISTORY_OFFSETS=(0)
 WINE_LOADER_PATH=
+BLUECUP_LOADER_PATH=
 ACTION_EXPERT_VARIANT=${ACTION_EXPERT_VARIANT:-auto}
 TASKS_JSON=${TASKS_JSON:-}
 if [ -z "${USE_EXTERNAL2+x}" ]; then
@@ -78,12 +79,20 @@ case "$MODEL_PROFILE" in
     PROPRIO_HISTORY_OFFSETS=(0 45 75)
     WINE_LOADER_PATH=$FR3_DEMO_DIR/fr3_train/serve_wine.py
     ;;
+  bluecup_force)
+    # Blue-cup force / sensor-dropout checkpoints (fr3_train/bluecup/DEPLOY_PLAN.md). Three cameras
+    # and the measured joint torque are always required; the client never toggles them here.
+    LOADER=bluecup
+    CONFIG_NAME=pi05_droid
+    PROPRIO_HISTORY_OFFSETS=(0 45 75)
+    BLUECUP_LOADER_PATH=$FR3_DEMO_DIR/fr3_train/serve_bluecup.py
+    ;;
   *)
-    echo "Unknown model profile: $MODEL_PROFILE (expected pi05_droid, custom_droid, or wine_hybrid)" >&2
+    echo "Unknown model profile: $MODEL_PROFILE (expected pi05_droid, custom_droid, wine_hybrid, or bluecup_force)" >&2
     exit 2
     ;;
 esac
-if [ "$LOADER" = wine ] && [ -z "$CUSTOM_ASSET_ID" ]; then
+if { [ "$LOADER" = wine ] || [ "$LOADER" = bluecup ]; } && [ -z "$CUSTOM_ASSET_ID" ]; then
   mapfile -t NORM_FILES < <(find "$CHECKPOINT/assets" -type f -name norm_stats.json 2>/dev/null | sort)
   if [ "${#NORM_FILES[@]}" -ne 1 ]; then
     echo "Expected exactly one normalization file under $CHECKPOINT/assets; found ${#NORM_FILES[@]}." >&2
@@ -105,11 +114,16 @@ if [ "$LOADER" = wine ] && [ ! -f "$WINE_LOADER_PATH" ]; then
   echo "Pull the fr3_demo revision containing fr3_train before launching." >&2
   exit 2
 fi
-if [ "$LOADER" = wine ]; then
+if [ "$LOADER" = bluecup ] && [ ! -f "$BLUECUP_LOADER_PATH" ]; then
+  echo "Blue-cup loader is missing: $BLUECUP_LOADER_PATH" >&2
+  echo "Pull the fr3_demo branch containing fr3_train/serve_bluecup.py before launching." >&2
+  exit 2
+fi
+if [ "$LOADER" = wine ] || [ "$LOADER" = bluecup ]; then
   EXPECTED_OPENPI_REV=15a9616a00943ada6c20a0f158e3adb39df2ccac
   ACTUAL_OPENPI_REV=$(git -C "$OPENPI_DIR" rev-parse HEAD 2>/dev/null || true)
   if [ "$ACTUAL_OPENPI_REV" != "$EXPECTED_OPENPI_REV" ]; then
-    echo "wine_hybrid requires OpenPI $EXPECTED_OPENPI_REV" >&2
+    echo "$MODEL_PROFILE requires OpenPI $EXPECTED_OPENPI_REV" >&2
     echo "Current checkout is ${ACTUAL_OPENPI_REV:-not a Git checkout}." >&2
     echo "Use a dedicated checkout at the training revision and apply fr3_train/deploy.patch." >&2
     exit 2
@@ -145,6 +159,12 @@ if [ ! -w "$OPENPI_DATA_HOME" ] || [ ! -w "$UV_CACHE_DIR" ]; then
   exit 2
 fi
 EXTRA_ARGS=()
+if [ -n "$BLUECUP_LOADER_PATH" ]; then
+  EXTRA_ARGS+=(
+    --bluecup-loader-path "$BLUECUP_LOADER_PATH"
+    --asset-id "$CUSTOM_ASSET_ID"
+  )
+fi
 if [ -n "$WINE_LOADER_PATH" ]; then
   EXTRA_ARGS+=(
     --wine-loader-path "$WINE_LOADER_PATH"

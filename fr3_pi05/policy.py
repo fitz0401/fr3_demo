@@ -96,8 +96,15 @@ def build_droid_observation(
     prompt: str,
     *,
     exterior2_image: np.ndarray | None = None,
+    joint_torque: np.ndarray | None = None,
+    fault: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the exact observation dictionary expected by ``pi05_droid``."""
+    """Build the exact observation dictionary expected by ``pi05_droid``.
+
+    ``joint_torque`` (measured tau_J, 7 values, Nm) is required by the bluecup_force checkpoints and
+    ignored by the others. ``fault`` holds the optional ``fault/...`` keys understood by
+    fr3_train/serve_bluecup.py (see fr3_pi05/faults.py); it is passed through unchanged.
+    """
 
     joints = np.asarray(joint_position, dtype=np.float32)
     if joints.shape not in ((7,), (3, 7)) or not np.all(np.isfinite(joints)):
@@ -121,6 +128,16 @@ def build_droid_observation(
         observation["observation/exterior_image_2_left"] = resize_image(
             np.asarray(exterior2_image, dtype=np.uint8)
         )
+    if joint_torque is not None:
+        torque = np.asarray(joint_torque, dtype=np.float32).reshape(-1)
+        if torque.shape != (7,) or not np.all(np.isfinite(torque)):
+            raise ValueError("Joint torque must contain seven finite values (tau_J, Nm)")
+        observation["observation/joint_torque"] = torque
+    if fault:
+        unknown = [key for key in fault if not str(key).startswith("fault/")]
+        if unknown:
+            raise ValueError(f"Fault fields must start with 'fault/': {unknown}")
+        observation.update(fault)
     return observation
 
 
