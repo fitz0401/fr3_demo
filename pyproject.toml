@@ -25,6 +25,11 @@ convert = [
     "lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
     "Pillow>=10",
 ]
+# datasets is intentionally unpinned here. Its 4.x releases renamed the
+# fixed-length list feature tag from "Sequence" to "List", which readers on
+# datasets 3.x reject outright. Conversion rewrites the parquet footer back to
+# "Sequence", a tag every version accepts, so neither this environment nor the
+# training environment has to be held at a particular datasets release.
 pi05 = [
     "msgpack>=1.0.5",
     "Pillow>=10",

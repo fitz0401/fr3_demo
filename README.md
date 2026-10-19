@@ -225,6 +225,37 @@ gripper state, eight-dimensional actions, and per-episode tasks. The second
 exterior image uses the optional camera when recorded and falls back to the
 black DROID compatibility image for older/two-camera episodes.
 
+### Raw force and scale readings
+
+Alongside the LeRobot dataset, conversion writes the full-rate force stream and
+the operator's scale readings. The parquet dataset itself is unchanged, so a
+training stack that ignores these files sees exactly the dataset it did before.
+
+- `raw_force/episode_NNNNNN.npz` — one file per episode, holding every arm
+  sample on the controller's own timeline (about 860 Hz): `raw_force_joint_torque`,
+  `raw_force_joint_position`, and the controller/send/receive timestamps. It
+  also carries the per-frame `robot_timestamp` and `host_monotonic_timestamp`,
+  plus `robot_clock_scale`/`robot_clock_offset` from `sync_report.json`, so the
+  stream can be mapped onto the 15 Hz frames. Gravity compensation, windowing
+  and calibration are left to the training side.
+- `meta/episode_weights.jsonl` — one line per episode with the four scale
+  readings and the derived `poured_g`/`spilled_g`. A reading that was never
+  entered is `null`, never zero. Back-fill with `fr3-annotate --weights`.
+- `meta/raw_force_report.json` — per-episode sample count, rate, largest gap,
+  and the alignment error against the 15 Hz torque column.
+
+Conversion re-interpolates the raw stream at each frame's `robot_timestamp` and
+compares it with the frame torque. That reproduces the column to float32
+round-off, so a mismatch above 0.01 Nm means the arrays were paired with the
+wrong episode and conversion stops. Episodes recorded before raw force existed
+get no npz file and are listed in the report; they are never filled with zeros.
+
+Parquet footers are written with the legacy `Sequence` feature tag rather than
+the `List` tag that `datasets` 4.x and newer emit. Both decode to the same
+`fixed_size_list`, but `datasets` 3.x rejects `List` outright with
+`Feature type 'List' not found`, so the older tag is the one that every version
+reads. This replaces pinning `datasets` on either side.
+
 Schema-v1 recordings used loop-index alignment and are rejected by default. To
 convert one only after manually accepting its timing risk, add:
 

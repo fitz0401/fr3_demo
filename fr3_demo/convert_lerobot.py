@@ -81,6 +81,216 @@ def _episodes_with_joint_torque(episodes: Sequence[Path]) -> list[Path]:
     return missing
 
 
+# Every arm sample of an episode, on the controller's own timeline, plus the
+# two per-frame clocks the training side needs to line them up with the 15 Hz
+# frames. Copied out verbatim; gravity compensation, windowing and calibration
+# belong to the training stack, not here.
+RAW_FORCE_KEYS = (
+    "raw_force_joint_torque",
+    "raw_force_joint_position",
+    "raw_force_robot_timestamp",
+    "raw_force_request_send_timestamp",
+    "raw_force_response_receive_timestamp",
+)
+FRAME_CLOCK_KEYS = ("robot_timestamp", "host_monotonic_timestamp")
+WEIGHT_FIELDS = (
+    "bottle_before_g",
+    "cup_before_g",
+    "bottle_after_g",
+    "cup_after_g",
+    "poured_g",
+    "spilled_g",
+)
+# Re-interpolating the raw stream at the frame clock reproduces the frame
+# torque column to float32 round-off (measured 1.9e-06 Nm). Pairing one
+# episode's raw arrays with another's frames misses by whole Nm, so anything
+# above this is a wiring bug rather than noise.
+ALIGNMENT_TOLERANCE_NM = 1e-2
+
+
+def _legacy_feature_tags(node: Any) -> Any:
+    """Rename the datasets 4.x "List" feature tag back to "Sequence"."""
+
+    if isinstance(node, dict):
+        converted = {key: _legacy_feature_tags(value) for key, value in node.items()}
+        if converted.get("_type") == "List":
+            converted["_type"] = "Sequence"
+            converted.setdefault("length", -1)
+        return converted
+    if isinstance(node, list):
+        return [_legacy_feature_tags(value) for value in node]
+    return node
+
+
+def restore_sequence_feature_tags(root: Path) -> list[Path]:
+    """Make the parquet footers readable by every HF datasets version.
+
+    datasets 4.x renamed the fixed-length list feature from "Sequence" to
+    "List" and stamps that name into every parquet footer. A reader on
+    datasets 3.x refuses the file outright with "Feature type 'List' not
+    found", which is why previous FR3 datasets had to be repaired by hand
+    after conversion. Both names decode to the same fixed_size_list, and 4.x
+    and 5.x still accept "Sequence", so writing the older name makes a single
+    file readable on either side. Only schema metadata is rewritten; values
+    and encoded image bytes are preserved exactly.
+    """
+
+    paths = sorted(root.glob("data/**/*.parquet"))
+    if not paths:
+        return []
+    import pyarrow.parquet as pq
+
+    rewritten: list[Path] = []
+    for path in paths:
+        table = pq.read_table(path)
+        metadata = dict(table.schema.metadata or {})
+        encoded = metadata.get(b"huggingface")
+        if encoded is None:
+            continue
+        info = json.loads(encoded)
+        features = info.get("info", {}).get("features")
+        if features is None:
+            continue
+        patched = _legacy_feature_tags(features)
+        if patched == features:
+            continue
+        info["info"]["features"] = patched
+        metadata[b"huggingface"] = json.dumps(info).encode("utf-8")
+        # Keep the codec the writer chose so only the footer changes. pyarrow
+        # reports an uncompressed column as "UNCOMPRESSED" but only accepts
+        # "none" when writing one back.
+        codec = str(pq.ParquetFile(path).metadata.row_group(0).column(0).compression).lower()
+        # Never write over the original in place: pq.write_table truncates the
+        # destination before it validates its arguments, so a rejected argument
+        # destroys the file it was supposed to rewrite. Write beside it and
+        # replace only once the new file is complete.
+        staged = path.with_suffix(path.suffix + ".tmp")
+        try:
+            pq.write_table(
+                table.replace_schema_metadata(metadata),
+                staged,
+                compression="none" if codec == "uncompressed" else codec,
+            )
+            staged.replace(path)
+        finally:
+            staged.unlink(missing_ok=True)
+        rewritten.append(path)
+    return rewritten
+
+
+def _alignment_error_nm(
+    raw_time: np.ndarray,
+    raw_torque: np.ndarray,
+    frame_time: np.ndarray,
+    frame_torque: np.ndarray,
+) -> tuple[float, int]:
+    """Largest torque mismatch between the re-interpolated raw stream and the frames.
+
+    Returns the error and how many frames had to be skipped because they fall
+    outside the raw stream. The recorder can interpolate the first grid frame
+    from a poll taken a fraction of a millisecond before the raw buffer starts
+    retaining samples, which happens on about half of the episodes here.
+    np.interp would clamp to the first sample for those frames, so comparing
+    them measures the clamp rather than the data.
+    """
+
+    # The sampler can poll the same controller state twice; keep the first
+    # occurrence so np.interp sees a strictly increasing x, while the saved
+    # arrays stay untouched.
+    keep = np.sort(np.unique(raw_time, return_index=True)[1])
+    times = raw_time[keep]
+    inside = (frame_time >= times[0]) & (frame_time <= times[-1])
+    outside = int((~inside).sum())
+    if not inside.any():
+        raise RuntimeError("Raw force does not overlap the episode's frames")
+    worst = 0.0
+    for joint in range(raw_torque.shape[1]):
+        interpolated = np.interp(frame_time[inside], times, raw_torque[keep, joint].astype(np.float64))
+        difference = np.abs(interpolated - frame_torque[inside, joint].astype(np.float64))
+        worst = max(worst, float(np.max(difference)))
+    return worst, outside
+
+
+def write_raw_force(
+    root: Path,
+    episode_index: int,
+    episode: Path,
+    report: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Copy one episode's raw force stream next to the dataset; None if absent."""
+
+    with np.load(episode / "trajectory.npz") as trajectory:
+        if not all(key in trajectory.files for key in RAW_FORCE_KEYS):
+            return None
+        payload = {key: trajectory[key] for key in RAW_FORCE_KEYS}
+        for key in FRAME_CLOCK_KEYS:
+            if key not in trajectory.files:
+                raise RuntimeError(f"Episode has raw force but no {key}: {episode}")
+            payload[key] = trajectory[key]
+        frame_torque = np.asarray(trajectory["joint_torque"], dtype=np.float32)
+
+    estimate = ((report or {}).get("clock_estimates") or {}).get("robot_controller")
+    if not estimate:
+        raise RuntimeError(f"Episode has raw force but no robot clock estimate: {episode}")
+
+    payload["source_episode"] = np.asarray(episode.name)
+    payload["robot_clock_scale"] = np.asarray(float(estimate["scale"]))
+    payload["robot_clock_offset"] = np.asarray(float(estimate["offset"]))
+
+    raw_time = np.asarray(payload["raw_force_robot_timestamp"], dtype=np.float64)
+    frame_time = np.asarray(payload["robot_timestamp"], dtype=np.float64)
+    alignment, outside = _alignment_error_nm(
+        raw_time, payload["raw_force_joint_torque"], frame_time, frame_torque
+    )
+    if alignment > ALIGNMENT_TOLERANCE_NM:
+        raise RuntimeError(
+            f"Raw force does not match the frames of {episode}: max torque difference {alignment:.4g} Nm "
+            f"exceeds {ALIGNMENT_TOLERANCE_NM:g} Nm. The arrays most likely belong to a different episode."
+        )
+
+    directory = root / "raw_force"
+    directory.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(directory / f"episode_{episode_index:06d}.npz", **payload)
+
+    gaps = np.diff(raw_time)
+    span = float(raw_time[-1] - raw_time[0])
+    return {
+        "episode_index": episode_index,
+        "source_episode": episode.name,
+        "raw_samples": len(raw_time),
+        "frames": len(frame_time),
+        "raw_rate_hz": (len(raw_time) - 1) / span if span > 0 else 0.0,
+        "max_gap_ms": float(gaps.max() * 1000.0) if len(gaps) else 0.0,
+        "duplicate_controller_timestamps": int(len(raw_time) - len(np.unique(raw_time))),
+        "alignment_max_abs_diff_nm": alignment,
+        "frames_outside_raw_span": outside,
+        "robot_clock_scale": float(estimate["scale"]),
+        "robot_clock_offset": float(estimate["offset"]),
+    }
+
+
+def weights_row(episode_index: int, episode: Path, metadata: dict[str, Any]) -> dict[str, Any]:
+    """One episode_weights.jsonl line; missing readings stay null, never zero."""
+
+    weights = metadata.get("weights") or {}
+    row: dict[str, Any] = {"episode_index": episode_index, "source_episode": episode.name}
+    for field in WEIGHT_FIELDS:
+        value = weights.get(field)
+        row[field] = None if value is None else float(value)
+    row["unit"] = weights.get("unit")
+    row["source"] = weights.get("source")
+    # A reviewed episode carries its superseded values and the reason, so the
+    # training side can tell a corrected outcome from a measured one.
+    for field in ("outcome_source", "outcome_reason"):
+        if weights.get(field) is not None:
+            row[field] = weights[field]
+    for field in ("measured_poured_g", "measured_spilled_g"):
+        if field in weights:
+            value = weights[field]
+            row[field] = None if value is None else float(value)
+    return row
+
+
 def _validate_episode_sync(
     episode: Path,
     metadata: dict[str, Any],
@@ -202,7 +412,10 @@ def convert(
         image_writer_threads=4,
     )
 
-    for episode in episodes:
+    raw_force_entries: list[dict[str, Any]] = []
+    raw_force_missing: list[Path] = []
+    weight_rows: list[dict[str, Any]] = []
+    for episode_index, episode in enumerate(episodes):
         metadata = episode_metadata[episode]
         task = str(metadata["language_instruction"]).strip()
         with np.load(episode / "trajectory.npz") as trajectory:
@@ -236,6 +449,15 @@ def convert(
                     frame["joint_torque"] = np.asarray(trajectory["joint_torque"][index], dtype=np.float32)
                 dataset.add_frame(frame)
         dataset.save_episode()
+        # Written after save_episode so the sidecar index always matches the
+        # episode LeRobot just committed. Raw force never gates the parquet:
+        # an older episode simply gets no sidecar.
+        entry = write_raw_force(Path(dataset.root), episode_index, episode, sync_reports[episode])
+        if entry is None:
+            raw_force_missing.append(episode)
+        else:
+            raw_force_entries.append(entry)
+        weight_rows.append(weights_row(episode_index, episode, metadata))
         report = sync_reports[episode]
         sync_status = "legacy/index-aligned"
         if report is not None:
@@ -247,6 +469,45 @@ def convert(
     finalize = getattr(dataset, "finalize", None)
     if callable(finalize):
         finalize()
+
+    root_path = Path(dataset.root)
+    meta_directory = root_path / "meta"
+    meta_directory.mkdir(parents=True, exist_ok=True)
+    with (meta_directory / "episode_weights.jsonl").open("w", encoding="utf-8") as handle:
+        for row in weight_rows:
+            handle.write(json.dumps(row) + "\n")
+    raw_force_report = {
+        "episodes_total": len(episodes),
+        "episodes_with_raw_force": len(raw_force_entries),
+        "episodes_without_raw_force": [path.name for path in raw_force_missing],
+        "alignment_tolerance_nm": ALIGNMENT_TOLERANCE_NM,
+        "episodes": raw_force_entries,
+    }
+    (meta_directory / "raw_force_report.json").write_text(
+        json.dumps(raw_force_report, indent=2) + "\n", encoding="utf-8"
+    )
+
+    # Must run before the upload so the Hub copy carries the portable tag.
+    rewritten = restore_sequence_feature_tags(root_path)
+    print(f"Rewrote the parquet feature tag to 'Sequence' in {len(rewritten)} files for datasets 3.x readers.")
+
+    with_weights = sum(1 for row in weight_rows if row["poured_g"] is not None)
+    print(
+        f"Raw force: {len(raw_force_entries)} of {len(episodes)} episodes "
+        f"(weights present on {with_weights} of {len(weight_rows)})."
+    )
+    if raw_force_entries:
+        rates = [entry["raw_rate_hz"] for entry in raw_force_entries]
+        gaps = [entry["max_gap_ms"] for entry in raw_force_entries]
+        worst = max(entry["alignment_max_abs_diff_nm"] for entry in raw_force_entries)
+        print(
+            f"  rate {min(rates):.1f}-{max(rates):.1f} Hz, largest gap {max(gaps):.1f} ms, "
+            f"worst alignment error {worst:.3g} Nm"
+        )
+    if raw_force_missing:
+        joined = "\n  ".join(path.name for path in raw_force_missing)
+        print(f"  no raw force (recorded before it was captured):\n  {joined}")
+
     if push:
         dataset.push_to_hub(
             tags=["droid", "fr3", "pi05", "lerobot"],

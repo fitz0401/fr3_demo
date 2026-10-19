@@ -85,6 +85,37 @@ def record_episode_weights(episode: Path, readings: dict[str, float]) -> dict[st
     return update_episode_metadata(episode, weights=weights)
 
 
+def override_episode_outcome(
+    episode: Path,
+    *,
+    poured_g: float,
+    spilled_g: float,
+    reason: str,
+) -> dict[str, Any]:
+    """Replace a reviewed episode's derived pour outcome, keeping the readings.
+
+    A scale reading can be wrong in a way the arithmetic then propagates: a cup
+    that reads 4 g light turns into a negative pour and a phantom spill. When
+    review establishes what actually happened, only the derived values are
+    replaced. The four readings stay exactly as the operator entered them and
+    the superseded values are kept alongside the reason, so a corrected episode
+    is never presented as a clean measurement.
+    """
+
+    metadata = json.loads((episode / "metadata.json").read_text(encoding="utf-8"))
+    weights = dict(metadata.get("weights") or {})
+    if not weights:
+        raise RuntimeError(f"Episode has no weights to correct: {episode}")
+    if "measured_poured_g" not in weights:
+        weights["measured_poured_g"] = weights.get("poured_g")
+        weights["measured_spilled_g"] = weights.get("spilled_g")
+    weights["poured_g"] = float(poured_g)
+    weights["spilled_g"] = float(spilled_g)
+    weights["outcome_source"] = "manual_review"
+    weights["outcome_reason"] = reason
+    return update_episode_metadata(episode, weights=weights)
+
+
 def update_episode_metadata(episode: Path, **fields: Any) -> dict[str, Any]:
     """Atomically merge fields into a finalized episode's metadata."""
 
