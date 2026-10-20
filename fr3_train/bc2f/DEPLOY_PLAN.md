@@ -55,13 +55,19 @@ cd <fr3_demo> && git fetch origin && git checkout deploy/bc2f-v5 && pip install 
 
 ### 第 1 步：把权重拷到 GPU 机（操作员，需要 CINECA 登录凭证）
 
-每个目录约 6 GB（`params/`、`assets/` 下的归一化统计、`force_model.json`、`golden.npz`、`BUNDLE.json`），
-**整个目录**拷过去，`force_model.json` 缺了服务会拒绝启动：
+每个目录约 6.4 GB（`params/`、`assets/` 下的归一化统计、`force_model.json`、`golden.npz`、`BUNDLE.json`），
+**整个目录**拷过去，`force_model.json` 缺了服务会拒绝启动。做法：在自己电脑上刷新 CINECA 证书，用 `ssh -A` 登录
+GPU 机（把证书转发过去），再在 GPU 机上直接从 Leonardo 拉（经自己电脑用 tar 管道中转的方式试过不行）：
 
 ```bash
+# 自己电脑上
+step ssh login '<CINECA 邮箱>' --provisioner cineca-hpc
+ssh -A <用户名>@<GPU 机>
+# GPU 机上（ssh-add -l 应能看到 CINECA 证书）
 for m in pi05_bc2f_vanilla_s0_14999 pi05_bc2f_moddrop_s0_14999 pi05_bc2f_moddrop_prop_s0_14999; do
-  rsync -av --progress ydu00001@login.leonardo.cineca.it:/leonardo_scratch/large/userexternal/ydu00001/openpi/deploy/$m /mnt/data/yurui/models/
+  rsync -a --info=progress2 ydu00001@data.leonardo.cineca.it:/leonardo_scratch/large/userexternal/ydu00001/openpi/deploy/$m /mnt/data/yurui/models/
 done
+du -sb --apparent-size /mnt/data/yurui/models/pi05_bc2f_*_s0_14999   # 6442772399 / 6442765294 / 6442754821
 ```
 
 ### 第 2 步：GPU 端自检并启动（GPU 机上的 Claude）
