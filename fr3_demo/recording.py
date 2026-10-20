@@ -26,6 +26,9 @@ RAW_SCHEMA_VERSION = 3
 # DROID stores every view at this size and the LeRobot conversion resizes to it,
 # so recording larger only costs disk.
 DEFAULT_IMAGE_SIZE = (320, 180)
+# Rate at which arm samples are fed to the clock mapper, independent of the
+# polling rate: the affine fit needs a long time span, not many points.
+ARM_CLOCK_SAMPLE_HZ = 60.0
 # Measured on this rig at quality 92: JPEG bytes scale with pixel count.
 BYTES_PER_PIXEL = 0.40
 
@@ -52,6 +55,44 @@ def require_free_space(path: Path, minimum_bytes: int) -> int:
             f"another disk, or lower --min-free-gb."
         )
     return free
+
+
+# Readings the operator takes around one pour, in the order they are taken.
+WEIGHT_READINGS: tuple[tuple[str, str], ...] = (
+    ("bottle_before_g", "bottle before the pour"),
+    ("cup_before_g", "cup before the pour"),
+    ("bottle_after_g", "bottle after the pour, back in place"),
+    ("cup_after_g", "cup after the pour"),
+)
+
+
+def record_episode_weights(episode: Path, readings: dict[str, float]) -> dict[str, Any]:
+    """Store the operator's scale readings and what they imply, in grams.
+
+    Weighing the bottle as well as the cup separates the two failure modes the
+    deployment plan distinguishes: liquid that reached the cup, and liquid that
+    left the bottle without reaching it.
+    """
+
+    weights: dict[str, Any] = {"unit": "g", "source": "operator_scale"}
+    weights.update({key: float(value) for key, value in readings.items() if value is not None})
+    cup_before, cup_after = weights.get("cup_before_g"), weights.get("cup_after_g")
+    bottle_before, bottle_after = weights.get("bottle_before_g"), weights.get("bottle_after_g")
+    if cup_before is not None and cup_after is not None:
+        weights["poured_g"] = cup_after - cup_before
+        if bottle_before is not None and bottle_after is not None:
+            weights["spilled_g"] = (bottle_before - bottle_after) - weights["poured_g"]
+    return update_episode_metadata(episode, weights=weights)
+
+
+def update_episode_metadata(episode: Path, **fields: Any) -> dict[str, Any]:
+    """Atomically merge fields into a finalized episode's metadata."""
+
+    path = episode / "metadata.json"
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    metadata.update(fields)
+    _write_json(path, metadata)
+    return metadata
 
 
 def estimated_bytes_per_frame(image_sizes: list[tuple[int, int]]) -> float:
@@ -258,6 +299,7 @@ class RawEpisodeWriter:
         self._joint_positions: list[np.ndarray] = []
         self._joint_velocities: list[np.ndarray] = []
         self._joint_torques: list[np.ndarray] = []
+        self._raw_force: list[RobotSample] = []
         self._action_joint_velocities: list[np.ndarray] = []
         self._action_joint_timestamps: list[float] = []
         self._gripper_positions: list[float] = []
@@ -296,6 +338,12 @@ class RawEpisodeWriter:
                 "source": "franka_tau_J",
                 "unit": "Nm",
                 "frame": "joint",
+                "raw_field": "raw_force_joint_torque",
+                "raw_note": (
+                    "Every arm sample taken during the episode, on its own timeline. "
+                    "The rate is the sampler's polling rate, not the controller's 1 kHz: "
+                    "bamboo serves state by request/reply with no subscription."
+                ),
             },
             "camera_transforms": transforms,
             "language_instruction": None,
@@ -408,6 +456,16 @@ class RawEpisodeWriter:
             "clock_estimates": self._clock_estimates,
         }
 
+    def set_raw_force(self, samples: list[RobotSample]) -> None:
+        """Record every arm sample taken during the episode, not just the grid.
+
+        The 15 Hz columns are interpolated for training; this keeps the force
+        signal at the rate the sampler actually achieved so offline analysis is
+        not limited by that interpolation.
+        """
+
+        self._raw_force = samples
+
     def finish(self, clock_estimates: dict[str, Any] | None = None) -> Path:
         if self.frame_count < 2:
             raise RuntimeError("An episode needs at least two synchronized frames")
@@ -427,6 +485,22 @@ class RawEpisodeWriter:
             "action_gripper_position": np.asarray(self._action_gripper_positions, dtype=np.float32)[:, None],
             "action_gripper_host_timestamp": np.asarray(self._action_gripper_timestamps, dtype=np.float64),
         }
+        # Unsampled force: one row per arm sample, on its own timeline. These
+        # arrays are a different length from the 15 Hz columns above.
+        if self._raw_force:
+            trajectory["raw_force_joint_torque"] = np.stack([s.tau_J for s in self._raw_force])
+            # qpos at the same instants, so gravity/dynamics terms can be
+            # computed offline without interpolating back onto this timeline.
+            trajectory["raw_force_joint_position"] = np.stack([s.qpos for s in self._raw_force])
+            trajectory["raw_force_robot_timestamp"] = np.asarray(
+                [s.controller_timestamp for s in self._raw_force], dtype=np.float64
+            )
+            trajectory["raw_force_request_send_timestamp"] = np.asarray(
+                [s.request_send_monotonic for s in self._raw_force], dtype=np.float64
+            )
+            trajectory["raw_force_response_receive_timestamp"] = np.asarray(
+                [s.response_receive_monotonic for s in self._raw_force], dtype=np.float64
+            )
         for key, values in self._robot_timing.items():
             trajectory[key] = np.asarray(values, dtype=np.float64)
         for key, values in self._gripper_timing.items():
@@ -588,15 +662,22 @@ class DemoCollector:
         self._threads: list[threading.Thread] = []
         self._writer: RawEpisodeWriter | None = None
         self._error: BaseException | None = None
-        self._arm_samples: deque[RobotSample] = deque(maxlen=max(300, int(robot_sample_hz * 10)))
+        # Alignment reaches back only one alignment delay, so hold a couple of
+        # seconds. Sizing this by sample count instead would make every
+        # interpolation scan 10 s of history once the sampler runs at 1 kHz.
+        self._arm_samples: deque[RobotSample] = deque(maxlen=max(300, int(robot_sample_hz * 2)))
         self._gripper_samples: deque[GripperSample] = deque(maxlen=max(150, int(gripper_sample_hz * 10)))
-        self._arm_clock = AffineClockMapper(max_samples=max(300, int(robot_sample_hz * 20)))
+        # Clock drift is fitted over a long window of sparse samples, so the
+        # mapper is fed at ARM_CLOCK_SAMPLE_HZ no matter how fast we poll: its
+        # percentile fit would otherwise cost milliseconds per call at 1 kHz.
+        self._arm_clock = AffineClockMapper(max_samples=int(ARM_CLOCK_SAMPLE_HZ * 20))
         now = time.monotonic()
         self._joint_actions: deque[ActionSample] = deque(
             [ActionSample(np.zeros(7, dtype=np.float32), now)], maxlen=3000
         )
         self._gripper_actions: deque[ActionSample] = deque([ActionSample(0.0, now)], maxlen=1000)
         self._frame_observer: Callable[[dict[str, CameraFrame]], None] | None = None
+        self._raw_force: list[RobotSample] | None = None
 
     @staticmethod
     def _recorded_image_sizes(
@@ -659,6 +740,8 @@ class DemoCollector:
                 raise RuntimeError("Arm-state buffer is not ready")
             if self.enable_gripper and not self._gripper_samples:
                 raise RuntimeError("Gripper-state buffer is not ready")
+        with self._sensor_lock:
+            self._raw_force = []
         with self._lock:
             if self._writer is not None:
                 raise RuntimeError("An episode is already recording")
@@ -694,7 +777,10 @@ class DemoCollector:
             self._writer = None
         if writer is None:
             raise RuntimeError("No episode is recording")
+        with self._sensor_lock:
+            raw_force, self._raw_force = self._raw_force or [], None
         try:
+            writer.set_raw_force(raw_force)
             return writer.finish(self._clock_estimates())
         except Exception as error:
             writer.abort(str(error))
@@ -751,6 +837,8 @@ class DemoCollector:
 
             client = BambooFrankaClient(server_ip=self.server_ip, control_port=self.control_port, enable_gripper=False)
             period = 1.0 / self.robot_sample_hz
+            clock_period = 1.0 / ARM_CLOCK_SAMPLE_HZ
+            next_clock_sample = 0.0
             while not self._stop.is_set():
                 started = time.monotonic()
                 state = client.get_joint_states()
@@ -770,12 +858,16 @@ class DemoCollector:
                 midpoint = (started + received) * 0.5
                 with self._sensor_lock:
                     if not self._arm_samples or sample.controller_timestamp > self._arm_samples[-1].controller_timestamp:
-                        self._arm_clock.add(
-                            sample.controller_timestamp,
-                            midpoint,
-                            uncertainty=(received - started) * 0.5,
-                        )
+                        if midpoint >= next_clock_sample:
+                            self._arm_clock.add(
+                                sample.controller_timestamp,
+                                midpoint,
+                                uncertainty=(received - started) * 0.5,
+                            )
+                            next_clock_sample = midpoint + clock_period
                         self._arm_samples.append(sample)
+                        if self._raw_force is not None:
+                            self._raw_force.append(sample)
                 self._arm_ready.set()
                 remaining = period - (time.monotonic() - started)
                 if remaining > 0:

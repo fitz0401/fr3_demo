@@ -21,6 +21,33 @@ def episode_metadata_paths(data_dir: Path) -> list[Path]:
     )
 
 
+def _annotate_weights(path: Path, metadata: dict, args: argparse.Namespace) -> bool:
+    """Ask for the scale readings the operator took around one pour."""
+
+    from fr3_demo.recording import WEIGHT_READINGS, record_episode_weights
+
+    existing = metadata.get("weights")
+    if existing and not args.replace:
+        print(f"{path.parent}: {existing} (kept)")
+        return False
+    readings: dict[str, float] = {}
+    for key, label in WEIGHT_READINGS:
+        answer = input(f"{path.parent.name} - {label} in grams (blank to skip): ").strip()
+        if not answer:
+            continue
+        try:
+            readings[key] = float(answer)
+        except ValueError:
+            print("  not a number; skipped")
+    if not readings:
+        return False
+    weights = record_episode_weights(path.parent, readings)["weights"]
+    # Keep the caller's copy in step; it is rewritten when the language is set.
+    metadata["weights"] = weights
+    print(f"{path.parent}: {weights}")
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Add language instructions to raw FR3 demonstration episodes.")
     parser.add_argument(
@@ -43,6 +70,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="replace existing non-empty annotations; with --all, replace every episode from one prompt",
     )
+    parser.add_argument(
+        "--weights",
+        action="store_true",
+        help="also ask for the bottle and cup scale readings in grams for each episode",
+    )
     args = parser.parse_args(argv)
 
     paths = episode_metadata_paths(args.data_dir)
@@ -60,8 +92,11 @@ def main(argv: list[str] | None = None) -> int:
             shared_instruction = input(f"Language for {target} (blank to skip): ").strip()
 
     updated = 0
+    weighed = 0
     for path in paths:
         metadata = json.loads(path.read_text(encoding="utf-8"))
+        if args.weights:
+            weighed += _annotate_weights(path, metadata, args)
         existing = str(metadata.get("language_instruction") or "").strip()
         if existing and not args.replace:
             print(f"{path.parent}: {existing!r} (kept)")
@@ -80,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{path.parent}: {instruction!r}")
         updated += 1
 
+    if args.weights:
+        print(f"Recorded weights for {weighed} of {len(paths)} episodes.")
     print(f"Updated {updated} of {len(paths)} episode annotations.")
     return 0
 
