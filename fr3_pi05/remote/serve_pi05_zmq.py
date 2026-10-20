@@ -156,6 +156,7 @@ def load_policy(
     tasks: list[str] | None = None,
     use_exterior2: bool = False,
     bluecup_loader_path: str | None = None,
+    bc2f_loader_path: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Load OpenPI lazily so protocol tests do not need the GPU stack."""
 
@@ -274,6 +275,51 @@ def load_policy(
             "fault_keys": ["fault/absent_cameras", "fault/black_cameras", "fault/force"],
             "fault_force_modes": list(module.FORCE_MODES),
         }
+    if loader == "bc2f":
+        loader_path = (
+            Path(bc2f_loader_path)
+            if bc2f_loader_path is not None
+            else Path(__file__).resolve().parents[2] / "fr3_train" / "serve_bc2f.py"
+        )
+        if not loader_path.is_file():
+            raise RuntimeError(f"bc2f checkpoint loader is missing: {loader_path}")
+        module_name = "fr3_pi05_deployed_bc2f"
+        spec = importlib.util.spec_from_file_location(module_name, loader_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Cannot import bc2f checkpoint loader: {loader_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        resolved_asset_id = asset_id or module.DEFAULT_ASSET_ID
+        bundle = {}
+        bundle_path = Path(checkpoint) / "BUNDLE.json"
+        if bundle_path.is_file():
+            bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        policy = module.build_policy(checkpoint, resolved_asset_id)
+        history_lags = list(module.STATE_HISTORY_LAGS)
+        num_frames = int(module.NUM_STATE_FRAMES)
+        return policy, {
+            "model": "pi05_bc2f",
+            # Which of the released weights is loaded (vanilla / moddrop / moddrop_prop); trial logs record it.
+            "bundle_model": bundle.get("model", Path(checkpoint).name),
+            "bundle_step": bundle.get("step"),
+            "action_horizon": 16,
+            "state_history_lags": history_lags,
+            "proprio_history_offsets": [0, *history_lags],
+            "num_state_frames": num_frames,
+            "joint_observation_shape": [num_frames, 7],
+            "gripper_observation_shape": [num_frames],
+            "image_observation_shape": [180, 320, 3],
+            "joint_observation_dim": num_frames * 7,
+            "gripper_observation_dim": num_frames,
+            "asset_id": resolved_asset_id,
+            "tasks": list(tasks or module.TASKS),
+            "uses_exterior2": True,
+            "requires_raw_force": True,
+            "raw_force_columns": ["time_sec", *[f"q{j}" for j in range(1, 8)], *[f"tau_J{j}" for j in range(1, 8)]],
+            "raw_force_window_s": module.force_features.WINDOW_S,
+            "camera_keys": list(module.CAMERA_SLOTS),
+        }
     if loader != "official":
         raise ValueError(f"Unknown policy loader: {loader}")
     try:
@@ -294,6 +340,7 @@ def warm_up(
     action_horizon: int | None = None,
     use_exterior2: bool = False,
     joint_torque: bool = False,
+    raw_force: bool = False,
 ) -> float:
     """Compile one inference before exposing the network endpoint."""
 
@@ -317,6 +364,14 @@ def warm_up(
         observation["observation/exterior_image_2_left"] = np.zeros(image_shape, dtype=np.uint8)
     if joint_torque:
         observation["observation/joint_torque"] = np.zeros(7, dtype=np.float32)
+    if raw_force:
+        # A still arm at the warm-up pose, polled at 860 Hz for 128 ms (bc2f_force reads the raw stream).
+        stamps = 100.0 - np.arange(110)[::-1] / 860.0
+        torque = np.array([0.02, -6.426, -0.308, 23.925, 0.588, 2.438, -0.165])  # still home, empty gripper
+        observation["observation/raw_force"] = np.concatenate(
+            [stamps[:, None], np.tile(current_joints, (len(stamps), 1)), np.tile(torque, (len(stamps), 1))], axis=1
+        )
+        observation["observation/robot_timestamp"] = 100.0
     started = time.monotonic()
     result = policy.infer(observation)
     actions = np.asarray(result.get("actions")) if isinstance(result, dict) else np.empty(0)
@@ -360,11 +415,12 @@ def main() -> int:
     parser.add_argument("--bind-host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--config-name", default="pi05_droid")
-    parser.add_argument("--loader", choices=("official", "custom_droid", "wine", "bluecup"), default="official")
+    parser.add_argument("--loader", choices=("official", "custom_droid", "wine", "bluecup", "bc2f"), default="official")
     parser.add_argument("--checkpoint", required=True, help="existing local checkpoint directory; never downloaded here")
     parser.add_argument("--default-prompt")
     parser.add_argument("--wine-loader-path")
     parser.add_argument("--bluecup-loader-path")
+    parser.add_argument("--bc2f-loader-path")
     parser.add_argument("--asset-id", help="checkpoint normalization asset ID, for example owner/dataset")
     parser.add_argument("--tasks-json", help="optional JSON array restricting accepted language instructions")
     parser.add_argument(
@@ -417,6 +473,7 @@ def main() -> int:
         tasks,
         args.use_exterior2,
         args.bluecup_loader_path,
+        args.bc2f_loader_path,
     )
     metadata = dict(getattr(policy, "metadata", {}) or {})
     metadata.update(loader_metadata)
@@ -433,6 +490,7 @@ def main() -> int:
             int(loader_metadata["action_horizon"]) if "action_horizon" in loader_metadata else None,
             bool(loader_metadata.get("uses_exterior2", False)),
             bool(loader_metadata.get("requires_joint_torque", False)),
+            bool(loader_metadata.get("requires_raw_force", False)),
         )
         metadata["warmup_ms"] = warmup_ms
         LOG.info("policy warm-up complete in %.1f ms", warmup_ms)

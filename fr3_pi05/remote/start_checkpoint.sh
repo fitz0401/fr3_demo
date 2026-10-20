@@ -12,6 +12,7 @@ Profiles:
   custom_droid custom DROID contract   (port 8001)
   wine_hybrid  FR3 wine contract       (port 8002)
   bluecup_force FR3 blue-cup force/dropout contract (port 8003)
+  bc2f_force   FR3 blue-cup scope-v5 contract: raw 1 kHz force stream (port 8004)
 
 Optional environment overrides:
   CUDA_VISIBLE_DEVICES, FR3_GPU_INDEX, OPENPI_DIR, FR3_DEMO_DIR, PORT,
@@ -30,7 +31,7 @@ fi
 
 if [ "$#" -eq 1 ]; then
   case "$1" in
-    pi05_droid|custom_droid|wine_hybrid|bluecup_force)
+    pi05_droid|custom_droid|wine_hybrid|bluecup_force|bc2f_force)
       PROFILE=$1
       CHECKPOINT=
       ;;
@@ -68,6 +69,13 @@ case "$PROFILE" in
     OPENPI_DIR=${OPENPI_DIR:-$HOME/openpi_wine}
     # One of pi05_bluecup_{flag_10500,moddrop_14999,alloc_fixed_14500}; restart to switch models.
     CHECKPOINT=${CHECKPOINT:-/mnt/data/yurui/models/pi05_bluecup_alloc_fixed_14500}
+    ;;
+  bc2f_force)
+    PORT=${PORT:-8004}
+    # Same checkout as wine: OpenPI 15a9616 + fr3_train/deploy.patch.
+    OPENPI_DIR=${OPENPI_DIR:-$HOME/openpi_wine}
+    # One of pi05_bc2f_{vanilla,moddrop,moddrop_prop}_s0_14999; restart to switch models.
+    CHECKPOINT=${CHECKPOINT:-/mnt/data/yurui/models/pi05_bc2f_moddrop_s0_14999}
     ;;
   *)
     echo "Unknown profile: $PROFILE" >&2

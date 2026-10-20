@@ -10,6 +10,10 @@ is recorded automatically.
     fr3-pi05-trials record  --session r1 --trial 7 --rollout-log trials/r1/logs/7.json
     fr3-pi05-trials summary --session r1 --target-g 120 --tolerance-g 15
 
+Scope-v5 round (fr3_train/bc2f/DEPLOY_PLAN.md): models bc2f_vanilla / bc2f_moddrop / bc2f_moddrop_prop, condition
+"none" only (every input present), no target amount: success = at least --min-poured-g in the cup, spill within
+--spill-tolerance-g, ended by the operator (Back) after the bottle is back and released.
+
 Weights (grams): tare the empty cup on the scale before the trial (cup_before = 0) and weigh the
 bottle while refilling it to its start level (bottle_before). After the rollout and ~3 s of
 settling read the cup (cup_after) and weigh the bottle again (bottle_after). Then
@@ -49,7 +53,20 @@ MODEL_CHECKPOINTS = {
     "flag": "pi05_bluecup_flag_10500",
     "moddrop": "pi05_bluecup_moddrop_14999",
     "alloc_fixed": "pi05_bluecup_alloc_fixed_14500",
+    "bc2f_vanilla": "pi05_bc2f_vanilla_s0_14999",
+    "bc2f_moddrop": "pi05_bc2f_moddrop_s0_14999",
+    "bc2f_moddrop_prop": "pi05_bc2f_moddrop_prop_s0_14999",
 }
+
+
+def model_profile(model: str) -> str:
+    """Runner/server contract profile of a scheduled model."""
+    return "bc2f_force" if model.startswith("bc2f_") else "bluecup_force"
+
+
+def bundle_model_name(model: str) -> str:
+    """The `model` field of the bundle's BUNDLE.json, as the server reports it (directory name without the step)."""
+    return MODEL_CHECKPOINTS[model].rsplit("_", 1)[0]
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -184,7 +201,7 @@ def next_trial(schedule: list[dict[str, str]], results: list[dict[str, str]]) ->
 
 
 def classify(poured: float | None, spilled: float | None, log: dict[str, Any], target: float | None,
-             tolerance: float, spill_tolerance: float) -> str:
+             tolerance: float, spill_tolerance: float, minimum: float | None = None) -> str:
     reason = log.get("end_reason")
     if reason == "error":
         return "error"
@@ -198,6 +215,10 @@ def classify(poured: float | None, spilled: float | None, log: dict[str, Any], t
         if poured > target + tolerance:
             return "over"
         return "success" if reason in (None, "completed", "operator_stop") else "abort"
+    if poured is not None and minimum is not None:
+        if reason not in (None, "completed", "operator_stop"):
+            return "abort"
+        return "under" if poured < minimum else "success"
     return "abort" if reason not in (None, "completed", "operator_stop") else "other"
 
 
@@ -269,6 +290,8 @@ def summarize(results: list[dict[str, str]], target: float | None, tolerance: fl
 
 
 def runner_command(row: dict[str, str], prompt: str, log_path: Path, pour_deg: float) -> str:
+    if model_profile(row["model"]) == "bc2f_force":
+        return f"fr3-pi05-run --checkpoint bc2f_force --prompt '{prompt}' --execute --trial-log {log_path}"
     return (f"fr3-pi05-run --checkpoint bluecup_force --prompt '{prompt}' --execute "
             f"--fault {row['preset']} --fault-trigger {row['trigger']} --pour-deg {pour_deg:g} "
             f"--trial-log {log_path}")
@@ -304,6 +327,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--target-g", type=float)
     p.add_argument("--tolerance-g", type=float, default=15.0)
     p.add_argument("--spill-tolerance-g", type=float, default=5.0)
+    p.add_argument("--min-poured-g", type=float,
+                   help="without --target-g: success needs at least this much in the cup (scope-v5 round: 20)")
     p.add_argument("--outcome", choices=OUTCOMES, help="override the automatic classification")
     p.add_argument("--notes", default="")
 
@@ -328,6 +353,8 @@ def main(argv: list[str] | None = None) -> int:
         bad = [c for c in args.conditions if c not in FAULT_PRESETS]
         if bad:
             parser.error(f"unknown condition(s) {bad}; expected some of {sorted(FAULT_PRESETS)}")
+        if any(model_profile(m) == "bc2f_force" for m in args.models) and args.conditions != ["none"]:
+            parser.error("bc2f models take every input at deployment: use --conditions none")
         rows = make_schedule(args.models, args.conditions, args.reps, args.block_reps, args.seed, args.trigger)
         _write_csv(schedule_path, SCHEDULE_FIELDS, rows)
         blocks = len({r["block"] for r in rows})
@@ -343,7 +370,7 @@ def main(argv: list[str] | None = None) -> int:
         current = next((r for r in schedule if r["trial_id"] == row["trial_id"]), row)
         previous = [r for r in schedule if r["trial_id"] in {x["trial_id"] for x in results}]
         if not previous or previous[-1]["model"] != current["model"]:
-            print(f">>> (re)start the GPU server: start_checkpoint.sh bluecup_force "
+            print(f">>> (re)start the GPU server: start_checkpoint.sh {model_profile(current['model'])} "
                   f"/mnt/data/yurui/models/{MODEL_CHECKPOINTS[current['model']]}")
         log_path = directory / "logs" / f"{row['trial_id']}.json"
         print(f"trial {row['trial_id']}: model={row['model']} condition={row['preset']} trigger={row['trigger']} rep={row['rep']}")
@@ -366,7 +393,8 @@ def main(argv: list[str] | None = None) -> int:
         bottle_after = _weight(args.bottle_after, "bottle after", args.scale_port)
         poured = cup_after - cup_before if cup_after is not None and cup_before is not None else None
         spilled = (bottle_before - bottle_after) - poured if None not in (bottle_before, bottle_after, poured) else None
-        outcome = args.outcome or classify(poured, spilled, log, args.target_g, args.tolerance_g, args.spill_tolerance_g)
+        outcome = args.outcome or classify(poured, spilled, log, args.target_g, args.tolerance_g, args.spill_tolerance_g,
+                                           args.min_poured_g)
         pour = log.get("pour", {})
         results.append({
             **{k: row[k] for k in ("trial_id", "model", "preset", "trigger", "rep")},
@@ -382,9 +410,9 @@ def main(argv: list[str] | None = None) -> int:
         })
         if log and log.get("fault_preset") not in (None, row["preset"]):
             print(f"WARNING: rollout log says fault {log.get('fault_preset')!r}, schedule says {row['preset']!r}")
-        if log and log.get("server_model") and MODEL_CHECKPOINTS[row["model"]] not in str(log.get("server_model")) \
-                and row["model"] not in str(log.get("server_model")):
-            print(f"WARNING: server reported model {log.get('server_model')!r}, schedule says {row['model']!r}")
+        if log and log.get("server_model") and str(log.get("server_model")) != bundle_model_name(row["model"]):
+            print(f"WARNING: server reported model {log.get('server_model')!r}, schedule says {row['model']!r} "
+                  f"({bundle_model_name(row['model'])})")
         _write_csv(results_path, RESULT_FIELDS, results)
         print(f"trial {args.trial}: outcome={outcome} poured={poured} spilled={spilled} -> {results_path}")
         return 0

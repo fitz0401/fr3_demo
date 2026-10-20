@@ -6,7 +6,7 @@ import queue
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -98,12 +98,17 @@ def build_droid_observation(
     exterior2_image: np.ndarray | None = None,
     joint_torque: np.ndarray | None = None,
     fault: dict[str, Any] | None = None,
+    raw_force: np.ndarray | None = None,
+    robot_timestamp: float | None = None,
 ) -> dict[str, Any]:
     """Build the exact observation dictionary expected by ``pi05_droid``.
 
     ``joint_torque`` (measured tau_J, 7 values, Nm) is required by the bluecup_force checkpoints and
     ignored by the others. ``fault`` holds the optional ``fault/...`` keys understood by
     fr3_train/serve_bluecup.py (see fr3_pi05/faults.py); it is passed through unchanged.
+    ``raw_force`` ([N, 15] = Bamboo time_sec, q, tau_J of every polled arm sample, fr3_pi05/raw_force.py) and
+    ``robot_timestamp`` (time_sec of the state sent as the current joints) are required together by the
+    bc2f_force checkpoints (fr3_train/serve_bc2f.py).
     """
 
     joints = np.asarray(joint_position, dtype=np.float32)
@@ -138,6 +143,17 @@ def build_droid_observation(
         if unknown:
             raise ValueError(f"Fault fields must start with 'fault/': {unknown}")
         observation.update(fault)
+    if (raw_force is None) != (robot_timestamp is None):
+        raise ValueError("raw_force and robot_timestamp must be sent together")
+    if raw_force is not None:
+        raw = np.asarray(raw_force, dtype=np.float64)
+        if raw.ndim != 2 or raw.shape[1] != 15 or len(raw) < 2 or not np.all(np.isfinite(raw)):
+            raise ValueError("raw_force must be [N >= 2, 15] finite values: time_sec, q (7), tau_J (7)")
+        stamp = float(robot_timestamp)
+        if not np.isfinite(stamp):
+            raise ValueError("robot_timestamp must be finite")
+        observation["observation/raw_force"] = raw
+        observation["observation/robot_timestamp"] = stamp
     return observation
 
 
@@ -230,6 +246,11 @@ class InferenceResult:
     actions: np.ndarray
     requested_at: float
     completed_at: float
+    # Server-side extras worth logging (bc2f_force: the wrench window the model saw; timings).
+    info: dict[str, Any] = field(default_factory=dict)
+
+
+RESPONSE_INFO_KEYS = ("force", "server_timing", "policy_timing")
 
 
 class InferenceWorker:
@@ -291,7 +312,10 @@ class InferenceWorker:
             try:
                 response = self._policy.infer(observation)
                 result: InferenceResult | Exception = InferenceResult(
-                    validate_action_chunk(response, self._horizon), requested_at, time.monotonic()
+                    validate_action_chunk(response, self._horizon),
+                    requested_at,
+                    time.monotonic(),
+                    {key: response[key] for key in RESPONSE_INFO_KEYS if key in response},
                 )
             except Exception as error:  # noqa: BLE001 - propagate third-party websocket errors to control thread
                 result = error

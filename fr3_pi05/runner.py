@@ -21,6 +21,7 @@ from fr3_demo.joystick import LinuxJoystick
 from fr3_demo.kinematics import WorkspaceBounds, forward_kinematics
 from fr3_demo.settings import default_config_path, load_config, pi05_defaults
 from fr3_demo.teleop import HOME_JOINTS, BambooRobot, Mapping, stream_home
+from fr3_pi05.faults import PourDetector
 from fr3_pi05.policy import (
     DROID_CONTROL_HZ,
     WINE_HISTORY_OFFSETS,
@@ -32,9 +33,14 @@ from fr3_pi05.policy import (
     predict_joint_path,
     safe_joint_velocity,
 )
+from fr3_pi05.raw_force import RawForceSampler
+from fr3_pi05.trials import RolloutLogger
 
 LOG = logging.getLogger("fr3_pi05")
 WINE_ACTION_HORIZON = 16
+# Checkpoints trained on fr3_demo recordings at 15 Hz with the 0/45/75 proprio history, 16-step chunks executed
+# open loop, and the arm held still while the gripper moves (both the wine and the blue-cup demonstrations do).
+HISTORY_CHECKPOINTS = ("wine_hybrid", "bc2f_force")
 
 
 class WineHistorySampler:
@@ -190,7 +196,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--transport", choices=("zmq", "websocket"), default="zmq")
     parser.add_argument(
         "--checkpoint",
-        choices=("pi05_droid", "custom_droid", "wine_hybrid"),
+        choices=("pi05_droid", "custom_droid", "wine_hybrid", "bc2f_force"),
         default="pi05_droid",
     )
     parser.add_argument("--policy-host", default="10.38.32.253")
@@ -284,6 +290,11 @@ def _parser() -> argparse.ArgumentParser:
         help="print every received action chunk and its thresholded gripper decisions",
     )
     parser.add_argument("--execute", action="store_true", help="allow policy actions to reach Bamboo")
+    parser.add_argument(
+        "--trial-log",
+        type=Path,
+        help="write a per-rollout JSON (fr3_pi05.trials.RolloutLogger: end reason, pour detection, inferences)",
+    )
     return parser
 
 
@@ -313,7 +324,7 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
             args.policy_port = int(server_ports[args.checkpoint])
     if not args.external_camera_serial or not args.wrist_camera_serial:
         parser.error("both camera serial numbers are required in config.toml or on the command line")
-    if args.checkpoint == "wine_hybrid":
+    if args.checkpoint in HISTORY_CHECKPOINTS:
         # These are checkpoint contract values, not rollout tuning parameters.
         args.open_loop_horizon = WINE_ACTION_HORIZON
         args.prefetch_actions = 0
@@ -323,9 +334,9 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--offline is only supported with --check")
     if args.control_hz <= 0 or args.stream_hz < args.control_hz:
         parser.error("stream-hz must be at least control-hz, and both must be positive")
-    if args.checkpoint == "wine_hybrid" and not np.isclose(args.control_hz, DROID_CONTROL_HZ):
+    if args.checkpoint in HISTORY_CHECKPOINTS and not np.isclose(args.control_hz, DROID_CONTROL_HZ):
         parser.error(
-            f"wine_hybrid requires --control-hz {DROID_CONTROL_HZ:g} to match its demonstration history"
+            f"{args.checkpoint} requires --control-hz {DROID_CONTROL_HZ:g} to match its demonstration history"
         )
     if args.open_loop_horizon < 1 or not 0 <= args.prefetch_actions < args.open_loop_horizon:
         parser.error("prefetch-actions must be in [0, open-loop-horizon)")
@@ -374,7 +385,10 @@ def _build_camera_observation(
     joint_position: np.ndarray,
     gripper_position: float | np.ndarray,
     prompt: str,
+    raw_force: tuple[np.ndarray, float] | None = None,
 ) -> dict[str, Any]:
+    """``raw_force`` = (raw arm samples [N, 15], time_sec of the state sent as the current joints), bc2f_force only."""
+
     exterior2 = frames.get("exterior_image_2_left")
     return build_droid_observation(
         frames["exterior_image_left"].image,
@@ -383,7 +397,18 @@ def _build_camera_observation(
         gripper_position,
         prompt,
         exterior2_image=None if exterior2 is None else exterior2.image,
+        raw_force=None if raw_force is None else raw_force[0],
+        robot_timestamp=None if raw_force is None else raw_force[1],
     )
+
+
+def _raw_force_at(sampler: RawForceSampler | None, state: dict[str, Any]) -> tuple[np.ndarray, float] | None:
+    """The raw arm window for an observation whose current joints come from `state`."""
+
+    if sampler is None:
+        return None
+    stamp = float(state["time_sec"])
+    return sampler.window(stamp), stamp
 
 
 def _make_observation(
@@ -393,18 +418,58 @@ def _make_observation(
     prompt: str,
     max_camera_age: float,
     history: ProprioHistory | None = None,
+    raw_force_sampler: RawForceSampler | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], np.ndarray, dict[str, Any]]:
     frames = cameras.snapshot(max_camera_age)
     state, q = _state(robot)
     observation_joints: np.ndarray = q
     observation_gripper: float | np.ndarray = gripper.position
     if history is not None:
+        if raw_force_sampler is not None:
+            # The current history entry must be this state, whose time_sec stamps the force window.
+            history.append(q, gripper.position)
         observation_joints, observation_gripper = history.observation()
-    observation = _build_camera_observation(frames, observation_joints, observation_gripper, prompt)
+    observation = _build_camera_observation(
+        frames, observation_joints, observation_gripper, prompt, _raw_force_at(raw_force_sampler, state)
+    )
     return observation, frames, q, state
 
 
+def _validate_bc2f_contract(metadata: dict[str, Any]) -> None:
+    expected = {
+        "model": "pi05_bc2f",
+        "loader": "bc2f",
+        "action_horizon": WINE_ACTION_HORIZON,
+        "state_history_lags": [45, 75],
+        "num_state_frames": 3,
+        "joint_observation_shape": [3, 7],
+        "gripper_observation_shape": [3],
+        "image_observation_shape": [180, 320, 3],
+        "proprio_history_offsets": list(WINE_HISTORY_OFFSETS),
+        "uses_exterior2": True,
+        "requires_raw_force": True,
+    }
+    mismatches = [
+        f"{key}={metadata.get(key)!r} (expected {value!r})"
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "bc2f_force server does not advertise the required contract: "
+            + "; ".join(mismatches)
+            + ". Start it with start_checkpoint.sh bc2f_force <bundle> from this fr3_demo revision."
+        )
+    tasks = metadata.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        raise RuntimeError("bc2f_force server returned an invalid task allowlist")
+    print(f"bc2f_force server: model {metadata.get('bundle_model')} step {metadata.get('bundle_step')}")
+
+
 def _validate_policy_contract(checkpoint: str, metadata: dict[str, Any]) -> None:
+    if checkpoint == "bc2f_force":
+        _validate_bc2f_contract(metadata)
+        return
     if checkpoint != "wine_hybrid":
         return
     expected = {
@@ -504,6 +569,22 @@ def _wait_result(
             sleep_seconds = min(sleep_seconds, max(0.0, history_sampler.next_sample - time.monotonic()))
         time.sleep(sleep_seconds)
     raise RuntimeError(f"Timed out after {timeout:.0f}s waiting for pi0.5 inference")
+
+
+def _log_inference(trial_log: RolloutLogger, result: InferenceResult) -> None:
+    """Record one inference: latency and, for bc2f_force, the force window the model saw (mean over its bins)."""
+
+    timing = result.info.get("server_timing") or {}
+    trial_log.inference(float(timing.get("infer_ms", (result.completed_at - result.requested_at) * 1000.0)))
+    force = result.info.get("force")
+    if isinstance(force, dict) and "window" in force:
+        window = np.asarray(force["window"], dtype=float)
+        trial_log.event(
+            "force",
+            wrench_mean=np.round(window.mean(axis=0), 3).tolist(),
+            valid_fraction=float(force.get("valid_fraction", float("nan"))),
+            staleness_ms=round(float(force.get("staleness_ms", float("nan"))), 2),
+        )
 
 
 def _announce_execution(args: argparse.Namespace) -> None:
@@ -618,6 +699,11 @@ def run(args: argparse.Namespace) -> int:
     rviz: Any | None = None
     joystick: LinuxJoystick | None = None
     history_sampler: WineHistorySampler | None = None
+    raw_force_sampler: RawForceSampler | None = None
+    trial_log: RolloutLogger | None = None
+    pour_detector: PourDetector | None = None
+    end_reason = "error"
+    end_error: str | None = None
     stream_started = False
     stopped = threading.Event()
 
@@ -682,12 +768,34 @@ def run(args: argparse.Namespace) -> int:
             print(f"Server metadata keys: {', '.join(sorted(policy.metadata))}")
         _validate_policy_contract(args.checkpoint, policy.metadata)
         _validate_prompt(prompt, policy.metadata)
+        if args.trial_log is not None:
+            trial_log = RolloutLogger(
+                args.trial_log,
+                meta={
+                    "checkpoint_profile": args.checkpoint,
+                    "server_model": policy.metadata.get("bundle_model"),
+                    "bundle_step": policy.metadata.get("bundle_step"),
+                    "prompt": prompt,
+                    "execute": bool(args.execute),
+                    "max_joint_speed": args.max_joint_speed,
+                },
+            )
+            pour_detector = PourDetector(control_hz=args.control_hz)
         if not args.no_rviz:
             from fr3_pi05.visualization import RvizBridge
 
             rviz = RvizBridge(launch_rviz=not args.rviz_publish_only)
 
-        if args.checkpoint == "wine_hybrid":
+        if args.checkpoint == "bc2f_force":
+            from bamboo import BambooFrankaClient
+
+            raw_force_sampler = RawForceSampler(
+                lambda: BambooFrankaClient(server_ip=args.server_ip, control_port=args.control_port, enable_gripper=False)
+            ).start()
+            raw_force_sampler.wait_ready()
+            stats = raw_force_sampler.stats()
+            print(f"Raw force stream ready: {stats['rate_hz']:.0f} Hz, max gap {stats['max_gap_ms']:.1f} ms")
+        if args.checkpoint in HISTORY_CHECKPOINTS:
             history_sampler = WineHistorySampler(args.control_hz)
             history_sampler.fill(robot, gripper, stopped)
         observation, frames, q, _ = _make_observation(
@@ -697,6 +805,7 @@ def run(args: argparse.Namespace) -> int:
             prompt,
             args.max_camera_age,
             history_sampler.history if history_sampler is not None else None,
+            raw_force_sampler,
         )
         _validate_exterior2_contract(policy.metadata, observation)
         policy.submit(observation)
@@ -709,6 +818,8 @@ def run(args: argparse.Namespace) -> int:
         age = first.completed_at - first.requested_at
         if age > args.max_inference_age:
             raise RuntimeError(f"Initial inference was stale ({age:.2f}s > {args.max_inference_age:.2f}s)")
+        if trial_log is not None:
+            _log_inference(trial_log, first)
         chunk_sequence = 1
         if args.debug_chunks:
             _print_action_chunk(first.actions, chunk_sequence, "initial", args.gripper_threshold)
@@ -750,6 +861,7 @@ def run(args: argparse.Namespace) -> int:
                     )
                     time.sleep(0.1)
             print("CHECK PASSED. Bamboo streaming was not started; the robot did not move.")
+            end_reason = "check"
             return 0
 
         _announce_execution(args)
@@ -789,6 +901,7 @@ def run(args: argparse.Namespace) -> int:
                     snapshot = None
                 if snapshot is not None and snapshot.press_counts[Mapping().quit_button] != initial_back_count:
                     print("Back pressed; stopping.")
+                    end_reason = "operator_stop"
                     break
 
             result = policy.poll()
@@ -799,6 +912,8 @@ def run(args: argparse.Namespace) -> int:
                         f"Discarding stale inference ({inference_age:.2f}s > {args.max_inference_age:.2f}s)"
                     )
                 chunk_sequence += 1
+                if trial_log is not None:
+                    _log_inference(trial_log, result)
                 if args.debug_chunks:
                     _print_action_chunk(result.actions, chunk_sequence, "replan", args.gripper_threshold)
                 if action_chunk is None:
@@ -810,8 +925,13 @@ def run(args: argparse.Namespace) -> int:
                     raise RuntimeError("Received an unexpected extra policy chunk")
 
             if now >= next_control:
-                _, q = _state(robot)
+                if raw_force_sampler is not None:
+                    raw_force_sampler.check()
+                state, q = _state(robot)
                 gripper_position = gripper.position
+                if pour_detector is not None and trial_log is not None:
+                    pour_detector.update(q, gripper_position)
+                    trial_log.step(pour_detector.state(), False, gripper_position)
                 if history_sampler is not None:
                     history_sampler.append_control_sample(q, gripper_position, now)
                     observation_joints, observation_gripper = history_sampler.history.observation()
@@ -844,7 +964,7 @@ def run(args: argparse.Namespace) -> int:
                             f"model={gripper_value:.4f} -> {gripper_decision}; "
                             f"observed={gripper_position:.4f}; {command_status}"
                         )
-                    if args.checkpoint == "wine_hybrid" and gripper_started:
+                    if args.checkpoint in HISTORY_CHECKPOINTS and gripper_started:
                         # Demonstrations pause the arm during blocking gripper motion. Keep the
                         # Bamboo stream alive with zeros, discard this stale chunk, then replan.
                         desired_velocity = np.zeros(7)
@@ -882,7 +1002,11 @@ def run(args: argparse.Namespace) -> int:
                             and not policy.busy
                         ):
                             observation = _build_camera_observation(
-                                frames, observation_joints, observation_gripper, prompt
+                                frames,
+                                observation_joints,
+                                observation_gripper,
+                                prompt,
+                                _raw_force_at(raw_force_sampler, state),
                             )
                             _validate_exterior2_contract(policy.metadata, observation)
                             policy.submit(observation)
@@ -895,7 +1019,11 @@ def run(args: argparse.Namespace) -> int:
                     predicted = None
                     if not policy.busy:
                         observation = _build_camera_observation(
-                            frames, observation_joints, observation_gripper, prompt
+                            frames,
+                            observation_joints,
+                            observation_gripper,
+                            prompt,
+                            _raw_force_at(raw_force_sampler, state),
                         )
                         _validate_exterior2_contract(policy.metadata, observation)
                         policy.submit(observation)
@@ -932,11 +1060,21 @@ def run(args: argparse.Namespace) -> int:
             if remaining_sleep > 0:
                 time.sleep(min(remaining_sleep, 0.01))
 
+        if end_reason == "error":
+            end_reason = "interrupted" if stopped.is_set() else "timeout"
         return 0
-    except SafetyViolation:
+    except SafetyViolation as error:
         LOG.exception("Policy safety stop")
+        end_reason, end_error = "safety", str(error)
         return 2
+    except BaseException as error:
+        end_reason, end_error = "error", f"{type(error).__name__}: {error}"
+        raise
     finally:
+        if trial_log is not None:
+            trial_log.finish(end_reason, error=end_error)
+        if raw_force_sampler is not None:
+            raw_force_sampler.close()
         if stream_started and robot is not None:
             try:
                 robot.stream_velocity(np.zeros(7))
