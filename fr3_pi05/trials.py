@@ -11,8 +11,12 @@ is recorded automatically.
     fr3-pi05-trials summary --session r1 --target-g 120 --tolerance-g 15
 
 Scope-v5 round (fr3_train/bc2f/DEPLOY_PLAN.md): models bc2f_vanilla / bc2f_moddrop / bc2f_moddrop_prop, condition
-"none" only (every input present), no target amount: success = at least --min-poured-g in the cup, spill within
---spill-tolerance-g, ended by the operator (Back) after the bottle is back and released.
+"none" only (every input present), no target amount. The runner ends each rollout itself (--auto-stop) and
+records joints, gripper and the raw arm stream; ``record`` scores the stages with fr3_pi05.autoscore (grasp,
+lift, pour, place: completion 0-4, timings, drops, retries, placement error) and only asks for the weights.
+Outcome = the first thing that went wrong in task order (grasp_fail, drop, lift_fail, pour_fail, spill,
+place_fail, under), else success: all four stages, at least --min-poured-g in the cup, spill within
+--spill-tolerance-g.
 
 Weights (grams): tare the empty cup on the scale before the trial (cup_before = 0) and weigh the
 bottle while refilling it to its start level (bottle_before). After the rollout and ~3 s of
@@ -47,8 +51,17 @@ RESULT_FIELDS = (
     "gripper_closed_empty", "server_model", "bundle_step",
     "cup_before_g", "cup_after_g", "bottle_before_g", "bottle_after_g", "poured_g", "spilled_g",
     "outcome", "notes",
+    # fr3_pi05.autoscore (empty when the rollout left no per-step recording)
+    "completion", "stage_grasp", "stage_lift", "stage_pour", "stage_place", "drop",
+    "start_delay_s", "t_grasp_s", "t_lift_s", "t_pour_s", "t_release_s", "pour_s", "pour_bouts",
+    "grasp_attempts", "empty_closes", "longest_idle_s", "path_rad", "place_dz_cm", "place_xy_cm",
+    "held_mass_g", "max_hold_fz_N", "max_force_N", "force_available", "inference_ms_median",
 )
-OUTCOMES = ("success", "under", "over", "spill", "grasp_fail", "abort", "error", "other")
+OUTCOMES = ("success", "under", "over", "spill", "grasp_fail", "drop", "lift_fail", "pour_fail", "place_fail",
+            "abort", "error", "other")
+SCORE_FIELDS = ("start_delay_s", "t_grasp_s", "t_lift_s", "t_pour_s", "t_release_s", "pour_s", "pour_bouts",
+                "grasp_attempts", "empty_closes", "longest_idle_s", "path_rad", "held_mass_g", "max_hold_fz_N",
+                "max_force_N", "force_available")
 MODEL_CHECKPOINTS = {
     "flag": "pi05_bluecup_flag_10500",
     "moddrop": "pi05_bluecup_moddrop_14999",
@@ -69,6 +82,12 @@ def bundle_model_name(model: str) -> str:
     return MODEL_CHECKPOINTS[model].rsplit("_", 1)[0]
 
 
+def raw_arrays_path(log_path: Path) -> Path:
+    """Where a rollout's raw arm stream lives: <log stem>.raw.npz next to the JSON."""
+    log_path = Path(log_path)
+    return log_path.with_name(log_path.stem + ".raw.npz")
+
+
 # --------------------------------------------------------------------------------------------- #
 # Runner side: one JSON per rollout.
 # --------------------------------------------------------------------------------------------- #
@@ -78,10 +97,15 @@ class RolloutLogger:
 
     Runner integration:
         log = RolloutLogger(path, meta={...server metadata subset, fault preset/trigger, pour_deg...})
-        each control step:   log.step(detector.state(), fault_active, gripper_position)
+        each control step:   log.step(detector.state(), fault_active, gripper_position, q=q, time_sec=state["time_sec"])
         each inference:      log.inference(ms)
         notable events:      log.event("safety_violation", detail=str(error))
-        always, in finally:  log.finish(end_reason, error=None)   # completed | operator_abort | safety | timeout | error
+        always, in finally:  log.finish(end_reason, error=None, arrays={"raw_force": ...})
+
+    Steps given with ``q`` are also kept as arrays and written to ``<path stem>.npz`` (``steps_t`` s since the
+    start, ``steps_time_sec`` controller time, ``steps_q``, ``steps_gripper``, ``steps_tilt``, ``steps_pouring``;
+    ~0.3 MB, committed with the results); ``arrays`` passed to ``finish`` (the raw arm stream, ~10-20 MB) go to
+    ``<path stem>.raw.npz``, which stays on the workstation. fr3_pi05.autoscore scores the rollout from both.
     """
 
     path: Path
@@ -96,9 +120,18 @@ class RolloutLogger:
     _gripper_min: float = 1.0
     _inference_ms: list[float] = field(default_factory=list)
     _events: list[dict[str, Any]] = field(default_factory=list)
+    _rows: list[tuple] = field(default_factory=list)
+    _start_monotonic: float = field(default_factory=time.monotonic)
     _finished: bool = False
 
-    def step(self, detector_state: dict[str, Any] | None, fault_active: bool, gripper_position: float) -> None:
+    def step(self, detector_state: dict[str, Any] | None, fault_active: bool, gripper_position: float,
+             q: Any = None, time_sec: float | None = None) -> None:
+        if q is not None:
+            state = detector_state or {}
+            self._rows.append((time.monotonic() - self._start_monotonic,
+                               float("nan") if time_sec is None else float(time_sec),
+                               tuple(float(x) for x in q), float(gripper_position),
+                               float(state.get("tilt_deg", 0.0)), bool(state.get("pouring", False))))
         self._steps += 1
         self._fault_steps += int(bool(fault_active))
         self._gripper_min = min(self._gripper_min, float(gripper_position))
@@ -115,10 +148,38 @@ class RolloutLogger:
     def event(self, name: str, **detail: Any) -> None:
         self._events.append({"t": round(time.time() - self._start, 3), "event": name, **detail})
 
-    def finish(self, end_reason: str, error: str | None = None) -> dict[str, Any]:
+    def write_arrays(self, arrays: dict[str, Any] | None = None) -> Path | None:
+        """Write the per-step recording to <stem>.npz and `arrays` to <stem>.raw.npz; returns the steps file."""
+        import numpy as np
+
+        def save(target: Path, data: dict[str, Any]) -> None:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(target.name + ".tmp.npz")
+            np.savez_compressed(tmp, **data)
+            os.replace(tmp, target)
+
+        extra = {k: np.asarray(v) for k, v in (arrays or {}).items() if v is not None}
+        if extra:
+            save(raw_arrays_path(self.path), extra)
+        if not self._rows:
+            return None
+        t, time_sec, q, gripper, tilt, pouring = zip(*self._rows)
+        target = self.path.with_suffix(".npz")
+        save(target, {"steps_t": np.asarray(t), "steps_time_sec": np.asarray(time_sec), "steps_q": np.asarray(q),
+                      "steps_gripper": np.asarray(gripper), "steps_tilt": np.asarray(tilt),
+                      "steps_pouring": np.asarray(pouring, dtype=bool)})
+        return target
+
+    def finish(self, end_reason: str, error: str | None = None,
+               arrays: dict[str, Any] | None = None) -> dict[str, Any]:
         if self._finished:
             return {}
         self._finished = True
+        try:
+            arrays_path = self.write_arrays(arrays)
+        except Exception as write_error:  # noqa: BLE001 - the JSON must still be written
+            arrays_path = None
+            self.event("arrays_write_failed", detail=f"{type(write_error).__name__}: {write_error}")
         record = {
             **self.meta,
             "start_time": self._start,
@@ -134,6 +195,7 @@ class RolloutLogger:
             "gripper_closed_empty": self._gripper_min < self.closed_empty_below,
             "inference_ms_median": round(statistics.median(self._inference_ms), 1) if self._inference_ms else None,
             "inferences": len(self._inference_ms),
+            "arrays": arrays_path.name if arrays_path else None,
             "events": self._events,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -259,6 +321,58 @@ def _weight(value: float | None, label: str, port: str | None) -> float | None:
     return float(answer) if answer else None
 
 
+def score_log(log_path: Path | None, force_model: str | None = None) -> dict[str, Any] | None:
+    """fr3_pi05.autoscore score of a rollout from the .npz its RolloutLogger wrote next to the JSON."""
+    if log_path is None:
+        return None
+    arrays_path = Path(log_path).with_suffix(".npz")
+    if not arrays_path.exists():
+        return None
+    import numpy as np
+
+    from fr3_pi05.autoscore import load_force_model, score_recording
+
+    with np.load(arrays_path) as data:
+        arrays = {key: data[key] for key in data.files}
+    raw_path = raw_arrays_path(log_path)
+    if raw_path.exists():
+        with np.load(raw_path) as data:
+            arrays.update({key: data[key] for key in data.files})
+    if "steps_t" not in arrays or len(arrays["steps_t"]) < 2:
+        return None
+    return score_recording(arrays, load_force_model(force_model))
+
+
+def score_columns(score: dict[str, Any] | None) -> dict[str, Any]:
+    if not score:
+        return {}
+    place = score.get("place") or {}
+    return {"completion": score["completion"], **{f"stage_{k}": v for k, v in score["stages"].items()},
+            "drop": score["drop"], "place_dz_cm": place.get("dz_cm"), "place_xy_cm": place.get("xy_cm"),
+            **{k: score.get(k) for k in SCORE_FIELDS}}
+
+
+def describe_score(score: dict[str, Any]) -> str:
+    stages = " ".join(f"{name}:{'OK' if ok else '--'}" for name, ok in score["stages"].items())
+    place = score.get("place") or {}
+    parts = [f"completion {score['completion']}/4 ({stages})", f"duration {score['duration_s']} s",
+             f"start delay {score['start_delay_s']} s", f"pour {score['pour_s']} s in {score['pour_bouts']} bout(s)",
+             f"grasp attempts {score['grasp_attempts']}"]
+    if score["drop"]:
+        parts.append(f"DROP at {score['t_drop_s']} s")
+    if place.get("dz_cm") is not None:
+        parts.append(f"release {place['dz_cm']} cm from grasp height, {place['xy_cm']} cm from grasp point")
+    if score.get("held_mass_g") is not None:
+        parts.append(f"held bottle ~{score['held_mass_g']:.0f} g")
+    if not score.get("force_available"):
+        parts.append("no raw force: lift judged by height only")
+    return "; ".join(parts)
+
+
+def _median(values: list[float]) -> str:
+    return f"{statistics.median(values):.1f}" if values else "-"
+
+
 def summarize(results: list[dict[str, str]], target: float | None, tolerance: float) -> str:
     def f(row: dict[str, str], key: str) -> float | None:
         try:
@@ -286,12 +400,37 @@ def summarize(results: list[dict[str, str]], target: float | None, tolerance: fl
                      + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) + " |")
     if target is not None:
         lines.append(f"\nsuccess = within {target:.0f} ± {tolerance:.0f} g, no spill above threshold, rollout not aborted")
+    scored = [r for r in results if r.get("completion") not in (None, "")]
+    if scored:
+        lines += ["", "Automatic stage scores (fr3_pi05.autoscore; stage counts = trials that reached it):", "",
+                  "| model | condition | n | completion mean | 0/1/2/3/4 | grasp | lift | pour | place | drops | "
+                  "start delay s (median) | duration s (median, success) | grasp attempts (mean) | end reasons |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        cells = {}
+        for row in scored:
+            cells.setdefault((row["model"], row["preset"]), []).append(row)
+        for (model, preset), rows in sorted(cells.items()):
+            completion = [int(float(r["completion"])) for r in rows]
+            histogram = "/".join(str(completion.count(c)) for c in range(5))
+            reached = {k: sum(r.get(f"stage_{k}") == "True" for r in rows) for k in ("grasp", "lift", "pour", "place")}
+            drops = sum(r.get("drop") == "True" for r in rows)
+            delay = [v for v in (f(r, "start_delay_s") for r in rows) if v is not None]
+            duration = [v for v in (f(r, "duration_s") for r in rows if r.get("outcome") == "success") if v is not None]
+            attempts = [v for v in (f(r, "grasp_attempts") for r in rows) if v is not None]
+            reasons: dict[str, int] = {}
+            for r in rows:
+                reasons[r.get("end_reason") or "?"] = reasons.get(r.get("end_reason") or "?", 0) + 1
+            lines.append(f"| {model} | {preset} | {len(rows)} | {statistics.mean(completion):.2f} | {histogram} | "
+                         + " | ".join(str(reached[k]) for k in ("grasp", "lift", "pour", "place"))
+                         + f" | {drops} | {_median(delay)} | {_median(duration)} | "
+                         + (f"{statistics.mean(attempts):.1f}" if attempts else "-") + " | "
+                         + ", ".join(f"{k} {v}" for k, v in sorted(reasons.items())) + " |")
     return "\n".join(lines)
 
 
 def runner_command(row: dict[str, str], prompt: str, log_path: Path, pour_deg: float) -> str:
     if model_profile(row["model"]) == "bc2f_force":
-        return f"fr3-pi05-run --checkpoint bc2f_force --prompt '{prompt}' --execute --trial-log {log_path}"
+        return f"fr3-pi05-run --checkpoint bc2f_force --prompt '{prompt}' --execute --auto-stop --trial-log {log_path}"
     return (f"fr3-pi05-run --checkpoint bluecup_force --prompt '{prompt}' --execute "
             f"--fault {row['preset']} --fault-trigger {row['trigger']} --pour-deg {pour_deg:g} "
             f"--trial-log {log_path}")
@@ -331,6 +470,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="without --target-g: success needs at least this much in the cup (scope-v5 round: 20)")
     p.add_argument("--outcome", choices=OUTCOMES, help="override the automatic classification")
     p.add_argument("--notes", default="")
+    p.add_argument("--force-model", help="force_model.json for the stage scores (default: fr3_train/bc2f/force_model.json)")
+
+    p = sub.add_parser("score", help="print the automatic stage score of a rollout log (nothing is recorded)")
+    p.add_argument("rollout_log", type=Path)
+    p.add_argument("--force-model")
 
     p = sub.add_parser("summary")
     p.add_argument("--session", required=True)
@@ -339,6 +483,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", type=Path)
 
     args = parser.parse_args(argv)
+    if args.command == "score":
+        score = score_log(args.rollout_log, args.force_model)
+        if score is None:
+            print(f"No per-step recording next to {args.rollout_log} (expected {args.rollout_log.with_suffix('.npz')})")
+            return 1
+        print(describe_score(score))
+        print(json.dumps(score, indent=1))
+        return 0
     directory = session_dir(args.root, args.session)
     schedule_path, results_path = directory / "schedule.csv", directory / "results.csv"
 
@@ -375,7 +527,9 @@ def main(argv: list[str] | None = None) -> int:
         log_path = directory / "logs" / f"{row['trial_id']}.json"
         print(f"trial {row['trial_id']}: model={row['model']} condition={row['preset']} trigger={row['trigger']} rep={row['rep']}")
         print(runner_command(row, args.prompt, log_path, args.pour_deg))
-        print(f"then: fr3-pi05-trials record --session {args.session} --trial {row['trial_id']} --rollout-log {log_path}")
+        thresholds = " --min-poured-g 20 --spill-tolerance-g 10" if model_profile(row["model"]) == "bc2f_force" else ""
+        print(f"then: fr3-pi05-trials record --session {args.session} --trial {row['trial_id']} --rollout-log {log_path}"
+              f"{thresholds}")
         return 0
 
     if args.command == "record":
@@ -387,14 +541,27 @@ def main(argv: list[str] | None = None) -> int:
         log: dict[str, Any] = {}
         if args.rollout_log and args.rollout_log.exists():
             log = json.loads(args.rollout_log.read_text(encoding="utf-8"))
+        score = score_log(args.rollout_log, args.force_model) if log else None
+        if score is not None:
+            print(f"trial {args.trial} (end: {log.get('end_reason')}): {describe_score(score)}")
+        elif model_profile(row["model"]) == "bc2f_force":
+            print("WARNING: no per-step recording for this rollout; stages are not scored")
         cup_before = _weight(args.cup_before, "cup before (tared: 0)", args.scale_port)
         cup_after = _weight(args.cup_after, "cup after", args.scale_port)
         bottle_before = _weight(args.bottle_before, "bottle before", args.scale_port)
         bottle_after = _weight(args.bottle_after, "bottle after", args.scale_port)
         poured = cup_after - cup_before if cup_after is not None and cup_before is not None else None
         spilled = (bottle_before - bottle_after) - poured if None not in (bottle_before, bottle_after, poured) else None
-        outcome = args.outcome or classify(poured, spilled, log, args.target_g, args.tolerance_g, args.spill_tolerance_g,
-                                           args.min_poured_g)
+        if args.outcome:
+            outcome = args.outcome
+        elif score is not None and args.target_g is None:
+            from fr3_pi05.autoscore import outcome as staged_outcome
+
+            outcome = staged_outcome(score, poured, spilled, log.get("end_reason"), args.min_poured_g,
+                                     args.spill_tolerance_g)
+        else:
+            outcome = classify(poured, spilled, log, args.target_g, args.tolerance_g, args.spill_tolerance_g,
+                               args.min_poured_g)
         pour = log.get("pour", {})
         results.append({
             **{k: row[k] for k in ("trial_id", "model", "preset", "trigger", "rep")},
@@ -407,6 +574,8 @@ def main(argv: list[str] | None = None) -> int:
             "cup_before_g": cup_before, "cup_after_g": cup_after, "bottle_before_g": bottle_before,
             "bottle_after_g": bottle_after, "poured_g": poured, "spilled_g": spilled,
             "outcome": outcome, "notes": args.notes,
+            "inference_ms_median": log.get("inference_ms_median", ""),
+            **score_columns(score),
         })
         if log and log.get("fault_preset") not in (None, row["preset"]):
             print(f"WARNING: rollout log says fault {log.get('fault_preset')!r}, schedule says {row['preset']!r}")

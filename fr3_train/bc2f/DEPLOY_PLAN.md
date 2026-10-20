@@ -100,10 +100,15 @@ fr3_pi05/remote/start_checkpoint.sh bc2f_force /mnt/data/yurui/models/pi05_bc2f_
    状态的 `time_sec`）。GPU 端会检查二者一致（关节角差 > 0.02 rad 或窗口不全就拒绝），所以接线错了会立刻报错而不是
    悄悄喂错数据。
 3. `--trial-log <path>`：写一条试验 JSON（结束原因、倒液检测、每次推理的延迟和该次力窗口均值），
-   `fr3-pi05-trials record` 会读它。结束原因：手柄 Back = `operator_stop`；Ctrl+C = `interrupted`；
-   安全停 = `safety`；异常 = `error`。
-4. 安全检查（工作空间、关节余量、速度上限 0.35 rad/s、看门狗）一律不变。
-5. Bamboo 状态里必须有 `tau_J` 和 `time_sec`（录制时已有）；没有就报错退出。
+   旁边再写两个文件：`<id>.npz`（每个控制步的关节角、夹爪、倾角，约 0.3 MB，随结果提交）和
+   `<id>.raw.npz`（整段 ~1 kHz 原始关节数据，10–20 MB，留在工作站，不提交）。`fr3-pi05-trials record`
+   读这些文件自动打分（见第 4 节）。
+4. `--auto-stop`：不用操作员判断"做完了"。倒过液之后夹爪张开满 2 s → `completed`；手臂 30 s 没动 →
+   `stall`；总时长超过 240 s（示教最长 114 s 的两倍多）→ `timeout`。示教都是松手即结束、没有回 home，
+   所以松手后的动作不算任务。其余结束原因：手柄 Back = `operator_stop`（只作安全用）；Ctrl+C = `interrupted`；
+   安全停 = `safety`；异常 = `error`。停止时先停机器人流，再写日志。
+5. 安全检查（工作空间、关节余量、速度上限 0.35 rad/s、看门狗）一律不变。
+6. Bamboo 状态里必须有 `tau_J` 和 `time_sec`（录制时已有）；没有就报错退出。
 
 ### 第 4 步：不动机器人的核对（机器人端 Claude + 操作员）
 
@@ -127,29 +132,52 @@ fr3_pi05/remote/start_checkpoint.sh bc2f_force /mnt/data/yurui/models/pi05_bc2f_
 **第一轮（30 次）**：三个模型 × 每个 10 次，同一模型连做 5 次为一块（一次服务启动），块顺序随机：
 
 ```bash
-fr3-pi05-trials plan --session v5r1 --models bc2f_vanilla bc2f_moddrop bc2f_moddrop_prop --conditions none --reps 10 --block-reps 5
-fr3-pi05-trials next --session v5r1      # 打印该重启哪个模型、本次的运行命令
-fr3-pi05-trials record --session v5r1 --trial <id> --rollout-log trials/v5r1/logs/<id>.json --min-poured-g 20 --spill-tolerance-g 10
-fr3-pi05-trials summary --session v5r1
+fr3-pi05-trials plan --session v5r2 --models bc2f_vanilla bc2f_moddrop bc2f_moddrop_prop --conditions none --reps 10 --block-reps 5
+fr3-pi05-trials next --session v5r2      # 打印该重启哪个模型、本次的运行命令（已带 --auto-stop --trial-log）
+fr3-pi05-trials record --session v5r2 --trial <id> --rollout-log trials/v5r2/logs/<id>.json --min-poured-g 20 --spill-tolerance-g 10
+fr3-pi05-trials summary --session v5r2
+fr3-pi05-trials score trials/v5r2/logs/<id>.json   # 随时查看某次的自动打分（不记录）
 ```
 
-操作员**不要**看日志去猜是哪个模型（`next` 会打印模型名，记录时只照实填称重和结果）。
+`record` 先打印自动打分（完成度、各阶段用时、是否掉瓶、放瓶位置等），再在命令行逐项提示输入称重，然后自动给出
+结果并写入 `results.csv`。操作员**不要**看日志去猜是哪个模型，也**不用**判断成败，只照实输入称重。
 
-称重：试验前空杯放秤去皮；称瓶子（`bottle_before`）；倒完瓶子放回、夹爪松开后按 Back 结束；静置约 3 秒读杯子，
+称重：试验前空杯放秤去皮；称瓶子（`bottle_before`）；机器人松手 2 s 后自己停；静置约 3 秒读杯子，
 再称瓶子。倒出量 = 杯增重；洒出量 = 瓶减重 − 杯增重。
 
 ### 第 6 步：回传结果
 
-把 `trials/<session>/schedule.csv`、`results.csv`、`logs/*.json` 和运行器改动一起提交到本分支并推送（不要提交视频）。
-Leonardo 端负责分析。
+把 `trials/<session>/schedule.csv`、`results.csv`、`logs/*.json`、`logs/*.npz`（不含 `*.raw.npz`，已在
+`.gitignore`）和运行器改动一起提交到本分支并推送（不要提交视频）。Leonardo 端负责分析。
 
-## 4. 判定标准
+## 4. 判定标准（自动，`fr3_pi05/autoscore.py`）
 
-- **成功**：杯中至少 20 g（示教最少约 6 g、中位 56 g、四分位 43–68 g）、洒出不超过 10 g、瓶子放回且松开、
-  由操作员按 Back 正常结束。
-- 主要比较：三个模型的成功率；次要：倒出量分布（与示教中位 56 g 比）、洒出量、用时、中止和安全停次数。
-- 每个模型 10 次，成功率的置信区间约 ±30%，第一轮只用来看方向；差别明显再加次数。
-- 特别留意：ModDrop+本体组在回程段（放回瓶子、松开、回位）是否出问题——离线它在回程误差最大。
+只用机器人自己的信号（夹爪读数、关节角算出的末端位置、由 ~1 kHz 原始关节数据算出的法兰受力）按顺序判四个阶段，
+**完成度** = 按顺序完成的阶段数（0–4）。阈值取自 22 条 blue_cup_2 示教（`validate_autoscore.py`，逐条数值在
+`autoscore_demos.json`）：
+
+| 阶段 | 判据 | 22 条示教 |
+|---|---|---|
+| 抓取 | 夹爪闭合在物体上（0.5 ≤ 读数 < 0.9）持续 1 s；低于 0.5 = 空抓 | 0.780–0.802 |
+| 抬起 | 持瓶、末端比抓取点高 ≥3 cm，且法兰 F_z 比 home 低 ≥4 N，持续 0.5 s | −6.8 至 −9.4 N（换算重量与秤上瓶重相关 0.94，平均差 −10 g） |
+| 倾倒 | 抬起后持瓶倾角 ≥60°（`PourDetector`） | 最大 87–104°，8.5–31 s |
+| 放回 | 倾倒后第一次松手（张开 0.5 s）时，高度在抓取高度 −8 至 +3 cm、水平距抓取点 ≤12 cm | −5.1 至 +0.2 cm；0.4–8.1 cm |
+
+掉瓶 = 抬起后、非倾倒、夹爪仍闭合，但 F_z 回到空手水平（> home − 2 N）持续 0.5 s。验证：22 条示教全部 4/4、
+无误判掉瓶；把示教截在任一阶段之前，恰好丢掉之后的阶段。
+
+**结果**（`outcome`，按任务顺序取第一个出问题的地方）：`grasp_fail` → `drop` → `lift_fail` → `pour_fail` →
+`spill`（洒出 > 10 g）→ `place_fail` → `under`（杯中 < 20 g）→ 否则 `success`。软件异常记 `error`，不算模型的账。
+
+每次试验自动记录的其他指标：起步延迟、到抓取/抬起/倾倒/松手的时间、倾倒时长和次数、抓取尝试次数、空抓次数、
+最长停顿、关节路径长度、放瓶高度差和水平偏差、持瓶重量（只用来核对抓取，**不是**倒出量）、持瓶时最大向上
+推力（瓶子压桌或撞杯）、全程最大受力变化（碰撞）、推理延迟。倒出量从力里读不出来（示教里倒液前后持瓶 F_z 差与
+秤的相关只有 0.23，散布约 50 g），所以仍用秤。
+
+- 主要比较：成功率与完成度分布；次要：倒出量（与示教中位 56 g 比）、洒出量、各阶段用时、掉瓶、停顿和安全停。
+- 每个模型 10 次，成功率的置信区间约 ±30%，只用来看方向；差别明显再加次数。
+- 特别留意：ModDrop+本体组在放回和松手是否出问题——离线它在回程误差最大。
+- 第一轮（v5r1）的日志没有逐步关节角和原始力：只能用逐步的夹爪、倾角和每次推理的力粗略补判抓取、抬起、倾倒、松手，放回位置和高度补不了。
 
 ## 5. 已知限制
 

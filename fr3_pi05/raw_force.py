@@ -27,15 +27,18 @@ class RawForceSampler:
     `client_factory` returns an object with ``get_joint_states() -> dict`` holding ``qpos``, ``tau_J`` and
     ``time_sec``, normally ``BambooFrankaClient(server_ip=..., control_port=..., enable_gripper=False)``: a client
     of its own, as the recorder used, so polling never waits on the control loop's requests. Repeated controller
-    states (the same ``time_sec`` read twice) are kept once.
+    states (the same ``time_sec`` read twice) are kept once. With ``archive=True`` every sample of the rollout is
+    also kept (``archived()``, ~10 MB per 100 s) so the trial log can store the whole stream for scoring.
     """
 
-    def __init__(self, client_factory: Callable[[], Any], rate_hz: float = 1000.0, keep_s: float = 2.0) -> None:
+    def __init__(self, client_factory: Callable[[], Any], rate_hz: float = 1000.0, keep_s: float = 2.0,
+                 archive: bool = False) -> None:
         if rate_hz <= 0 or keep_s <= RAW_FORCE_SEND_S:
             raise ValueError("rate_hz must be positive and keep_s longer than the sent window")
         self._factory = client_factory
         self._period = 1.0 / rate_hz
         self._samples: deque[np.ndarray] = deque(maxlen=int(keep_s * max(rate_hz, 1000.0)) + 1)
+        self._archive: list[np.ndarray] | None = [] if archive else None
         self._lock = threading.Lock()
         self._new_sample = threading.Condition(self._lock)
         self._stop = threading.Event()
@@ -66,6 +69,8 @@ class RawForceSampler:
                 with self._new_sample:
                     if not self._samples or row[0] > self._samples[-1][0]:
                         self._samples.append(row)
+                        if self._archive is not None:
+                            self._archive.append(row)
                         self._last_host_time = time.monotonic()
                         self._new_sample.notify_all()
                 self._ready.set()
@@ -132,6 +137,14 @@ class RawForceSampler:
         gaps = np.diff(t)
         return {"rate_hz": float((len(t) - 1) / max(t[-1] - t[0], 1e-9)),
                 "max_gap_ms": float(gaps.max() * 1000) if len(gaps) else float("inf"), "samples": float(len(t))}
+
+    def archived(self) -> np.ndarray | None:
+        """Every sample since start as [N, 15] (None without archive=True)."""
+        if self._archive is None:
+            return None
+        with self._lock:
+            rows = list(self._archive)
+        return np.stack(rows) if rows else np.empty((0, RAW_FORCE_COLUMNS))
 
     def close(self) -> None:
         self._stop.set()

@@ -6,3 +6,5 @@ __pycache__/
 build/
 dist/
 data/
+# Raw ~1 kHz arm stream of each robot trial (10-20 MB each): stays on the workstation
+*.raw.npz

@@ -33,6 +33,7 @@ from fr3_pi05.policy import (
     predict_joint_path,
     safe_joint_velocity,
 )
+from fr3_pi05.autoscore import AutoStop
 from fr3_pi05.raw_force import RawForceSampler
 from fr3_pi05.trials import RolloutLogger
 
@@ -293,8 +294,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trial-log",
         type=Path,
-        help="write a per-rollout JSON (fr3_pi05.trials.RolloutLogger: end reason, pour detection, inferences)",
+        help="write a per-rollout JSON (fr3_pi05.trials.RolloutLogger: end reason, pour detection, inferences) "
+        "and, next to it, the per-step joints/gripper and raw arm stream that fr3_pi05.autoscore scores",
     )
+    parser.add_argument(
+        "--auto-stop",
+        action="store_true",
+        help="end the rollout without the operator: 'completed' once the gripper has been open --release-s after a "
+        "pour, 'stall' when the arm has not moved for --stall-s, 'timeout' after --max-duration-s",
+    )
+    parser.add_argument("--release-s", type=float, default=2.0, help="--auto-stop: open time after the pour")
+    parser.add_argument("--stall-s", type=float, default=30.0, help="--auto-stop: no-motion time that ends a rollout")
+    parser.add_argument("--max-duration-s", type=float, default=240.0, help="--auto-stop: rollout time limit")
     return parser
 
 
@@ -340,6 +351,8 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         )
     if args.open_loop_horizon < 1 or not 0 <= args.prefetch_actions < args.open_loop_horizon:
         parser.error("prefetch-actions must be in [0, open-loop-horizon)")
+    if args.release_s <= 0 or args.stall_s <= 0 or args.max_duration_s <= 0:
+        parser.error("--release-s, --stall-s and --max-duration-s must be positive")
     if args.max_steps < 0:
         parser.error("max-steps must be non-negative (0 disables the limit)")
     if args.camera_width < 1 or args.camera_height < 1 or args.camera_fps < 1:
@@ -702,6 +715,7 @@ def run(args: argparse.Namespace) -> int:
     raw_force_sampler: RawForceSampler | None = None
     trial_log: RolloutLogger | None = None
     pour_detector: PourDetector | None = None
+    auto_stop: AutoStop | None = None
     end_reason = "error"
     end_error: str | None = None
     stream_started = False
@@ -778,9 +792,14 @@ def run(args: argparse.Namespace) -> int:
                     "prompt": prompt,
                     "execute": bool(args.execute),
                     "max_joint_speed": args.max_joint_speed,
+                    "auto_stop": {"release_s": args.release_s, "stall_s": args.stall_s,
+                                  "max_duration_s": args.max_duration_s} if args.auto_stop else None,
                 },
             )
+        if args.trial_log is not None or args.auto_stop:
             pour_detector = PourDetector(control_hz=args.control_hz)
+        if args.auto_stop:
+            auto_stop = AutoStop(args.release_s, args.stall_s, max_duration_s=args.max_duration_s)
         if not args.no_rviz:
             from fr3_pi05.visualization import RvizBridge
 
@@ -790,7 +809,8 @@ def run(args: argparse.Namespace) -> int:
             from bamboo import BambooFrankaClient
 
             raw_force_sampler = RawForceSampler(
-                lambda: BambooFrankaClient(server_ip=args.server_ip, control_port=args.control_port, enable_gripper=False)
+                lambda: BambooFrankaClient(server_ip=args.server_ip, control_port=args.control_port, enable_gripper=False),
+                archive=args.trial_log is not None,
             ).start()
             raw_force_sampler.wait_ready()
             stats = raw_force_sampler.stats()
@@ -885,6 +905,7 @@ def run(args: argparse.Namespace) -> int:
         control_period = 1.0 / args.control_hz
         next_stream = time.monotonic()
         next_control = history_sampler.next_sample if history_sampler is not None else next_stream
+        rollout_start = time.monotonic()
 
         unlimited_steps = args.max_steps == 0
         step_limit_label = "unlimited" if unlimited_steps else str(args.max_steps)
@@ -929,9 +950,16 @@ def run(args: argparse.Namespace) -> int:
                     raw_force_sampler.check()
                 state, q = _state(robot)
                 gripper_position = gripper.position
-                if pour_detector is not None and trial_log is not None:
+                if pour_detector is not None:
                     pour_detector.update(q, gripper_position)
-                    trial_log.step(pour_detector.state(), False, gripper_position)
+                if trial_log is not None and pour_detector is not None:
+                    trial_log.step(pour_detector.state(), False, gripper_position, q=q, time_sec=state.get("time_sec"))
+                if auto_stop is not None and pour_detector is not None:
+                    reason = auto_stop.update(now - rollout_start, q, gripper_position, pour_detector.pour_started)
+                    if reason is not None:
+                        print(f"Auto-stop: {reason} after {now - rollout_start:.1f} s.")
+                        end_reason = reason
+                        break
                 if history_sampler is not None:
                     history_sampler.append_control_sample(q, gripper_position, now)
                     observation_joints, observation_gripper = history_sampler.history.observation()
@@ -1071,10 +1099,7 @@ def run(args: argparse.Namespace) -> int:
         end_reason, end_error = "error", f"{type(error).__name__}: {error}"
         raise
     finally:
-        if trial_log is not None:
-            trial_log.finish(end_reason, error=end_error)
-        if raw_force_sampler is not None:
-            raw_force_sampler.close()
+        # Stop the arm first: writing the trial log (the whole raw arm stream, ~10-20 MB) takes a second or two.
         if stream_started and robot is not None:
             try:
                 robot.stream_velocity(np.zeros(7))
@@ -1082,6 +1107,16 @@ def run(args: argparse.Namespace) -> int:
                 robot.stop_stream()
             except Exception as error:  # noqa: BLE001 - cleanup must continue even if Bamboo transport fails
                 LOG.error("Could not cleanly stop Bamboo streaming: %s", error)
+        if raw_force_sampler is not None:
+            raw_force_sampler.close()
+        if trial_log is not None:
+            raw_archive = None
+            if raw_force_sampler is not None:
+                try:
+                    raw_archive = raw_force_sampler.archived()
+                except Exception as error:  # noqa: BLE001 - the log must still be written
+                    LOG.error("Could not collect the raw arm stream for the trial log: %s", error)
+            trial_log.finish(end_reason, error=end_error, arrays={"raw_force": raw_archive})
         if joystick is not None:
             joystick.close()
         if policy is not None:
