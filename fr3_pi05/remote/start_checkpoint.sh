@@ -36,8 +36,22 @@ if [ "$#" -eq 1 ]; then
       CHECKPOINT=
       ;;
     *)
-      PROFILE=wine_hybrid
+      # A bare checkpoint path. Infer the contract from its name instead of
+      # assuming wine: a checkpoint served under the wrong contract loads
+      # without complaint and returns garbage actions, so never guess.
       CHECKPOINT=$1
+      case $(basename -- "$1" | tr '[:upper:]' '[:lower:]' | tr '-' '_') in
+        *bc2f*) PROFILE=bc2f_force ;;
+        *bluecup*) PROFILE=bluecup_force ;;
+        *wine*) PROFILE=wine_hybrid ;;
+        *)
+          echo "Cannot tell which contract this checkpoint belongs to: $1" >&2
+          echo "Pass the profile explicitly, for example:" >&2
+          echo "  start_checkpoint.sh bc2f_force $1" >&2
+          exit 2
+          ;;
+      esac
+      echo "Inferred profile=$PROFILE from the checkpoint name." >&2
       ;;
   esac
 else

@@ -32,7 +32,10 @@ def resolve_action_expert_variant(checkpoint: str, requested: str) -> str:
         return "gemma_300m_lora"
     raise RuntimeError(
         "Cannot determine whether this Wine checkpoint is LoRA or full from its directory name. "
-        "Include 'lora'/'hybrid' or 'aefull'/'full' in the checkpoint directory name."
+        "Set ACTION_EXPERT_VARIANT=gemma_300m_lora (or gemma_300m), or include "
+        "'lora'/'hybrid' or 'aefull'/'full' in the directory name. "
+        "If this is a bc2f or blue-cup checkpoint it is being served under the wrong contract: "
+        "pass the bc2f_force or bluecup_force profile instead, which fix the variant themselves."
     )
 
 
