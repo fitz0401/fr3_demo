@@ -19,13 +19,22 @@ def _load_lerobot_dataset() -> Any:
     return LeRobotDataset
 
 
-def _load_rgb(path: Path) -> np.ndarray:
+def _load_rgb(path: Path, size: tuple[int, int] = (320, 180)) -> np.ndarray:
+    """Load a frame at the given (width, height). Defaults to the DROID size.
+
+    Tactile frames are 4:3 rather than the cameras' 16:9, so the size has to
+    follow the stream instead of being fixed.
+    """
+
     try:
         from PIL import Image
     except ImportError as error:
         raise RuntimeError("Image conversion requires Pillow; run: pip install -e '.[recording]'") from error
     with Image.open(path) as image:
-        return np.asarray(image.convert("RGB").resize((320, 180), resample=Image.Resampling.BICUBIC))
+        picture = image.convert("RGB")
+        if picture.size != size:
+            picture = picture.resize(size, resample=Image.Resampling.BICUBIC)
+        return np.asarray(picture)
 
 
 def find_episodes(data_dirs: Path | Sequence[Path]) -> list[Path]:
@@ -360,7 +369,10 @@ def convert(
                 if tactile_rows is not None:
                     # Nearest-frame selection was already resolved at recording
                     # time, so this only follows the stored index.
-                    frame[TACTILE_KEY] = _load_rgb(tactile_paths[int(tactile_rows[index])])
+                    frame[TACTILE_KEY] = _load_rgb(
+                        tactile_paths[int(tactile_rows[index])],
+                        (tactile_shape[1], tactile_shape[0]),
+                    )
                 dataset.add_frame(frame)
         dataset.save_episode()
         tactile_entry = write_tactile_sidecar(Path(dataset.root), episode_index, episode)

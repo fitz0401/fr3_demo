@@ -248,9 +248,14 @@ class TactileConversionTest(unittest.TestCase):
             self.assertEqual(dataset.create_args["features"][TACTILE_KEY]["shape"], (24, 32, 3))
             with np.load(episode / "trajectory.npz") as trajectory:
                 rows = trajectory["tactile_frame_index"]
+            declared = dataset.create_args["features"][TACTILE_KEY]["shape"]
             for frame, index in zip(dataset.frames, rows):
                 # Every stored frame is a constant plate equal to its index.
                 self.assertEqual(int(frame[TACTILE_KEY][0, 0, 0]), int(index) % 251)
+                # The tactile image must keep its own 4:3 size: LeRobot rejects
+                # a frame whose shape disagrees with the declared feature, and
+                # the camera loader resizes to the 16:9 DROID size by default.
+                self.assertEqual(frame[TACTILE_KEY].shape, declared)
 
     def test_the_sidecar_keeps_the_full_rate_stream_byte_for_byte(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
