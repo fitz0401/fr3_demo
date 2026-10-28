@@ -58,6 +58,10 @@ def require_free_space(path: Path, minimum_bytes: int) -> int:
 
 
 # Readings the operator takes around one pour, in the order they are taken.
+# Stored under frames/<key>/ like a camera, but at the sensor's own rate rather
+# than on the 15 Hz grid.
+TACTILE_KEY = "tactile_image"
+
 WEIGHT_READINGS: tuple[tuple[str, str], ...] = (
     ("bottle_before_g", "bottle before the pour"),
     ("cup_before_g", "cup before the pour"),
@@ -250,6 +254,8 @@ class RawEpisodeWriter:
         image_queue_size: int = 120,
         sync_thresholds: dict[str, float] | None = None,
         image_size: tuple[int, int] | None = DEFAULT_IMAGE_SIZE,
+        record_force: bool = True,
+        tactile: dict[str, Any] | None = None,
     ) -> None:
         self.episode_index = episode_index
         self.fps = fps
@@ -272,6 +278,21 @@ class RawEpisodeWriter:
             (self.path / "frames" / key).mkdir(parents=True)
 
         self._image_writer = _AsyncImageWriter(image_workers, image_queue_size, image_size)
+        self.record_force = bool(record_force)
+        # Tactile frames are 4:3 while the cameras are 16:9, and one writer
+        # resizes everything it is given to a single size, so tactile needs its
+        # own. Capture already downscales, making this resize a no-op guard.
+        self._tactile_config = dict(tactile) if tactile else None
+        self._tactile_writer: _AsyncImageWriter | None = None
+        self._tactile_timestamps: list[float] = []
+        self._tactile_frame_numbers: list[int] = []
+        self._tactile_row_index: list[int] = []
+        self._tactile_row_aligned: list[float] = []
+        self._tactile_target_errors_ms: list[float] = []
+        if self._tactile_config is not None:
+            size = (int(self._tactile_config["width"]), int(self._tactile_config["height"]))
+            (self.path / "frames" / TACTILE_KEY).mkdir(parents=True)
+            self._tactile_writer = _AsyncImageWriter(max(1, image_workers - 1), image_queue_size, size)
         self._timestamps: list[float] = []
         self._host_timestamps: list[float] = []
         self._robot_timestamps: list[float] = []
@@ -333,18 +354,40 @@ class RawEpisodeWriter:
                 if image_size is None
                 else {"width": image_size[0], "height": image_size[1], "resample": "bicubic"}
             ),
-            "force_signal": {
-                "field": "joint_torque",
-                "source": "franka_tau_J",
-                "unit": "Nm",
-                "frame": "joint",
-                "raw_field": "raw_force_joint_torque",
-                "raw_note": (
-                    "Every arm sample taken during the episode, on its own timeline. "
-                    "The rate is the sampler's polling rate, not the controller's 1 kHz: "
-                    "bamboo serves state by request/reply with no subscription."
-                ),
-            },
+            "force_signal": (
+                {
+                    "field": "joint_torque",
+                    "source": "franka_tau_J",
+                    "unit": "Nm",
+                    "frame": "joint",
+                    "raw_field": "raw_force_joint_torque",
+                    "raw_note": (
+                        "Every arm sample taken during the episode, on its own timeline. "
+                        "The rate is the sampler's polling rate, not the controller's 1 kHz: "
+                        "bamboo serves state by request/reply with no subscription."
+                    ),
+                }
+                if self.record_force
+                else None
+            ),
+            "tactile_signal": (
+                None
+                if self._tactile_config is None
+                else {
+                    "field": TACTILE_KEY,
+                    "source": "gelsight_mini",
+                    "device": self._tactile_config.get("device"),
+                    "width": int(self._tactile_config["width"]),
+                    "height": int(self._tactile_config["height"]),
+                    "requested_fps": float(self._tactile_config["fps"]),
+                    "rotate_180": bool(self._tactile_config.get("rotate_180", False)),
+                    "raw_note": (
+                        "frames/tactile_image holds every captured frame at the sensor's own rate, "
+                        "not one per 15 Hz row. tactile_frame_index maps each grid row to the "
+                        "nearest full-rate frame, so no frame is stored twice."
+                    ),
+                }
+            ),
             "camera_transforms": transforms,
             "language_instruction": None,
             "frame_count": 0,
@@ -358,6 +401,35 @@ class RawEpisodeWriter:
     @property
     def camera_keys(self) -> tuple[str, ...]:
         return self._camera_keys
+
+    def add_tactile_frame(self, frame: Any) -> int:
+        """Store one tactile frame at the sensor's rate; returns its index.
+
+        Called for every captured frame, not once per grid row, so the stored
+        stream keeps the sensor's full temporal resolution. Only the JPEG and
+        two timestamps are retained; holding decoded frames in memory for a
+        whole episode would cost hundreds of megabytes.
+        """
+
+        if self._tactile_writer is None:
+            raise RuntimeError("This episode was not opened with tactile recording")
+        index = len(self._tactile_timestamps)
+        path = self.path / "frames" / TACTILE_KEY / f"frame_{index:06d}.jpg"
+        self._tactile_writer.submit_many([(path, frame.image)])
+        self._tactile_timestamps.append(float(frame.captured_monotonic))
+        self._tactile_frame_numbers.append(int(frame.frame_number))
+        return index
+
+    def _nearest_tactile(self, target: float) -> tuple[int, float]:
+        """Index and timestamp of the stored tactile frame closest to a grid instant."""
+
+        stamps = self._tactile_timestamps
+        if not stamps:
+            raise RuntimeError("Tactile recording is active but no tactile frame has been stored")
+        position = bisect.bisect_left(stamps, target)
+        candidates = [index for index in (position - 1, position) if 0 <= index < len(stamps)]
+        best = min(candidates, key=lambda index: abs(stamps[index] - target))
+        return best, stamps[best]
 
     def add_sample(
         self,
@@ -398,7 +470,17 @@ class RawEpisodeWriter:
         self._robot_timestamps.append(float(state["time_sec"]))
         self._joint_positions.append(np.asarray(state["qpos"], dtype=np.float32))
         self._joint_velocities.append(np.asarray(state["dq"], dtype=np.float32))
-        self._joint_torques.append(np.asarray(state["tau_J"], dtype=np.float32))
+        if self.record_force:
+            self._joint_torques.append(np.asarray(state["tau_J"], dtype=np.float32))
+        if self._tactile_writer is not None:
+            # The writer holds the full-rate stream it has already stored, so it
+            # resolves the nearest frame itself. The grid row is emitted one
+            # alignment delay late, which is why frames around the target have
+            # arrived by now.
+            row_index, row_aligned = self._nearest_tactile(target_monotonic)
+            self._tactile_row_index.append(row_index)
+            self._tactile_row_aligned.append(row_aligned)
+            self._tactile_target_errors_ms.append(abs(row_aligned - target_monotonic) * 1000.0)
         self._action_joint_velocities.append(np.asarray(action_joint_velocity, dtype=np.float32))
         action_timestamp = float(timing.get("action_joint_host_timestamp", target_monotonic))
         self._action_joint_timestamps.append(action_timestamp)
@@ -434,6 +516,9 @@ class RawEpisodeWriter:
             violations.append("camera_pair_skew")
         if max(self._robot_interpolation_gaps_ms, default=0.0) > robot_threshold:
             violations.append("robot_interpolation_gap")
+        tactile_threshold = float(self._sync_thresholds.get("tactile_max_age_ms", float("inf")))
+        if max(self._tactile_target_errors_ms, default=0.0) > tactile_threshold:
+            violations.append("tactile_target_error")
         return {
             "schema_version": RAW_SCHEMA_VERSION,
             "valid": not violations,
@@ -453,8 +538,28 @@ class RawEpisodeWriter:
                 "high_watermark": self._image_writer.high_watermark,
                 "dropped": 0,
             },
+            "tactile": (
+                None
+                if self._tactile_writer is None
+                else {
+                    "frames": len(self._tactile_timestamps),
+                    "rate_hz": self._tactile_rate_hz(),
+                    "target_error_ms": _percentiles(self._tactile_target_errors_ms),
+                    "jpeg_queue": {
+                        "capacity": self._tactile_writer.capacity,
+                        "high_watermark": self._tactile_writer.high_watermark,
+                    },
+                }
+            ),
             "clock_estimates": self._clock_estimates,
         }
+
+    def _tactile_rate_hz(self) -> float:
+        stamps = self._tactile_timestamps
+        if len(stamps) < 2:
+            return 0.0
+        span = stamps[-1] - stamps[0]
+        return (len(stamps) - 1) / span if span > 0 else 0.0
 
     def set_raw_force(self, samples: list[RobotSample]) -> None:
         """Record every arm sample taken during the episode, not just the grid.
@@ -472,19 +577,31 @@ class RawEpisodeWriter:
         if clock_estimates is not None:
             self._clock_estimates = clock_estimates
         self._image_writer.close()
+        if self._tactile_writer is not None:
+            self._tactile_writer.close()
         trajectory: dict[str, np.ndarray] = {
             "timestamp": np.asarray(self._timestamps, dtype=np.float64),
             "host_monotonic_timestamp": np.asarray(self._host_timestamps, dtype=np.float64),
             "robot_timestamp": np.asarray(self._robot_timestamps, dtype=np.float64),
             "joint_position": np.stack(self._joint_positions),
             "joint_velocity": np.stack(self._joint_velocities),
-            "joint_torque": np.stack(self._joint_torques),
             "action_joint_velocity": np.stack(self._action_joint_velocities),
             "action_joint_host_timestamp": np.asarray(self._action_joint_timestamps, dtype=np.float64),
             "gripper_position": np.asarray(self._gripper_positions, dtype=np.float32)[:, None],
             "action_gripper_position": np.asarray(self._action_gripper_positions, dtype=np.float32)[:, None],
             "action_gripper_host_timestamp": np.asarray(self._action_gripper_timestamps, dtype=np.float64),
         }
+        if self.record_force:
+            trajectory["joint_torque"] = np.stack(self._joint_torques)
+        # Tactile: frames/tactile_image holds one JPEG per captured frame at the
+        # sensor's rate, so these raw_tactile_* arrays are a different length
+        # from the 15 Hz columns, and tactile_frame_index maps a grid row onto
+        # them rather than duplicating any image.
+        if self._tactile_writer is not None:
+            trajectory["raw_tactile_timestamp"] = np.asarray(self._tactile_timestamps, dtype=np.float64)
+            trajectory["raw_tactile_frame_number"] = np.asarray(self._tactile_frame_numbers, dtype=np.int64)
+            trajectory["tactile_frame_index"] = np.asarray(self._tactile_row_index, dtype=np.int64)
+            trajectory["tactile_aligned_timestamp"] = np.asarray(self._tactile_row_aligned, dtype=np.float64)
         # Unsampled force: one row per arm sample, on its own timeline. These
         # arrays are a different length from the 15 Hz columns above.
         if self._raw_force:
@@ -530,6 +647,13 @@ class RawEpisodeWriter:
             report["robot_interpolation_gap_ms"]["p95"],
             report["camera_pair_warning_frames"],
         )
+        if report["tactile"] is not None:
+            LOG.info(
+                "Tactile: %d frames at %.1f Hz; grid alignment error p95 %.1f ms",
+                report["tactile"]["frames"],
+                report["tactile"]["rate_hz"],
+                report["tactile"]["target_error_ms"]["p95"],
+            )
         self._metadata.update(
             {
                 "complete": True,
@@ -590,6 +714,9 @@ class DemoCollector:
         image_queue_size: int = 120,
         image_size: tuple[int, int] | None = DEFAULT_IMAGE_SIZE,
         min_free_gb: float = 5.0,
+        record_force: bool = True,
+        tactile: Any | None = None,
+        tactile_max_age_ms: float = 60.0,
     ) -> None:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         root = output_root.expanduser().resolve()
@@ -614,6 +741,12 @@ class DemoCollector:
         self.gripper_max_age = gripper_max_age_ms / 1000.0
         self.image_workers = image_workers
         self.image_queue_size = image_queue_size
+        self.record_force = bool(record_force)
+        # The sensor object is owned by the caller: it must be opened before a
+        # session starts so a missing sensor refuses collection up front rather
+        # than failing on the first episode.
+        self.tactile = tactile
+        self.tactile_max_age = tactile_max_age_ms / 1000.0
         bytes_per_frame = estimated_bytes_per_frame(self._recorded_image_sizes(cameras, image_size))
         rate = bytes_per_frame * fps * 3600.0 / 1e9
         hours = free / 1e9 / rate if rate > 0 else float("inf")
@@ -633,6 +766,7 @@ class DemoCollector:
             "camera_pair_reject_ms": camera_pair_reject_ms,
             "robot_interpolation_gap_max_ms": robot_max_gap_ms,
             "gripper_sample_age_max_ms": gripper_max_age_ms,
+            "tactile_max_age_ms": tactile_max_age_ms,
         }
         _write_json(
             self.session_dir / "session.json",
@@ -678,6 +812,8 @@ class DemoCollector:
         self._gripper_actions: deque[ActionSample] = deque([ActionSample(0.0, now)], maxlen=1000)
         self._frame_observer: Callable[[dict[str, CameraFrame]], None] | None = None
         self._raw_force: list[RobotSample] | None = None
+        self._tactile_lock = threading.Lock()
+        self._tactile_target: RawEpisodeWriter | None = None
 
     @staticmethod
     def _recorded_image_sizes(
@@ -712,6 +848,10 @@ class DemoCollector:
             )
         else:
             self._gripper_ready.set()
+        if self.tactile is not None:
+            # The sensor streams for the whole session; only the observer's
+            # target changes per episode.
+            self.tactile.set_frame_observer(self._on_tactile_frame)
         for thread in self._threads:
             thread.start()
         if not self._arm_ready.wait(timeout=6.0):
@@ -741,7 +881,7 @@ class DemoCollector:
             if self.enable_gripper and not self._gripper_samples:
                 raise RuntimeError("Gripper-state buffer is not ready")
         with self._sensor_lock:
-            self._raw_force = []
+            self._raw_force = [] if self.record_force else None
         with self._lock:
             if self._writer is not None:
                 raise RuntimeError("An episode is already recording")
@@ -755,8 +895,41 @@ class DemoCollector:
                 image_queue_size=self.image_queue_size,
                 sync_thresholds=self._sync_thresholds,
                 image_size=self.image_size,
+                record_force=self.record_force,
+                tactile=self._tactile_settings(),
             )
+            if self.tactile is not None:
+                with self._tactile_lock:
+                    self._tactile_target = self._writer
             return self._writer.path
+
+    def _tactile_settings(self) -> dict[str, Any] | None:
+        if self.tactile is None:
+            return None
+        return {
+            "device": f"/dev/video{self.tactile.device_index}",
+            "width": self.tactile.width,
+            "height": self.tactile.height,
+            "fps": self.tactile.fps,
+            "rotate_180": self.tactile.rotate_180,
+        }
+
+    def _on_tactile_frame(self, frame: Any) -> None:
+        """Store every captured frame into the active episode, or drop it.
+
+        Runs on the capture thread. The lock is held across the submit so the
+        episode cannot be finished underneath it, which would otherwise raise
+        from a closed JPEG writer.
+        """
+
+        try:
+            with self._tactile_lock:
+                writer = self._tactile_target
+                if writer is None:
+                    return
+                writer.add_tactile_frame(frame)
+        except BaseException as error:  # noqa: BLE001 - surfaced through check_health
+            self._set_error(error)
 
     def _clock_estimates(self) -> dict[str, Any]:
         with self._sensor_lock:
@@ -772,6 +945,10 @@ class DemoCollector:
         }
 
     def stop_episode(self) -> Path:
+        # Detach the tactile stream first: a frame submitted after finish()
+        # would hit a closed JPEG writer.
+        with self._tactile_lock:
+            self._tactile_target = None
         with self._lock:
             writer = self._writer
             self._writer = None
@@ -829,6 +1006,8 @@ class DemoCollector:
             error = self._error
         if error is not None:
             raise RuntimeError(f"Demonstration recorder failed: {error}") from error
+        if self.tactile is not None:
+            self.tactile.check_health()
 
     def _arm_loop(self) -> None:
         client = None
@@ -843,14 +1022,15 @@ class DemoCollector:
                 started = time.monotonic()
                 state = client.get_joint_states()
                 received = time.monotonic()
-                if "tau_J" not in state:
+                if self.record_force and "tau_J" not in state:
                     raise RuntimeError(
-                        "Robot state has no tau_J; this bamboo controller cannot report joint torque"
+                        "Robot state has no tau_J; this bamboo controller cannot report joint torque. "
+                        "Set recording.record_force = false to collect without it."
                     )
                 sample = RobotSample(
                     qpos=np.asarray(state["qpos"], dtype=np.float32),
                     dq=np.asarray(state["dq"], dtype=np.float32),
-                    tau_J=np.asarray(state["tau_J"], dtype=np.float32),
+                    tau_J=np.asarray(state.get("tau_J", np.zeros(7)), dtype=np.float32),
                     controller_timestamp=float(state["time_sec"]),
                     request_send_monotonic=started,
                     response_receive_monotonic=received,

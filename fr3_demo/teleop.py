@@ -435,8 +435,41 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--weigh",
         action=argparse.BooleanOptionalAction,
+        default=False,
+        help="after each episode, ask for the weight read off the scale; task-specific, off by default",
+    )
+    parser.add_argument(
+        "--record-force",
+        action=argparse.BooleanOptionalAction,
         default=True,
-        help="after each episode, ask for the liquid weight read off the scale (default: enabled)",
+        help="record joint torque and the full-rate raw_force stream (default: enabled)",
+    )
+    parser.add_argument(
+        "--record-tactile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="record the GelSight tactile stream; the sensor must be present (default: disabled)",
+    )
+    parser.add_argument("--tactile-device", default="", help="tactile index or /dev/videoN; empty auto-detects")
+    parser.add_argument("--tactile-width", type=int, default=320, help="stored tactile frame width")
+    parser.add_argument("--tactile-height", type=int, default=240, help="stored tactile frame height")
+    parser.add_argument(
+        "--tactile-fps",
+        type=float,
+        default=25.0,
+        help="tactile capture rate; the GelSight Mini caps at 25 fps",
+    )
+    parser.add_argument(
+        "--tactile-max-age-ms",
+        type=float,
+        default=60.0,
+        help="reject a grid row whose nearest tactile frame is older than this",
+    )
+    parser.add_argument(
+        "--tactile-rotate-180",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="rotate the stored tactile image by 180 degrees",
     )
     parser.add_argument(
         "--min-free-gb",
@@ -566,6 +599,7 @@ def run(args: argparse.Namespace) -> int:
     cameras: Any | None = None
     collector: Any | None = None
     preview: Any | None = None
+    tactile: Any | None = None
     rumbler: Any | None = None
     streaming_active = False
     stop = False
@@ -609,6 +643,24 @@ def run(args: argparse.Namespace) -> int:
             ).start()
             if cameras.optional_camera_error:
                 print(f"Optional exterior camera unavailable; continuing without it: {cameras.optional_camera_error}")
+            if args.record_tactile:
+                from fr3_demo.tactile import GelSightCamera
+
+                tactile = GelSightCamera(
+                    device=args.tactile_device or None,
+                    width=args.tactile_width,
+                    height=args.tactile_height,
+                    fps=args.tactile_fps,
+                    rotate_180=args.tactile_rotate_180,
+                )
+                # Deliberately not guarded: record_tactile means the tactile
+                # stream is part of the data, so a missing sensor must refuse
+                # the session rather than silently collect without it.
+                tactile.start()
+                print(
+                    f"Tactile sensor /dev/video{tactile.device_index} streaming at up to "
+                    f"{tactile.fps:.0f} Hz, stored {tactile.width}x{tactile.height}."
+                )
             collector = DemoCollector(
                 cameras,
                 args.data_dir,
@@ -634,6 +686,9 @@ def run(args: argparse.Namespace) -> int:
                     else None
                 ),
                 min_free_gb=args.min_free_gb,
+                record_force=args.record_force,
+                tactile=tactile,
+                tactile_max_age_ms=args.tactile_max_age_ms,
             )
             collector.start()
             if args.preview:
@@ -909,6 +964,11 @@ def run(args: argparse.Namespace) -> int:
                 preview.close()
             except Exception as error:  # noqa: BLE001 - shutdown must continue to camera and robot cleanup
                 LOG.warning("Could not stop the camera preview: %s", error)
+        if tactile is not None:
+            try:
+                tactile.close()
+            except Exception as error:  # noqa: BLE001 - shutdown must continue to camera and robot cleanup
+                LOG.warning("Could not stop the tactile sensor: %s", error)
         if cameras is not None:
             cameras.close()
         if robot is not None:

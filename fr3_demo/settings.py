@@ -48,6 +48,17 @@ _SCHEMA: dict[str, set[str]] = {
         "image_width",
         "image_height",
         "min_free_gb",
+        "record_force",
+        "record_tactile",
+        "weigh",
+    },
+    "tactile": {
+        "device",
+        "width",
+        "height",
+        "fps",
+        "max_age_ms",
+        "rotate_180",
     },
     "teleop": {
         "linear_speed",
@@ -134,6 +145,7 @@ def teleop_defaults(config: dict[str, Any]) -> dict[str, Any]:
     joystick = config.get("joystick", {})
     cameras = config.get("cameras", {})
     recording = config.get("recording", {})
+    tactile = config.get("tactile", {})
     teleop = config.get("teleop", {})
     home = config.get("home", {})
     workspace = config.get("workspace", {})
@@ -175,6 +187,15 @@ def teleop_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "record_image_width": recording.get("image_width"),
         "record_image_height": recording.get("image_height"),
         "min_free_gb": recording.get("min_free_gb"),
+        "record_force": recording.get("record_force"),
+        "record_tactile": recording.get("record_tactile"),
+        "weigh": recording.get("weigh"),
+        "tactile_device": tactile.get("device"),
+        "tactile_width": tactile.get("width"),
+        "tactile_height": tactile.get("height"),
+        "tactile_fps": tactile.get("fps"),
+        "tactile_max_age_ms": tactile.get("max_age_ms"),
+        "tactile_rotate_180": tactile.get("rotate_180"),
         "linear_speed": teleop.get("linear_speed"),
         "angular_speed": teleop.get("angular_speed"),
         "stream_rate": teleop.get("stream_rate"),

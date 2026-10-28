@@ -53,8 +53,16 @@ Useful details:
   required exterior and wrist cameras. When configured and connected, the L515
   is recorded as `exterior_image_2_left`; its configured mode is `960x540@60`.
 - `[recording]` contains the synchronization limits. The defaults sample Bamboo
-  at 60 Hz, align every stream to an exact 15 Hz Ubuntu monotonic-time grid,
+  at 1 kHz, align every stream to an exact 15 Hz Ubuntu monotonic-time grid,
   and reject camera/robot samples outside the configured tolerances.
+- `recording.record_force` records joint torque and the full-rate `raw_force_*`
+  stream. With it off, torque is omitted rather than zero-filled, and a
+  controller that cannot report `tau_J` no longer refuses to collect.
+- `recording.record_tactile` records the GelSight tactile stream, configured
+  under `[tactile]`. With it on the sensor must be present: collection refuses
+  to start rather than quietly producing episodes without tactile data.
+- `recording.weigh` asks for scale readings after each episode. It is
+  task-specific (the pouring task uses it) and off by default.
 
 CLI options override the file for one run. Use `--config PATH` or set
 `FR3_DEMO_CONFIG` to load a different configuration.
@@ -143,6 +151,42 @@ If ROS 2 is not sourced, collection still runs and logs
 Sessions are stored under `data/raw/session_YYYYMMDD_HHMMSS`. Incomplete
 episodes retain an `.inprogress` suffix and are ignored during conversion.
 
+### Tactile sensor
+
+The GelSight Mini is a UVC camera looking at a deformable gel pad. It exposes
+exactly one mode, **3280x2464 MJPEG at 25 fps**, so 25 Hz is a hardware
+ceiling and every frame costs an 8 MP JPEG decode. Frames are downscaled on
+capture to `tactile.width` x `tactile.height`; the gel image carries nothing
+like 8 MP of information.
+
+Check the sensor and measure what it actually delivers before collecting:
+
+```bash
+fr3-tactile-check --seconds 10
+```
+
+A UVC device has a single owner, so close any viewer first (`fuser -v
+/dev/video20` names the holder) — the same constraint as `fr3-camera-rviz`
+versus `fr3-collect`.
+
+Then collect with it:
+
+```bash
+fr3-collect --record-tactile
+```
+
+Tactile capture runs at the sensor's own rate, **not** on the 15 Hz grid:
+
+- `frames/tactile_image/` holds one JPEG per captured frame, so the full
+  temporal resolution is kept.
+- `tactile_frame_index` maps each 15 Hz row to the nearest captured frame, so
+  an aligned view costs no duplicated images.
+- `raw_tactile_timestamp` gives every frame's host-monotonic time.
+
+`sync_report.json` reports the achieved tactile rate and the grid alignment
+error, and a row whose nearest frame is older than `tactile.max_age_ms` fails
+the episode the same way a stale camera does.
+
 ### Recording format
 
 - Cameras capture at 60 Hz; all streams are aligned to an exact 15 Hz Ubuntu
@@ -225,6 +269,24 @@ gripper state, eight-dimensional actions, and per-episode tasks. The second
 exterior image uses the optional camera when recorded and falls back to the
 black DROID compatibility image for older/two-camera episodes.
 
+### Tactile in the dataset
+
+When every input episode has tactile, conversion adds a `tactile_image` feature
+holding the gel frame nearest each 15 Hz row, alongside the three RealSense
+images. Because the sensor runs faster than the grid, that column is a
+resampling, so the complete stream is written beside the dataset as well:
+
+- `tactile/episode_NNNNNN.npz` — every captured JPEG byte-for-byte as recorded,
+  concatenated into `jpeg_blob` with a `jpeg_offsets` table, plus each frame's
+  `timestamp` and the per-row `row_frame_index`. One file per episode rather
+  than thousands of small ones, and readable without `allow_pickle`.
+- `meta/tactile_report.json` — per-episode frame count, achieved rate, largest
+  gap and grid alignment error.
+
+If only some episodes have tactile, the `tactile_image` feature is omitted
+rather than padded, while the sidecars for the episodes that do have it are
+still written so nothing recorded is discarded.
+
 Schema-v1 recordings used loop-index alignment and are rejected by default. To
 convert one only after manually accepting its timing risk, add:
 
@@ -262,6 +324,7 @@ the gripper before inference; policy motion additionally requires `--execute`.
 | `fr3-annotate` | Add episode language instructions |
 | `fr3-convert` | Build and optionally upload a LeRobot dataset |
 | `fr3-downsize` | Rewrite older native-resolution episodes at the stored size |
+| `fr3-tactile-check` | List tactile devices and measure the achieved rate |
 | `fr3-pi05-check` | Non-moving policy integration check |
 | `fr3-pi05-run` | Guarded pi0.5 rollout |
 

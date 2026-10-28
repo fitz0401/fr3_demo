@@ -73,11 +73,41 @@ image_width = 320
 image_height = 180
 # Refuse to start a session, or a new episode, below this much free disk.
 min_free_gb = 5.0
+# Record the arm's full-rate joint torque into raw_force_* (see robot_sample_hz).
+# When false the 15 Hz joint_torque column is still written; only the unsampled
+# stream is skipped, and a controller that cannot report tau_J no longer aborts
+# the session.
+record_force = true
+# Record the GelSight tactile stream. See the [tactile] section for the device
+# and rate. When true the sensor must be present or collection refuses to start.
+record_tactile = false
+# Ask for the scale readings after each episode. Task-specific: the pouring
+# stage needs them, other tasks do not, so this is off by default.
+weigh = false
 # Live RViz view of every camera while collecting. The recorder owns the
 # RealSense handles, so this republishes its frames instead of reopening them;
 # fr3-camera-rviz cannot run at the same time.
 preview = true
 preview_rate_hz = 10.0
+
+# GelSight Mini tactile sensor, recorded only when recording.record_tactile is
+# true. The hardware exposes exactly one UVC mode, 3280x2464 MJPEG at 25 fps,
+# so the rate ceiling is 25 Hz and every frame is an 8 MP JPEG decode. Frames
+# are downscaled on capture: storing the native size would cost far more disk
+# and CPU than the gel image carries information.
+[tactile]
+# Leave empty to pick the first device whose name contains "GelSight".
+device = ""
+# Stored tactile frame size. The gel surface is 4:3.
+width = 320
+height = 240
+# Capture rate; capped by the sensor's 25 fps. The 15 Hz grid takes the nearest
+# frame, and every captured frame is kept on its own timeline as well.
+fps = 25.0
+# Refuse a frame older than this when aligning a grid row.
+max_age_ms = 60.0
+# Rotate the stored tactile image by 180 degrees.
+rotate_180 = false
 
 [teleop]
 linear_speed = 0.08
