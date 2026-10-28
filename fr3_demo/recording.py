@@ -899,6 +899,16 @@ class DemoCollector:
                 tactile=self._tactile_settings(),
             )
             if self.tactile is not None:
+                # Seed the episode with the frame already in the sensor's
+                # buffer. The first grid row is emitted one alignment delay
+                # after this, which is only ~1.5 tactile periods, so without a
+                # seed row 0 can race the first capture and abort the episode.
+                seed = self.tactile.latest(max_age=self.tactile_max_age)
+                if seed is None:
+                    self._writer.abort("tactile sensor has no recent frame")
+                    self._writer = None
+                    raise RuntimeError("Tactile buffer is not ready")
+                self._writer.add_tactile_frame(seed)
                 with self._tactile_lock:
                     self._tactile_target = self._writer
             return self._writer.path

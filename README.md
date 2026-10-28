@@ -154,10 +154,18 @@ episodes retain an `.inprogress` suffix and are ignored during conversion.
 ### Tactile sensor
 
 The GelSight Mini is a UVC camera looking at a deformable gel pad. It exposes
-exactly one mode, **3280x2464 MJPEG at 25 fps**, so 25 Hz is a hardware
-ceiling and every frame costs an 8 MP JPEG decode. Frames are downscaled on
-capture to `tactile.width` x `tactile.height`; the gel image carries nothing
-like 8 MP of information.
+exactly one mode, **3280x2464 MJPEG**, advertised at 25 fps. Measured here it
+delivers a steady **18.75 Hz** (53.3 ms, p95 53.4, no retrieve failures) — the
+device's own limit, not a software one: the rate is unchanged with the decode
+removed entirely and at every driver buffer depth, and the sensor is a USB 2.0
+device, so a USB 3 port will not raise it. That is still above the 15 Hz
+recording grid.
+
+Every frame is an 8 MP JPEG. Decoding in full costs about 44 ms, so capture
+asks V4L2 for the raw MJPEG payload and lets libjpeg scale during decode,
+which costs about 18 ms at 1/8 — comfortably inside the 53 ms the device
+allows. Frames are downscaled to `tactile.width` x `tactile.height`; the gel
+image carries nothing like 8 MP of information.
 
 Check the sensor and measure what it actually delivers before collecting:
 

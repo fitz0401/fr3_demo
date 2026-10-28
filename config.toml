@@ -91,20 +91,28 @@ preview = true
 preview_rate_hz = 10.0
 
 # GelSight Mini tactile sensor, recorded only when recording.record_tactile is
-# true. The hardware exposes exactly one UVC mode, 3280x2464 MJPEG at 25 fps,
-# so the rate ceiling is 25 Hz and every frame is an 8 MP JPEG decode. Frames
-# are downscaled on capture: storing the native size would cost far more disk
-# and CPU than the gel image carries information.
+# true. The hardware exposes exactly one UVC mode, 3280x2464 MJPEG, advertised
+# at 25 fps. Measured on this rig it delivers a steady 18.75 Hz (53.3 ms,
+# p95 53.4): that is the device, not this code -- the rate is identical with
+# the decode removed entirely, at every driver buffer depth, and the sensor is
+# a USB 2.0 device (bcdUSB 2.00) so a USB 3 port cannot raise it. Still well
+# above the 15 Hz grid, which is what matters here.
+# Frames are downscaled on capture: storing the native size would cost far more
+# disk and CPU than the gel image carries information.
 [tactile]
 # Leave empty to pick the first device whose name contains "GelSight".
 device = ""
 # Stored tactile frame size. The gel surface is 4:3.
 width = 320
 height = 240
-# Capture rate; capped by the sensor's 25 fps. The 15 Hz grid takes the nearest
-# frame, and every captured frame is kept on its own timeline as well.
+# Requested capture rate, capped at the sensor's advertised 25 fps. The device
+# paces the stream itself, so this only bounds the loop; the achieved rate is
+# in sync_report.json per episode. The 15 Hz grid takes the nearest frame, and
+# every captured frame is kept on its own timeline as well.
 fps = 25.0
-# Refuse a frame older than this when aligning a grid row.
+# Refuse a grid row whose nearest tactile frame is further away than this. At
+# the measured 18.75 Hz a row is at worst half a period away, 26.7 ms, so this
+# leaves better than 2x margin.
 max_age_ms = 60.0
 # Rotate the stored tactile image by 180 degrees.
 rotate_180 = false
