@@ -224,6 +224,22 @@ class BambooRobot:
         self._arm.close()
 
 
+HAND_GUIDE_ACTION_SOURCE = "measured_joint_velocity"
+
+
+def hand_guide_tick(robot: Any, collector: Any | None) -> np.ndarray:
+    """Record the arm's own motion as the action while an operator guides it.
+
+    Nothing is commanded: the measured joint velocity stands in for the
+    joystick velocity teleop records, in the same unit (rad/s).
+    """
+
+    state = robot.state()
+    if collector is not None:
+        collector.set_action(np.asarray(state["dq"], dtype=float))
+    return np.asarray(state["qpos"], dtype=float)
+
+
 def stream_home(
     robot: BambooRobot,
     target: np.ndarray,
@@ -379,6 +395,14 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="run teleop and print targets without sending commands")
     parser.add_argument("--offline", action="store_true", help="dry-run without connecting to Bamboo")
     parser.add_argument("--collect", action="store_true", help="enable synchronized demonstration collection")
+    parser.add_argument(
+        "--hand-guide",
+        action="store_true",
+        help=(
+            "record while you move the arm with the robot's own guiding buttons; "
+            "no arm command is sent, so there is no gel protection (requires --collect)"
+        ),
+    )
     parser.add_argument("--data-dir", type=Path, default=Path("data/raw"), help="raw recording root")
     parser.add_argument(
         "--external-camera-serial",
@@ -557,6 +581,8 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         parser.error(
             "--collect requires live streaming mode (not --offline, --dry-run, --check, or --legacy-waypoints)"
         )
+    if args.hand_guide and not args.collect:
+        parser.error("--hand-guide records demonstrations, so it requires --collect (use fr3-collect --hand-guide)")
     if args.collect and (not args.external_camera_serial or not args.wrist_camera_serial):
         parser.error(
             "--collect requires --external-camera-serial and --wrist-camera-serial "
@@ -689,6 +715,7 @@ def run(args: argparse.Namespace) -> int:
                 record_force=args.record_force,
                 tactile=tactile,
                 tactile_max_age_ms=args.tactile_max_age_ms,
+                action_source=HAND_GUIDE_ACTION_SOURCE if args.hand_guide else None,
             )
             collector.start()
             if args.preview:
@@ -719,8 +746,13 @@ def run(args: argparse.Namespace) -> int:
                 print("Check complete: no motion command was sent.")
                 return 0
 
-            streaming = not args.dry_run and not args.legacy_waypoints
-            if streaming and robot is not None:
+            streaming = not args.dry_run and not args.legacy_waypoints and not args.hand_guide
+            if args.hand_guide:
+                print(
+                    "Hand-guide mode: no arm command will be sent. Move the arm with the robot's guiding "
+                    "buttons; nothing here limits the force on the gel."
+                )
+            elif streaming and robot is not None:
                 robot.start_stream(args.watchdog_ms, args.max_joint_speed, args.max_joint_acceleration)
                 streaming_active = True
                 print(f"Streaming control active at {args.stream_rate:.0f} Hz (watchdog: {args.watchdog_ms} ms).")
@@ -742,13 +774,16 @@ def run(args: argparse.Namespace) -> int:
                     robot.start_stream(args.watchdog_ms, args.max_joint_speed, args.max_joint_acceleration)
                     streaming_active = True
 
-            print("\nTeleoperation is active; moving a control commands the robot immediately.")
-            print(
-                "Left stick: X/Y | LT/LB: selected-frame Z down/up | "
-                "D-pad up/down: tool Z +/- | D-pad left/right: tool Y +/- | "
-                "right stick: roll/pitch | RT/RB: yaw"
-            )
-            controls = "A: close gripper | B: open gripper | Menu: home | Back: quit"
+            if args.hand_guide:
+                controls = "A: close gripper | B: open gripper | Back: quit"
+            else:
+                print("\nTeleoperation is active; moving a control commands the robot immediately.")
+                print(
+                    "Left stick: X/Y | LT/LB: selected-frame Z down/up | "
+                    "D-pad up/down: tool Z +/- | D-pad left/right: tool Y +/- | "
+                    "right stick: roll/pitch | RT/RB: yaw"
+                )
+                controls = "A: close gripper | B: open gripper | Menu: home | Back: quit"
             if collector is not None:
                 controls += " | X: start/stop recording"
             print(controls)
@@ -838,6 +873,11 @@ def run(args: argparse.Namespace) -> int:
                         print(f"\n⬆️ Recording started: {pending}")
                     continue
 
+                if home_requested and args.hand_guide:
+                    rumbler.error()
+                    print("\nHoming is disabled in --hand-guide mode: it would move the arm under your hands.")
+                    continue
+
                 if home_requested:
                     if collector is not None and collector.active:
                         collector.set_action(np.zeros(7))
@@ -880,6 +920,13 @@ def run(args: argparse.Namespace) -> int:
                         robot.close_gripper() if close_requested else robot.open_gripper()
                         if collector is not None:
                             collector.set_gripper_observation(robot.gripper_position())
+                    continue
+
+                if args.hand_guide and robot is not None:
+                    q = hand_guide_tick(robot, collector)
+                    remaining = stream_period - (time.monotonic() - loop_started)
+                    if remaining > 0:
+                        time.sleep(remaining)
                     continue
 
                 twist = joystick_twist(snapshot, mapping, args.linear_speed, args.angular_speed, args.deadzone)

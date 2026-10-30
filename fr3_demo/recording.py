@@ -256,6 +256,7 @@ class RawEpisodeWriter:
         image_size: tuple[int, int] | None = DEFAULT_IMAGE_SIZE,
         record_force: bool = True,
         tactile: dict[str, Any] | None = None,
+        action_source: str | None = None,
     ) -> None:
         self.episode_index = episode_index
         self.fps = fps
@@ -392,6 +393,10 @@ class RawEpisodeWriter:
             "language_instruction": None,
             "frame_count": 0,
         }
+        if action_source is not None:
+            # Only non-default sources are recorded, so teleop episodes keep
+            # exactly the metadata they had before this key existed.
+            self._metadata["action_source"] = action_source
         _write_json(self.path / "metadata.json", self._metadata)
 
     @property
@@ -717,6 +722,7 @@ class DemoCollector:
         record_force: bool = True,
         tactile: Any | None = None,
         tactile_max_age_ms: float = 60.0,
+        action_source: str | None = None,
     ) -> None:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         root = output_root.expanduser().resolve()
@@ -742,6 +748,7 @@ class DemoCollector:
         self.image_workers = image_workers
         self.image_queue_size = image_queue_size
         self.record_force = bool(record_force)
+        self.action_source = action_source
         # The sensor object is owned by the caller: it must be opened before a
         # session starts so a missing sensor refuses collection up front rather
         # than failing on the first episode.
@@ -897,6 +904,7 @@ class DemoCollector:
                 image_size=self.image_size,
                 record_force=self.record_force,
                 tactile=self._tactile_settings(),
+                action_source=self.action_source,
             )
             if self.tactile is not None:
                 # Seed the episode with the frame already in the sensor's
