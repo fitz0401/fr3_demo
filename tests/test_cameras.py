@@ -141,3 +141,16 @@ class RealSensePairTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FrameRateTest(unittest.TestCase):
+    def test_start_turns_off_auto_exposure_priority(self) -> None:
+        rs = MagicMock()
+        sensor = MagicMock()
+        sensor.supports.return_value = True
+        rs.pipeline.return_value.start.return_value.get_device.return_value.query_sensors.return_value = [sensor]
+        camera = RealSenseCamera("serial", fps=60)
+        with patch("fr3_demo.cameras._load_realsense", return_value=rs), patch.object(camera, "_capture_loop"):
+            camera.start()
+        sensor.set_option.assert_any_call(rs.option.auto_exposure_priority, 0.0)
+        sensor.set_option.assert_any_call(rs.option.global_time_enabled, 1.0)

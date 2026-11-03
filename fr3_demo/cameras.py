@@ -120,6 +120,16 @@ class RealSenseCamera:
                     sensor.set_option(rs.option.global_time_enabled, 1.0)
             except RuntimeError as error:
                 LOG.warning("Could not enable global timestamps for RealSense %s: %s", self.serial, error)
+            # With auto-exposure priority on (the default), a dim scene makes the
+            # camera expose longer than a frame and halve its rate: an exterior
+            # D435i fell from 60 to 33 fps with an operator in view, and the
+            # recorder's alignment limit then rejected the episode. Off, the
+            # exposure is capped by the frame period and the image gets darker.
+            try:
+                if sensor.supports(rs.option.auto_exposure_priority):
+                    sensor.set_option(rs.option.auto_exposure_priority, 0.0)
+            except RuntimeError as error:
+                LOG.warning("Could not fix the frame rate of RealSense %s: %s", self.serial, error)
 
         self._pipeline = pipeline
         self._stop.clear()
