@@ -55,6 +55,23 @@ class GuideModeChoiceTest(unittest.TestCase):
             robot.set_load(0.9, [0.0, 0.0, 0.06])
 
 
+class PayloadTest(unittest.TestCase):
+    @patch("fr3_demo.teleop.time.sleep")
+    @patch("fr3_demo.teleop.BambooFrankaClient")
+    def test_set_load_waits_for_franka_to_finish_blending(self, client_class: MagicMock, _sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.get_joint_states.return_value = {"qpos": [0.0] * 7}
+        client.supports.return_value = True
+        client.set_load.return_value = {"success": True}
+        ramp = [0.2, 0.6, 1.1]
+        client.get_capabilities.side_effect = [{"payload": {"m_load": value}} for value in ramp]
+        client_class.return_value = client
+        robot = BambooRobot("127.0.0.1", 5555, 5559, "robotiq", False)
+        robot.set_load(1.1, [0.0, 0.0, 0.07])
+        self.assertEqual(client.get_capabilities.call_count, len(ramp))
+        client.set_load.assert_called_once_with(1.1, [0.0, 0.0, 0.07])
+
+
 class GuideHeartbeatTest(unittest.TestCase):
     def test_sends_updates_until_stopped_then_closes_its_connection(self) -> None:
         client = FakeGuideClient()

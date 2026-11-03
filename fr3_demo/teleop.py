@@ -212,6 +212,17 @@ class BambooRobot:
                 "from the config."
             )
         self._require_success(self._arm.set_load(mass, center_of_mass), "set the payload")
+        # Franka blends a new load in over about a second. Wait until it reports
+        # the full mass, so a guide start right after cannot see a half-applied
+        # load as an external force and refuse.
+        deadline = time.monotonic() + 3.0
+        while True:
+            reported = float(self._arm.get_capabilities().get("payload", {}).get("m_load", mass))
+            if abs(reported - mass) <= max(0.01, 0.01 * mass):
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Franka reports a {reported:.3f} kg payload, not the {mass:.3f} kg requested")
+            time.sleep(0.05)
 
     def legacy_command(self, target: np.ndarray, duration: float) -> None:
         response = self._arm.execute_joint_impedance_path(
