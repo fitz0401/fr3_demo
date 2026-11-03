@@ -4,25 +4,36 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from fr3_demo.guide import GuideHeartbeat, choose_guide_mode, hold_message
+from fr3_demo.guide import GuideHeartbeat, choose_guide_mode, guide_failure_advice, hold_message
 from fr3_demo.settings import load_config, teleop_defaults
 from fr3_demo.teleop import BambooRobot, _create_parser, _validate_args
 
+USER_STOPPED = (
+    "Guide mode stopped: Franka guide control error: libfranka: Move command rejected: command not possible "
+    'in the current mode ("User stopped")!'
+)
+
 
 class FakeGuideClient:
-    def __init__(self, fail_after: int | None = None) -> None:
+    def __init__(self, fail_after: int | None = None, error: str = "Guide mode is not running") -> None:
         self.updates = 0
         self.closed = False
         self.fail_after = fail_after
+        self.error = error
 
     def update_guiding(self, level: float = 0.0, valid: bool = True) -> dict:
         self.updates += 1
         if self.fail_after is not None and self.updates > self.fail_after:
-            return {"success": False, "error": "Guide mode is not running"}
+            return {"success": False, "error": self.error}
         return {"success": True, "phase": 0, "reason": 0, "level": level, "stale": False}
 
     def close(self) -> None:
         self.closed = True
+
+
+class UnreachableGuideClient(FakeGuideClient):
+    def update_guiding(self, level: float = 0.0, valid: bool = True) -> dict:
+        raise TimeoutError("Bamboo did not answer")
 
 
 def _wait_for(predicate, timeout: float = 2.0) -> bool:
@@ -85,14 +96,58 @@ class GuideHeartbeatTest(unittest.TestCase):
         time.sleep(0.05)
         self.assertEqual(client.updates, sent)
 
-    def test_a_rejected_update_is_reported(self) -> None:
+    def test_an_ended_guide_loop_is_reported_as_ended(self) -> None:
         client = FakeGuideClient(fail_after=2)
         heartbeat = GuideHeartbeat(lambda: client, rate_hz=200.0)
         heartbeat.start()
         self.assertTrue(_wait_for(lambda: client.closed))
+        self.assertTrue(heartbeat.ended_on_robot)
+        with self.assertRaisesRegex(RuntimeError, "Guide mode ended"):
+            heartbeat.check_health()
+        heartbeat.stop()
+
+    def test_a_user_stop_comes_with_what_to_do(self) -> None:
+        client = FakeGuideClient(fail_after=0, error=USER_STOPPED)
+        heartbeat = GuideHeartbeat(lambda: client, rate_hz=200.0)
+        heartbeat.start()
+        self.assertTrue(_wait_for(lambda: client.closed))
+        with self.assertRaisesRegex(RuntimeError, "(?s)User stopped.*Release it so the lights turn blue"):
+            heartbeat.check_health()
+        heartbeat.stop()
+
+    def test_losing_bamboo_means_the_watchdog_holds(self) -> None:
+        client = UnreachableGuideClient()
+        heartbeat = GuideHeartbeat(lambda: client, rate_hz=200.0)
+        heartbeat.start()
+        self.assertTrue(_wait_for(lambda: client.closed))
+        self.assertFalse(heartbeat.ended_on_robot)
         with self.assertRaisesRegex(RuntimeError, "arm is holding"):
             heartbeat.check_health()
         heartbeat.stop()
+
+
+class GuideFailureAdviceTest(unittest.TestCase):
+    def test_raw_franka_errors_get_advice(self) -> None:
+        self.assertIn("Release it", guide_failure_advice(USER_STOPPED))
+        pressed = "Franka guide control error: libfranka: Move command aborted: User Stop pressed!"
+        self.assertIn("was pressed", guide_failure_advice(pressed))
+        reflex = 'libfranka: Move command aborted: motion aborted by reflex! ["joint_velocity_violation"]'
+        self.assertIn("reflex", guide_failure_advice(reflex))
+
+    def test_bamboo_messages_that_already_say_what_to_do_get_none(self) -> None:
+        refusal = 'Franka is user-stopped (robot mode "User stopped"): the user stop button is pressed. Release it'
+        self.assertIsNone(guide_failure_advice(refusal))
+        self.assertIsNone(guide_failure_advice("libfranka: something new"))
+
+    @patch("fr3_demo.teleop.BambooFrankaClient")
+    def test_a_refused_start_says_guide_mode_did_not_start(self, client_class: MagicMock) -> None:
+        client = MagicMock()
+        client.get_joint_states.return_value = {"qpos": [0.0] * 7}
+        client.start_guiding.return_value = {"success": False, "error": USER_STOPPED.split(": ", 1)[1]}
+        client_class.return_value = client
+        robot = BambooRobot("127.0.0.1", 5555, 5559, "robotiq", False)
+        with self.assertRaisesRegex(RuntimeError, "(?s)Could not start guide mode.*Release it"):
+            robot.start_guide(250, 0.35)
 
 
 class HoldMessageTest(unittest.TestCase):

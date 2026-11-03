@@ -215,6 +215,11 @@ How depends on the Bamboo server:
 - **Pilot buttons** (an older server, or `--pilot-guide`): the robot's own
   guiding buttons move the arm, as before.
 
+Guide mode is a Franka motion like teleop, so start it the same way: user
+stop released and lights blue. If the user stop is pressed, guide mode refuses
+to start and says so. Pressing it while guiding stops the arm and ends the
+session; release it and run `fr3-collect` again.
+
 Guide mode refuses to start while Franka's external force estimate is above
 `[guide] max_start_force` (5 N): usually the gripper's weight is not
 compensated, so a released arm would sink. Weigh the gripper, sensor and tool

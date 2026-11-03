@@ -16,7 +16,7 @@ from typing import Any
 import numpy as np
 from bamboo import BambooFrankaClient
 
-from fr3_demo.guide import GuideHeartbeat, choose_guide_mode, hold_message
+from fr3_demo.guide import GuideHeartbeat, choose_guide_mode, describe_guide_failure, hold_message
 from fr3_demo.joystick import JoystickSnapshot, LinuxJoystick, axis, button, shaped_axis
 from fr3_demo.kinematics import WorkspaceBounds, forward_kinematics, resolved_rate_step
 from fr3_demo.settings import default_config_path, load_config, teleop_defaults
@@ -197,7 +197,9 @@ class BambooRobot:
         if max_start_force is not None:
             options["max_start_force"] = max_start_force
         response = self._arm.start_guiding(watchdog_ms=watchdog_ms, max_joint_velocity=max_joint_velocity, **options)
-        self._require_success(response, "start guiding")
+        if not response.get("success", False):
+            error = str(response.get("error", "Bamboo refused to start guiding"))
+            raise RuntimeError(describe_guide_failure("Could not start guide mode", error))
 
     def resume_guide(self) -> None:
         self._require_success(self._arm.resume_guiding(), "resume guiding")
@@ -866,7 +868,8 @@ def run(args: argparse.Namespace) -> int:
                     print(
                         "Hand-guide mode: the arm floats, so grab it and move it; no guiding buttons needed. "
                         f"It resists above {args.guide_max_joint_velocity:.2f} rad/s, holds when left still and "
-                        "breaks free when pushed. Nothing here limits the force on the gel yet."
+                        "breaks free when pushed. Pressing the user stop stops the arm and ends guide mode. "
+                        "Nothing here limits the force on the gel yet."
                     )
                 else:
                     print(
@@ -1169,7 +1172,9 @@ def run(args: argparse.Namespace) -> int:
                 try:
                     robot.stop_guide()
                 except Exception as error:  # noqa: BLE001 - without updates the watchdog holds the arm
-                    LOG.warning("Could not explicitly stop Bamboo guide mode: %s", error)
+                    # Guide mode that ended on its own has already said why.
+                    if heartbeat is None or not heartbeat.ended_on_robot:
+                        LOG.warning("Could not explicitly stop Bamboo guide mode: %s", error)
         if heartbeat is not None:
             heartbeat.stop()
         if robot is not None:

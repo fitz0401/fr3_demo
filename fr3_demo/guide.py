@@ -14,6 +14,32 @@ GUIDE_FEATURE = "guide_mode"
 # Holds the arm leaves on its own (idle) or that are part of normal operation
 # (stopping); every other hold needs the operator to resume.
 SILENT_HOLDS = {"none", "idle", "stopping"}
+# How Bamboo answers once its guide loop has ended, on a Franka error or a stop.
+GUIDE_ENDED = ("Guide mode stopped", "Guide mode is not running")
+# libfranka's words for why a motion ended or was refused, and what the
+# operator does about it. More specific markers come first.
+FRANKA_ADVICE = (
+    ("user stop pressed", "The user stop was pressed. Release it so the lights turn blue, then run fr3-collect again."),
+    ("user stopped", "The user stop is pressed. Release it so the lights turn blue, then run fr3-collect again."),
+    (
+        "reflex",
+        "Franka stopped the arm on a reflex, such as a collision. Run fr3-collect again; guide mode clears the reflex as it starts.",
+    ),
+)
+
+
+def guide_failure_advice(error: str) -> str | None:
+    """Say what to do about a raw libfranka error; Bamboo's own messages already do."""
+
+    if "libfranka" not in error:
+        return None
+    lowered = error.lower()
+    return next((advice for marker, advice in FRANKA_ADVICE if marker in lowered), None)
+
+
+def describe_guide_failure(context: str, error: str) -> str:
+    advice = guide_failure_advice(error)
+    return f"{context}: {error}" + (f"\n{advice}" if advice else "")
 
 
 def choose_guide_mode(robot: Any, force_pilot: bool) -> str:
@@ -80,11 +106,23 @@ class GuideHeartbeat:
                 except Exception as error:  # noqa: BLE001 - closing must not mask the original error
                     LOG.warning("Closing the guide heartbeat connection failed: %s", error)
 
+    @property
+    def ended_on_robot(self) -> bool:
+        """Whether the heartbeat stopped because Bamboo's guide loop had ended."""
+
+        with self._lock:
+            error = self._error
+        return error is not None and str(error).startswith(GUIDE_ENDED)
+
     def check_health(self) -> None:
         with self._lock:
             error = self._error
-        if error is not None:
-            raise RuntimeError(f"Guide heartbeat stopped, so the arm is holding: {error}") from error
+        if error is None:
+            return
+        if self.ended_on_robot:
+            # Franka stopped the motion (or it was stopped): the arm no longer floats.
+            raise RuntimeError(describe_guide_failure("Guide mode ended, so the arm no longer floats", str(error)))
+        raise RuntimeError(f"Guide heartbeat stopped, so the arm is holding: {error}") from error
 
     def status(self) -> dict[str, Any]:
         with self._lock:
