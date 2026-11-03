@@ -149,6 +149,48 @@ rotate_180 = false
 mass_kg = 1.10
 center_of_mass_m = [0.0, 0.0, 0.07]  # flange frame
 
+# Contact limits for every stream (teleop, collection, policy runs, homing),
+# enforced by Bamboo at 1 kHz, so the arm cannot load the tool, or the GelSight
+# holding it, too hard. Off unless enabled; fr3-collect and fr3-pi05-run clear
+# them on exit. Franka's force estimate also counts anything the gripper lifts
+# (a 1 kg bottle reads about 10 N), so enable them for contact tasks such as
+# peeling, not lifting tasks such as pouring. Watch them with fr3-contact-check.
+[contact]
+enabled = false
+# true: report the push cap (fr3-contact-check) without applying it.
+shadow = false
+# The force a stream may push with at the contact point if it is blocked.
+max_force_n = 15.0
+# Tool tip where it meets the fruit, flange frame (m). Measure yours.
+contact_point_m = [0.0, 0.0, 0.20]
+# Franka's external force estimate above this for 0.05 N s of excess, or above
+# the hard limit at once: the arm goes soft for 0.2 s and the stream stops.
+guard_force_n = 20.0
+guard_hard_force_n = 30.0
+# Franka's own collision reflex, the last resort (it stops the arm too).
+collision_force_n = 35.0
+# Speed limit for the contact point (m/s); 0 leaves it off.
+max_point_speed_m_s = 0.0
+
+# GelSight guard: watches the marker gel itself, so it also works while you
+# guide the arm by hand (when Franka's own estimate cannot tell your hand from
+# the fruit). Needs the marker gel and a calibration from fr3-gel-calibrate.
+# Hand guiding: as the load rises the arm stiffens against loading it further,
+# and at the limit it will not go further that way (backing off stays free).
+# Teleop: driving further into the load is blocked; it yields past 1.2x.
+# Policy runs: the stream yields and the run stops at the limit, or if the gel
+# signal is lost. After every gripper command the gel is re-zeroed.
+[gel]
+enabled = false
+# Estimated force through the gel at level 1 (N).
+limit_n = 10.0
+# Twist of the marker field at level 1 (rad).
+twist_limit_rad = 0.1
+# From fr3-gel-calibrate (EE-frame force per px of marker shift, and per unit
+# spread). Recalibrate after moving the sensor or changing [tactile] rotate_180.
+# shear_to_force = [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+# spread_to_force = [0.0, 0.0, 0.0]
+
 [teleop]
 linear_speed = 0.08
 angular_speed = 0.35

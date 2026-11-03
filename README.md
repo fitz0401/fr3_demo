@@ -205,9 +205,11 @@ fr3-collect --hand-guide                 # add --record-tactile with the GelSigh
 How depends on the Bamboo server:
 
 - **Guide mode** (a server with the `guide_mode` feature): the arm floats.
-  Grab it anywhere and move it, with no guiding buttons. Joints resist above
-  `[guide] max_joint_velocity` (0.35 rad/s by default, the streaming limit, so
-  every demonstration can be replayed). Left still for a second, the arm holds
+  Grab it anywhere and move it, with no guiding buttons. No joint can be moved
+  faster than `[guide] max_joint_velocity` (0.35 rad/s by default, the
+  streaming limit, so every demonstration can be replayed): below it you feel
+  nothing, above it a stiff spring holds you back (Bamboo's speed leash, up to
+  40 N m on the large joints). Left still for a second, the arm holds
   its pose and breaks free when pushed. Near a joint limit it pushes back,
   harder the closer you get, but never blocks moving away. If the update
   stream stops, the arm damps to a stop and holds; press **RB** to resume once
@@ -230,7 +232,46 @@ and declare them in `[payload]` (unless Desk already lists that mass).
 The action is the arm's own motion: each row stores the average joint
 velocity over the next row period, from the 1 kHz joint positions, and the
 episode metadata says `action_source: measured_joint_velocity`. Homing is
-refused in this mode. Nothing here limits the force on the gel yet.
+refused in this mode. With `[gel]` on, the GelSight guard below protects the
+gel while you guide; without it nothing limits the force on the gel.
+
+### Protecting the GelSight
+
+Two independent layers, both off until enabled in `config.toml`:
+
+| | `[contact]` (Bamboo, 1 kHz) | `[gel]` (GelSight, ~25 Hz) |
+|---|---|---|
+| Senses | Franka's force estimate and the stream's own push | the marker gel itself |
+| Teleop, policy runs | push cap, force guard that yields, Franka reflex | blocks driving into the load (teleop); stops the run at the limit or if the signal is lost |
+| Hand guiding | not applicable (your hand is part of the force) | the arm stiffens against further loading; at the limit it will not go further that way |
+| Caveat | counts lifted objects (1 kg reads ~10 N): contact tasks only | needs the marker gel and a calibration |
+
+The contact limits make a policy run unable to push the tool harder than the
+set force, and Franka's own reflex is the backstop if anything else fails.
+While you guide by hand, the gel guard resists and warns, but it cannot stop
+a hand that pushes through it; only a mechanical limit could.
+
+Bring-up, with the user stop at hand:
+
+1. Rebuild Bamboo on the robot PC (`feature/contact-safety`) and restart it.
+2. Fit the marker gel and the tool, then calibrate the gel against Franka's
+   estimate: `fr3-gel-calibrate`. With the arm still and no loop running,
+   press the tool tip with a finger, 3 to 10 N, in several directions,
+   touching only the tool. Copy the two lines it prints into `[gel]`, set
+   `limit_n`, and `enabled = true`.
+3. `[contact]`: measure your tool tip (`contact_point_m`), set
+   `enabled = true` and `shadow = true`, and teleop through a normal task
+   while `fr3-contact-check` runs in a second terminal. In free motion the
+   push should stay well under `max_force_n` and the tool force near 0 N.
+4. Set `shadow = false` and press the tool into a kitchen scale by teleop:
+   the scale should stop near `max_force_n`, and pushing on harder makes the
+   guard yield. Then the same with a policy run.
+5. Hand guiding: press the tool into the scale by hand; the arm should
+   stiffen as the gel's level rises and stop advancing at `limit_n`.
+
+`fr3-collect` and `fr3-pi05-run` set the limits when they start and clear them
+when they exit; `--no-contact-limits` and `--no-gel-guard` turn either off for
+one session.
 
 ### Recording format
 
@@ -371,6 +412,8 @@ the gripper before inference; policy motion additionally requires `--execute`.
 | `fr3-convert` | Build and optionally upload a LeRobot dataset |
 | `fr3-downsize` | Rewrite older native-resolution episodes at the stored size |
 | `fr3-tactile-check` | List tactile devices and measure the achieved rate |
+| `fr3-gel-calibrate` | Fit the GelSight guard's force calibration against Franka's estimate |
+| `fr3-contact-check` | Watch the tool force, push cap and guard live (read-only) |
 | `fr3-pi05-check` | Non-moving policy integration check |
 | `fr3-pi05-run` | Guarded pi0.5 rollout |
 

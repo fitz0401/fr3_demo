@@ -16,6 +16,8 @@ from typing import Any
 import numpy as np
 from bamboo import BambooFrankaClient
 
+from fr3_demo.contact import describe_contact_limits
+from fr3_demo.gel import limit_twist
 from fr3_demo.guide import GuideHeartbeat, choose_guide_mode, describe_guide_failure, hold_message
 from fr3_demo.joystick import JoystickSnapshot, LinuxJoystick, axis, button, shaped_axis
 from fr3_demo.kinematics import WorkspaceBounds, forward_kinematics, resolved_rate_step
@@ -167,6 +169,11 @@ class BambooRobot:
         )
         self._require_success(response, "start streaming")
 
+    def yield_stream(self, reason: str) -> None:
+        """Make the active stream stop pushing and end (Bamboo goes soft, then holds)."""
+
+        self._require_success(self._arm.yield_streaming(reason), "yield the stream")
+
     def stream_velocity(self, velocity: np.ndarray) -> None:
         response = self._arm.stream_joint_velocity(velocity)
         self._require_success(response, "update streaming velocity")
@@ -226,6 +233,38 @@ class BambooRobot:
                 raise RuntimeError(f"Franka reports a {reported:.3f} kg payload, not the {mass:.3f} kg requested")
             time.sleep(0.05)
 
+    def apply_contact_limits(self, limits: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Set [contact] limits for the following streams; with None, clear any left over.
+
+        Bamboo keeps limits until they are cleared or it restarts, so a session
+        without [contact] must not inherit the previous session's. Returns what
+        Bamboo applied, or None.
+        """
+
+        if limits is None:
+            if self.supports("contact_limits"):
+                self._require_success(self._arm.clear_contact_limits(), "clear contact limits")
+            return None
+        if not self.supports("contact_limits"):
+            raise RuntimeError(
+                "The running Bamboo controller cannot limit contact forces. Update Bamboo, or turn [contact] off."
+            )
+        response = self._arm.set_contact_limits(**limits)
+        self._require_success(response, "set contact limits")
+        return dict(response.get("limits", limits))
+
+    def clear_contact_limits(self, timeout: float = 1.5) -> None:
+        """Clear the limits; a stream that just yielded may need a moment to end first."""
+
+        deadline = time.monotonic() + timeout
+        while True:
+            response = self._arm.clear_contact_limits()
+            busy = "active control loop" in str(response.get("error", ""))
+            if response.get("success", False) or not busy or time.monotonic() >= deadline:
+                self._require_success(response, "clear contact limits")
+                return
+            time.sleep(0.05)
+
     def legacy_command(self, target: np.ndarray, duration: float) -> None:
         response = self._arm.execute_joint_impedance_path(
             np.asarray(target, dtype=float)[None, :],
@@ -277,6 +316,9 @@ class BambooRobot:
 
 
 HAND_GUIDE_ACTION_SOURCE = "measured_joint_velocity"
+# Teleop already stops driving into a loaded gel at level 1 (gel.limit_twist);
+# past this the stream yields, in case the load keeps rising anyway.
+GEL_TELEOP_STOP_LEVEL = 1.2
 
 
 def hand_guide_tick(robot: Any, collector: Any | None) -> dict:
@@ -495,6 +537,18 @@ def _create_parser() -> argparse.ArgumentParser:
         default=None,
         help="payload center of mass in the flange frame, in m",
     )
+    parser.add_argument(
+        "--no-contact-limits",
+        action="store_true",
+        help="leave the config's [contact] limits off for this session",
+    )
+    parser.add_argument(
+        "--no-gel-guard",
+        action="store_true",
+        help="leave the config's [gel] GelSight guard off for this session",
+    )
+    # [contact] and [gel] in the config fill these in (see settings).
+    parser.set_defaults(contact_limits=None, gel=None)
     parser.add_argument("--data-dir", type=Path, default=Path("data/raw"), help="raw recording root")
     parser.add_argument(
         "--external-camera-serial",
@@ -732,6 +786,12 @@ def run(args: argparse.Namespace) -> int:
     heartbeat: Any | None = None
     streaming_active = False
     guiding_active = False
+    contact_limits_set = False
+    gel_camera: Any | None = None
+    gel: Any | None = None
+    gel_resume_pending = False
+    gel_warned_level = 0.0
+    gel_yielded = False
     stop = False
 
     def request_stop(*_: object) -> None:
@@ -754,6 +814,13 @@ def run(args: argparse.Namespace) -> int:
             if args.payload_mass_kg is not None and not (args.dry_run or args.check):
                 robot.set_load(args.payload_mass_kg, args.payload_com_m)
                 print(f"Payload set: {args.payload_mass_kg:.3f} kg at {list(args.payload_com_m)} m (flange frame).")
+            if not (args.dry_run or args.check):
+                # Guide mode is not a stream: [contact] does not apply to it.
+                wanted = None if (args.no_contact_limits or args.hand_guide) else args.contact_limits
+                applied = robot.apply_contact_limits(wanted)
+                if applied is not None:
+                    contact_limits_set = True
+                    print(describe_contact_limits(applied))
 
         if args.collect:
             from fr3_demo.cameras import RealSensePair
@@ -847,6 +914,29 @@ def run(args: argparse.Namespace) -> int:
             rumbler = open_rumbler(args.feedback_event)
             print(f"Raw demonstration session: {collector.session_dir}")
 
+        if args.gel is not None and not args.no_gel_guard and robot is not None and not (args.dry_run or args.check):
+            from fr3_demo.gel import GelCalibration, GelMonitor
+
+            calibration = GelCalibration.from_config(args.gel)
+            camera = tactile
+            if camera is None:
+                from fr3_demo.tactile import GelSightCamera
+
+                gel_camera = GelSightCamera(
+                    device=args.tactile_device or None,
+                    width=args.tactile_width,
+                    height=args.tactile_height,
+                    fps=args.tactile_fps,
+                    rotate_180=args.tactile_rotate_180,
+                )
+                gel_camera.start()
+                camera = gel_camera
+            gel = GelMonitor(calibration)
+            camera.add_frame_observer(gel.on_frame)
+            print("Zeroing the GelSight: keep the tool still and out of contact...")
+            gel.wait_zeroed(10.0)
+            print(f"GelSight guard on: level 1 is an estimated {calibration.limit_n:.0f} N through the gel.")
+
         with LinuxJoystick(args.joystick) as joystick:
             q = _diagnostics(joystick, robot, nominal_q)
             if args.check:
@@ -863,13 +953,19 @@ def run(args: argparse.Namespace) -> int:
                         args.guide_max_start_force,
                     )
                     guiding_active = True
-                    heartbeat = GuideHeartbeat(robot.new_arm_client, args.guide_heartbeat_hz)
+                    heartbeat = GuideHeartbeat(robot.new_arm_client, args.guide_heartbeat_hz, gel=gel)
                     heartbeat.start()
+                    gel_note = (
+                        "As the gel's load nears its limit the arm stiffens against loading it further; "
+                        "backing off stays free."
+                        if gel is not None
+                        else "Nothing here limits the force on the gel ([gel] is off)."
+                    )
                     print(
                         "Hand-guide mode: the arm floats, so grab it and move it; no guiding buttons needed. "
-                        f"It resists above {args.guide_max_joint_velocity:.2f} rad/s, holds when left still and "
-                        "breaks free when pushed. Pressing the user stop stops the arm and ends guide mode. "
-                        "Nothing here limits the force on the gel yet."
+                        f"It will not go faster than {args.guide_max_joint_velocity:.2f} rad/s per joint, holds "
+                        "when left still and breaks free when pushed. Pressing the user stop stops the arm and "
+                        f"ends guide mode. {gel_note}"
                     )
                 else:
                     print(
@@ -1045,7 +1141,13 @@ def run(args: argparse.Namespace) -> int:
                     if args.dry_run:
                         print("DRY RUN: gripper close" if close_requested else "DRY RUN: gripper open")
                     elif robot is not None:
+                        if gel is not None:
+                            gel.suspend("the gripper is moving")
                         robot.close_gripper() if close_requested else robot.open_gripper()
+                        if gel is not None:
+                            # The grasp presses the gel: that is the new zero.
+                            gel.rezero()
+                            gel_resume_pending = guiding_active
                         if collector is not None:
                             collector.set_gripper_observation(robot.gripper_position())
                     continue
@@ -1059,8 +1161,16 @@ def run(args: argparse.Namespace) -> int:
                         last_resume_count = resume_count
                     state = hand_guide_tick(robot, collector)
                     q = np.asarray(state["qpos"], dtype=float)
+                    if gel_resume_pending and gel is not None and gel.zeroed:
+                        if state.get("guide_phase") == "hold" and state.get("guide_hold_reason") == "gel_invalid":
+                            robot.resume_guide()
+                            gel_resume_pending = False
+                        elif state.get("guide_phase") == "free":
+                            gel_resume_pending = False
                     if heartbeat is not None:
-                        message = hold_message(state)
+                        message = hold_message(state, None if gel is None else gel.latest().reason)
+                        if gel_resume_pending and state.get("guide_hold_reason") == "gel_invalid":
+                            message = "Holding while the GelSight re-zeroes after the gripper move."
                         if message != last_hold_message:
                             if message is not None:
                                 rumbler.error()
@@ -1082,6 +1192,19 @@ def run(args: argparse.Namespace) -> int:
                     twist = np.concatenate((rotation @ twist[:3], rotation @ twist[3:]))
                 twist[:3] += rotation[:, 1] * tool_y
                 twist[:3] += rotation[:, 2] * tool_z
+                if gel is not None:
+                    reading = gel.latest()
+                    twist = limit_twist(twist, reading, rotation)
+                    overloaded = reading.valid and reading.level >= GEL_TELEOP_STOP_LEVEL
+                    if overloaded and streaming and robot is not None and not gel_yielded:
+                        # Once: the next stream command then fails with this reason.
+                        robot.yield_stream(f"GelSight load at level {reading.level:.2f}")
+                        gel_yielded = True
+                    if reading.valid and reading.level >= 0.5 > gel_warned_level:
+                        if rumbler is not None:
+                            rumbler.error()
+                        print(f"\nGel load at {reading.level:.0%} of its limit: moving further into it is blocked.")
+                    gel_warned_level = reading.level if reading.valid else 0.0
 
                 moving = float(np.linalg.norm(twist)) > 1e-8
                 if moving:
@@ -1162,6 +1285,11 @@ def run(args: argparse.Namespace) -> int:
                 LOG.warning("Could not stop the tactile sensor: %s", error)
         if cameras is not None:
             cameras.close()
+        if gel_camera is not None:
+            try:
+                gel_camera.close()
+            except Exception as error:  # noqa: BLE001 - shutdown must continue to robot cleanup
+                LOG.warning("Could not stop the GelSight: %s", error)
         if robot is not None:
             if streaming_active:
                 try:
@@ -1177,6 +1305,11 @@ def run(args: argparse.Namespace) -> int:
                         LOG.warning("Could not explicitly stop Bamboo guide mode: %s", error)
         if heartbeat is not None:
             heartbeat.stop()
+        if robot is not None and contact_limits_set:
+            try:
+                robot.clear_contact_limits()
+            except Exception as error:  # noqa: BLE001 - closing the client must still happen
+                LOG.warning("Could not clear Bamboo contact limits: %s", error)
         if robot is not None:
             robot.close()
 

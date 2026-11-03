@@ -72,13 +72,17 @@ class GuideHeartbeat:
     this thread stops for any reason, the updates stop and the arm damps to a
     stop and holds, which is the safe direction.
 
-    Until the gel shear estimator drives it, every update says level 0: keep
-    floating, no wall.
+    Without a gel monitor every update says level 0: keep floating, no wall.
+    With one, each update carries the gel's latest reading: its level, the
+    direction that loads it, and its frame sequence number. A repeated
+    sequence number is not fresh for Bamboo, so a stalled GelSight trips the
+    watchdog, and an invalid reading holds the arm.
     """
 
-    def __init__(self, client_factory: Callable[[], Any], rate_hz: float = 30.0) -> None:
+    def __init__(self, client_factory: Callable[[], Any], rate_hz: float = 30.0, gel: Any | None = None) -> None:
         if rate_hz <= 0:
             raise ValueError("rate_hz must be positive")
+        self._gel = gel
         self._client_factory = client_factory
         self._period = 1.0 / rate_hz
         self._stop = threading.Event()
@@ -99,7 +103,16 @@ class GuideHeartbeat:
             client = self._client_factory()
             while not self._stop.is_set():
                 started = time.monotonic()
-                response = client.update_guiding(level=0.0, valid=True)
+                if self._gel is None:
+                    response = client.update_guiding(level=0.0, valid=True)
+                else:
+                    reading = self._gel.latest()
+                    response = client.update_guiding(
+                        level=reading.level if reading.valid else 0.0,
+                        valid=reading.valid,
+                        direction=list(reading.direction_ee) if reading.direction_ee is not None else None,
+                        seq=reading.seq,
+                    )
                 if not response.get("success", False):
                     raise RuntimeError(str(response.get("error", "Bamboo rejected a guide update")))
                 with self._lock:
@@ -143,7 +156,7 @@ class GuideHeartbeat:
             self._thread.join(timeout=2.0)
 
 
-def hold_message(state: dict[str, Any]) -> str | None:
+def hold_message(state: dict[str, Any], gel_reason: str | None = None) -> str | None:
     """Describe a hold the operator has to act on, or return None."""
 
     if state.get("guide_phase") in (None, "free", "release"):
@@ -153,7 +166,8 @@ def hold_message(state: dict[str, Any]) -> str | None:
         return None
     advice = {
         "watchdog": "guide updates stopped arriving",
-        "gel_invalid": "the gel signal is not trustworthy",
+        "gel_invalid": "the gel signal is not trustworthy"
+        + (f" ({gel_reason}); B opens the gripper, which unloads the gel and re-zeroes it" if gel_reason else ""),
         "gel_limit": "the gel reached its load limit; back off",
         "joint_limit": "a joint is at its limit; move it back in range",
     }.get(reason, reason)

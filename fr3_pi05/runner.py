@@ -11,12 +11,14 @@ import socket
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from fr3_demo.cameras import RealSensePair
+from fr3_demo.contact import describe_contact_limits
 from fr3_demo.joystick import LinuxJoystick
 from fr3_demo.kinematics import WorkspaceBounds, forward_kinematics
 from fr3_demo.settings import default_config_path, load_config, pi05_defaults
@@ -91,6 +93,10 @@ class GripperWorker:
         self._lock = threading.Lock()
         self._commands: queue.Queue[float | None] = queue.Queue(maxsize=1)
         self._ready = threading.Event()
+        # Called around each blocking gripper command (the GelSight guard
+        # suspends itself during one and re-zeroes after it).
+        self.before_command: Callable[[], None] | None = None
+        self.after_command: Callable[[], None] | None = None
         self._thread: threading.Thread | None = None
         if enabled:
             self._thread = threading.Thread(target=self._loop, name="bamboo-gripper", daemon=True)
@@ -112,12 +118,16 @@ class GripperWorker:
             if command is None:
                 return
             try:
+                if self.before_command is not None:
+                    self.before_command()
                 if command > 0.5:
                     self._robot.open_gripper()
                     observed = self._robot.gripper_position()
                 else:
                     self._robot.close_gripper()
                     observed = self._robot.gripper_position()
+                if self.after_command is not None:
+                    self.after_command()
                 with self._lock:
                     self._position = observed
                     self._moving = False
@@ -284,6 +294,27 @@ def _parser() -> argparse.ArgumentParser:
         help="print every received action chunk and its thresholded gripper decisions",
     )
     parser.add_argument("--execute", action="store_true", help="allow policy actions to reach Bamboo")
+    parser.add_argument(
+        "--no-contact-limits",
+        action="store_true",
+        help="leave the config's [contact] limits off for this run",
+    )
+    parser.add_argument(
+        "--no-gel-guard",
+        action="store_true",
+        help="leave the config's [gel] GelSight guard off for this run",
+    )
+    # [contact], [payload], [gel] and [tactile] in the config fill these in.
+    parser.set_defaults(
+        contact_limits=None,
+        payload_mass_kg=None,
+        payload_com_m=None,
+        gel=None,
+        tactile_device=None,
+        tactile_width=320,
+        tactile_height=240,
+        tactile_rotate_180=False,
+    )
     return parser
 
 
@@ -619,6 +650,9 @@ def run(args: argparse.Namespace) -> int:
     joystick: LinuxJoystick | None = None
     history_sampler: WineHistorySampler | None = None
     stream_started = False
+    contact_limits_set = False
+    gel_camera: Any | None = None
+    gel_guard: Any | None = None
     stopped = threading.Event()
 
     def request_stop(*_: object) -> None:
@@ -637,6 +671,14 @@ def run(args: argparse.Namespace) -> int:
         )
         state, q = _state(robot)
         print(f"Bamboo: q={np.array2string(q, precision=3)}; dq_norm={np.linalg.norm(state['dq']):.4f}")
+        if not args.check:
+            if args.payload_mass_kg is not None:
+                robot.set_load(args.payload_mass_kg, args.payload_com_m)
+                print(f"Payload set: {args.payload_mass_kg:.3f} kg at {list(args.payload_com_m)} m (flange frame).")
+            applied = robot.apply_contact_limits(None if args.no_contact_limits else args.contact_limits)
+            if applied is not None:
+                contact_limits_set = True
+                print(describe_contact_limits(applied))
         if not robot.supports_streaming() and (args.execute or (args.home and not args.check)):
             raise RuntimeError("The Bamboo controller does not support streaming execution")
 
@@ -647,6 +689,26 @@ def run(args: argparse.Namespace) -> int:
 
         gripper = GripperWorker(robot, not args.no_gripper, args.gripper_threshold)
         gripper.wait_ready()
+        if args.gel is not None and not args.no_gel_guard and args.execute:
+            from fr3_demo.gel import GelCalibration, GelMonitor, GelStreamGuard
+            from fr3_demo.tactile import GelSightCamera
+
+            calibration = GelCalibration.from_config(args.gel)
+            gel_camera = GelSightCamera(
+                device=args.tactile_device or None,
+                width=args.tactile_width,
+                height=args.tactile_height,
+                rotate_180=args.tactile_rotate_180,
+            )
+            gel_camera.start()
+            gel_monitor = GelMonitor(calibration)
+            gel_camera.add_frame_observer(gel_monitor.on_frame)
+            print("Zeroing the GelSight: keep the tool still and out of contact...")
+            gel_monitor.wait_zeroed(10.0)
+            gel_guard = GelStreamGuard(gel_monitor)
+            gripper.before_command = lambda: gel_monitor.suspend("the gripper is moving")
+            gripper.after_command = gel_monitor.rezero
+            print(f"GelSight guard on: the run stops at an estimated {calibration.limit_n:.0f} N through the gel.")
         cameras = RealSensePair(
             args.external_camera_serial,
             args.wrist_camera_serial,
@@ -922,6 +984,14 @@ def run(args: argparse.Namespace) -> int:
 
             if args.execute and now >= next_stream:
                 gripper.check()
+                reason = None if gel_guard is None else gel_guard.check()
+                if reason is not None:
+                    try:
+                        robot.yield_stream(f"Gel guard: {reason}")
+                        stream_started = False  # Bamboo ends the yielded stream itself
+                    except Exception as error:  # noqa: BLE001 - the stop below must not depend on it
+                        LOG.error("Could not make Bamboo yield: %s", error)
+                    raise SafetyViolation(f"Gel guard: {reason}")
                 robot.stream_velocity(desired_velocity)
                 next_stream += stream_period
                 if next_stream < now - stream_period:
@@ -952,8 +1022,15 @@ def run(args: argparse.Namespace) -> int:
             rviz.close()
         if cameras is not None:
             cameras.close()
+        if gel_camera is not None:
+            gel_camera.close()
         if gripper is not None:
             gripper.close()
+        if robot is not None and contact_limits_set:
+            try:
+                robot.clear_contact_limits()
+            except Exception as error:  # noqa: BLE001 - closing the client must still happen
+                LOG.error("Could not clear Bamboo contact limits: %s", error)
         if robot is not None:
             robot.close()
         signal.signal(signal.SIGINT, previous_sigint)

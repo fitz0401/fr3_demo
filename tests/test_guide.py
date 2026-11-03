@@ -157,6 +157,8 @@ class HoldMessageTest(unittest.TestCase):
         self.assertIsNone(hold_message({}))  # an older server reports no guide fields
         message = hold_message({"guide_phase": "hold", "guide_hold_reason": "watchdog"})
         self.assertIn("RB", message)
+        gel = hold_message({"guide_phase": "hold", "guide_hold_reason": "gel_invalid"}, "lost track")
+        self.assertIn("lost track", gel)
 
 
 class GuideConfigTest(unittest.TestCase):

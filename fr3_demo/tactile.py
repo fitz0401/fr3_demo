@@ -114,6 +114,8 @@ class GelSightCamera:
         self.fps = float(min(fps, NATIVE_FPS))
         self.rotate_180 = bool(rotate_180)
         self._on_frame = on_frame
+        self._extra_observers: list[Callable[[TactileFrame], None]] = []
+        self.extra_observer_errors = 0
         self._frames: list[TactileFrame] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -174,6 +176,15 @@ class GelSightCamera:
     def set_frame_observer(self, observer: Callable[[TactileFrame], None] | None) -> None:
         self._on_frame = observer
 
+    def add_frame_observer(self, observer: Callable[[TactileFrame], None]) -> None:
+        """Also call ``observer`` for every frame, after the main one and isolated from it.
+
+        An extra observer that raises is counted in ``extra_observer_errors``
+        and skipped for that frame; capture and recording carry on.
+        """
+
+        self._extra_observers.append(observer)
+
     def start(self, timeout: float = 10.0) -> None:
         if self._thread is not None:
             raise RuntimeError("Tactile capture is already running")
@@ -231,6 +242,11 @@ class GelSightCamera:
                 observer = self._on_frame
                 if observer is not None:
                     observer(frame)
+                for extra in tuple(self._extra_observers):
+                    try:
+                        extra(frame)
+                    except Exception:  # noqa: BLE001 - an extra observer must not stop capture
+                        self.extra_observer_errors += 1
                 self._ready.set()
                 remaining = period - (time.monotonic() - started)
                 if remaining > 0:

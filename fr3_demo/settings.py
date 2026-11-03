@@ -69,6 +69,20 @@ _SCHEMA: dict[str, set[str]] = {
         "heartbeat_hz",
     },
     "payload": {"mass_kg", "center_of_mass_m"},
+    "gel": {"enabled", "limit_n", "twist_limit_rad", "shear_to_force", "spread_to_force"},
+    "contact": {
+        "enabled",
+        "shadow",
+        "max_force_n",
+        "contact_point_m",
+        "max_point_speed_m_s",
+        "guard_force_n",
+        "guard_hard_force_n",
+        "guard_impulse_ns",
+        "guard_on_invalid",
+        "yield_time_s",
+        "collision_force_n",
+    },
     "teleop": {
         "linear_speed",
         "angular_speed",
@@ -146,6 +160,39 @@ def load_config(path: Path) -> dict[str, Any]:
     return config
 
 
+def contact_limits(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Return Bamboo ``set_contact_limits`` arguments from [contact], or None when it is off."""
+
+    contact = config.get("contact", {})
+    if not contact.get("enabled", False):
+        return None
+    point = contact.get("contact_point_m", [0.0, 0.0, 0.0])
+    if not (isinstance(point, list) and len(point) == 3):
+        raise ValueError("contact.contact_point_m must be three numbers (m, flange frame)")
+    limits = {
+        "shadow": bool(contact.get("shadow", False)),
+        "max_force_n": float(contact.get("max_force_n", 0.0)),
+        "contact_point": [float(value) for value in point],
+        "max_point_speed": float(contact.get("max_point_speed_m_s", 0.0)),
+        "guard_force_n": float(contact.get("guard_force_n", 0.0)),
+        "guard_hard_force_n": float(contact.get("guard_hard_force_n", 0.0)),
+        "guard_impulse_ns": float(contact.get("guard_impulse_ns", 0.05)),
+        "guard_on_invalid": bool(contact.get("guard_on_invalid", True)),
+        "yield_time": float(contact.get("yield_time_s", 0.2)),
+        "collision_force_n": float(contact.get("collision_force_n", 0.0)),
+    }
+    if not any(limits[key] > 0 for key in ("max_force_n", "max_point_speed", "guard_force_n", "collision_force_n")):
+        raise ValueError("[contact] is enabled but sets no limit")
+    return limits
+
+
+def gel_guard(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Return [gel] when the GelSight guard is enabled, else None (checked when a session starts)."""
+
+    gel = config.get("gel", {})
+    return dict(gel) if gel.get("enabled", False) else None
+
+
 def teleop_defaults(config: dict[str, Any]) -> dict[str, Any]:
     """Translate structured TOML values to argparse destination names."""
 
@@ -215,6 +262,8 @@ def teleop_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "guide_heartbeat_hz": guide.get("heartbeat_hz"),
         "payload_mass_kg": payload.get("mass_kg"),
         "payload_com_m": payload.get("center_of_mass_m"),
+        "contact_limits": contact_limits(config),
+        "gel": gel_guard(config),
         "linear_speed": teleop.get("linear_speed"),
         "angular_speed": teleop.get("angular_speed"),
         "stream_rate": teleop.get("stream_rate"),
@@ -263,6 +312,8 @@ def pi05_defaults(config: dict[str, Any]) -> dict[str, Any]:
     home = config.get("home", {})
     workspace = config.get("workspace", {})
     pi05 = config.get("pi05", {})
+    payload = config.get("payload", {})
+    tactile = config.get("tactile", {})
     checkpoint = pi05.get("checkpoint")
     server_ports = pi05.get("server_ports", {})
     selected_port = server_ports.get(checkpoint) if isinstance(server_ports, dict) else None
@@ -290,6 +341,14 @@ def pi05_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "home_timeout": home.get("timeout"),
         "workspace_min": workspace.get("min"),
         "workspace_max": workspace.get("max"),
+        "payload_mass_kg": payload.get("mass_kg"),
+        "payload_com_m": payload.get("center_of_mass_m"),
+        "contact_limits": contact_limits(config),
+        "gel": gel_guard(config),
+        "tactile_device": tactile.get("device"),
+        "tactile_width": tactile.get("width"),
+        "tactile_height": tactile.get("height"),
+        "tactile_rotate_180": tactile.get("rotate_180"),
         "policy_host": pi05.get("server_host"),
         "policy_port": selected_port or pi05.get("server_port"),
         "checkpoint": checkpoint,
