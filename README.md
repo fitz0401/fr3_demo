@@ -195,6 +195,35 @@ Tactile capture runs at the sensor's own rate, **not** on the 15 Hz grid:
 error, and a row whose nearest frame is older than `tactile.max_age_ms` fails
 the episode the same way a stale camera does.
 
+### Hand-guided collection
+
+```bash
+fr3-collect --hand-guide                 # add --record-tactile with the GelSight
+```
+
+`fr3-collect` sends no motion commands in this mode; you move the arm by hand.
+How depends on the Bamboo server:
+
+- **Guide mode** (a server with the `guide_mode` feature): the arm floats.
+  Grab it anywhere and move it, with no guiding buttons. Joints resist above
+  `[guide] max_joint_velocity` (0.35 rad/s by default, the streaming limit, so
+  every demonstration can be replayed). Left still for a second, the arm holds
+  its pose and breaks free when pushed. If the update stream stops or a joint
+  reaches its limit, the arm damps to a stop and holds; press **RB** to resume
+  once the cause has cleared.
+- **Pilot buttons** (an older server, or `--pilot-guide`): the robot's own
+  guiding buttons move the arm, as before.
+
+Guide mode refuses to start while Franka's external force estimate is above
+`[guide] max_start_force` (5 N): usually the gripper's weight is not
+compensated, so a released arm would sink. Weigh the gripper, sensor and tool
+and declare them in `[payload]` (unless Desk already lists that mass).
+
+The action is the arm's own motion: each row stores the average joint
+velocity over the next row period, from the 1 kHz joint positions, and the
+episode metadata says `action_source: measured_joint_velocity`. Homing is
+refused in this mode. Nothing here limits the force on the gel yet.
+
 ### Recording format
 
 - Cameras capture at 60 Hz; all streams are aligned to an exact 15 Hz Ubuntu
@@ -327,6 +356,7 @@ the gripper before inference; policy motion additionally requires `--execute`.
 | --- | --- |
 | `fr3-teleop` | Joystick teleoperation |
 | `fr3-collect` | Teleoperation with synchronized recording |
+| `fr3-collect --hand-guide` | Hand-guided recording (Bamboo guide mode or Pilot buttons) |
 | `fr3-camera-list` | List RealSense serial numbers |
 | `fr3-camera-rviz` | Preview all cameras in RViz (standalone; not while collecting) |
 | `fr3-annotate` | Add episode language instructions |

@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 from bamboo import BambooFrankaClient
 
+from fr3_demo.guide import GuideHeartbeat, choose_guide_mode, hold_message
 from fr3_demo.joystick import JoystickSnapshot, LinuxJoystick, axis, button, shaped_axis
 from fr3_demo.kinematics import WorkspaceBounds, forward_kinematics, resolved_rate_step
 from fr3_demo.settings import default_config_path, load_config, teleop_defaults
@@ -174,6 +175,44 @@ class BambooRobot:
         response = self._arm.stop_streaming()
         self._require_success(response, "stop streaming")
 
+    def supports(self, feature: str) -> bool:
+        supports = getattr(self._arm, "supports", None)  # absent in older Bamboo clients
+        return bool(supports(feature)) if supports is not None else False
+
+    def new_arm_client(self) -> BambooFrankaClient:
+        """Open a separate arm connection, for a thread that must not share this one."""
+
+        return BambooFrankaClient(server_ip=self._server_ip, control_port=self._control_port, enable_gripper=False)
+
+    def start_guide(
+        self,
+        watchdog_ms: int,
+        max_joint_velocity: float,
+        idle_hold_s: float | None = None,
+        max_start_force: float | None = None,
+    ) -> None:
+        options: dict[str, float] = {}
+        if idle_hold_s is not None:
+            options["idle_hold_s"] = idle_hold_s
+        if max_start_force is not None:
+            options["max_start_force"] = max_start_force
+        response = self._arm.start_guiding(watchdog_ms=watchdog_ms, max_joint_velocity=max_joint_velocity, **options)
+        self._require_success(response, "start guiding")
+
+    def resume_guide(self) -> None:
+        self._require_success(self._arm.resume_guiding(), "resume guiding")
+
+    def stop_guide(self) -> None:
+        self._require_success(self._arm.stop_guiding(), "stop guiding")
+
+    def set_load(self, mass: float, center_of_mass: list[float] | np.ndarray) -> None:
+        if not self.supports("set_load"):
+            raise RuntimeError(
+                "The running Bamboo controller cannot set a payload. Update Bamboo, or remove the payload "
+                "from the config."
+            )
+        self._require_success(self._arm.set_load(mass, center_of_mass), "set the payload")
+
     def legacy_command(self, target: np.ndarray, duration: float) -> None:
         response = self._arm.execute_joint_impedance_path(
             np.asarray(target, dtype=float)[None, :],
@@ -227,17 +266,18 @@ class BambooRobot:
 HAND_GUIDE_ACTION_SOURCE = "measured_joint_velocity"
 
 
-def hand_guide_tick(robot: Any, collector: Any | None) -> np.ndarray:
+def hand_guide_tick(robot: Any, collector: Any | None) -> dict:
     """Record the arm's own motion as the action while an operator guides it.
 
     Nothing is commanded: the measured joint velocity stands in for the
-    joystick velocity teleop records, in the same unit (rad/s).
+    joystick velocity teleop records, in the same unit (rad/s). Returns the
+    robot state, which also carries guide mode's hold status when available.
     """
 
     state = robot.state()
     if collector is not None:
         collector.set_action(np.asarray(state["dq"], dtype=float))
-    return np.asarray(state["qpos"], dtype=float)
+    return state
 
 
 def stream_home(
@@ -402,6 +442,45 @@ def _create_parser() -> argparse.ArgumentParser:
             "record while you move the arm with the robot's own guiding buttons; "
             "no arm command is sent, so there is no gel protection (requires --collect)"
         ),
+    )
+    parser.add_argument(
+        "--pilot-guide",
+        action="store_true",
+        help="with --hand-guide, use the robot's guiding buttons even when Bamboo can float the arm itself",
+    )
+    parser.add_argument("--guide-watchdog-ms", type=int, default=250, help="hold the arm if guide updates stop this long")
+    parser.add_argument(
+        "--guide-max-joint-velocity",
+        type=float,
+        default=0.35,
+        help="joint speed in rad/s above which guiding resists; keep it at the speed a policy can replay",
+    )
+    parser.add_argument(
+        "--guide-idle-hold-s",
+        type=float,
+        default=None,
+        help="hold the arm after this many seconds still, until pushed (0 disables; default: Bamboo's 1 s)",
+    )
+    parser.add_argument(
+        "--guide-max-start-force",
+        type=float,
+        default=None,
+        help="refuse to start guiding above this external force estimate in N (default: Bamboo's 5 N)",
+    )
+    parser.add_argument("--guide-heartbeat-hz", type=float, default=30.0, help="guide update rate")
+    parser.add_argument(
+        "--payload-mass-kg",
+        type=float,
+        default=None,
+        help="payload beyond Desk's end effector (gripper, sensor, tool), set at session start",
+    )
+    parser.add_argument(
+        "--payload-com-m",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=None,
+        help="payload center of mass in the flange frame, in m",
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data/raw"), help="raw recording root")
     parser.add_argument(
@@ -583,6 +662,16 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         )
     if args.hand_guide and not args.collect:
         parser.error("--hand-guide records demonstrations, so it requires --collect (use fr3-collect --hand-guide)")
+    if not 50 <= args.guide_watchdog_ms <= 500:
+        parser.error("--guide-watchdog-ms must be between 50 and 500")
+    if args.guide_max_joint_velocity <= 0:
+        parser.error("--guide-max-joint-velocity must be positive")
+    if args.guide_heartbeat_hz <= 0 or 1000.0 / args.guide_heartbeat_hz > args.guide_watchdog_ms / 3.0:
+        parser.error("--guide-heartbeat-hz must send at least three updates per --guide-watchdog-ms period")
+    if (args.payload_mass_kg is None) != (args.payload_com_m is None):
+        parser.error("--payload-mass-kg and --payload-com-m must be given together")
+    if args.payload_mass_kg is not None and not 0.0 <= args.payload_mass_kg <= 3.0:
+        parser.error("--payload-mass-kg must be between 0 and 3")
     if args.collect and (not args.external_camera_serial or not args.wrist_camera_serial):
         parser.error(
             "--collect requires --external-camera-serial and --wrist-camera-serial "
@@ -627,7 +716,9 @@ def run(args: argparse.Namespace) -> int:
     preview: Any | None = None
     tactile: Any | None = None
     rumbler: Any | None = None
+    heartbeat: Any | None = None
     streaming_active = False
+    guiding_active = False
     stop = False
 
     def request_stop(*_: object) -> None:
@@ -647,6 +738,9 @@ def run(args: argparse.Namespace) -> int:
                 not args.no_gripper,
                 args.gripper_force,
             )
+            if args.payload_mass_kg is not None and not (args.dry_run or args.check):
+                robot.set_load(args.payload_mass_kg, args.payload_com_m)
+                print(f"Payload set: {args.payload_mass_kg:.3f} kg at {list(args.payload_com_m)} m (flange frame).")
 
         if args.collect:
             from fr3_demo.cameras import RealSensePair
@@ -747,11 +841,27 @@ def run(args: argparse.Namespace) -> int:
                 return 0
 
             streaming = not args.dry_run and not args.legacy_waypoints and not args.hand_guide
-            if args.hand_guide:
-                print(
-                    "Hand-guide mode: no arm command will be sent. Move the arm with the robot's guiding "
-                    "buttons; nothing here limits the force on the gel."
-                )
+            if args.hand_guide and robot is not None:
+                if choose_guide_mode(robot, args.pilot_guide) == "impedance":
+                    robot.start_guide(
+                        args.guide_watchdog_ms,
+                        args.guide_max_joint_velocity,
+                        args.guide_idle_hold_s,
+                        args.guide_max_start_force,
+                    )
+                    guiding_active = True
+                    heartbeat = GuideHeartbeat(robot.new_arm_client, args.guide_heartbeat_hz)
+                    heartbeat.start()
+                    print(
+                        "Hand-guide mode: the arm floats, so grab it and move it; no guiding buttons needed. "
+                        f"It resists above {args.guide_max_joint_velocity:.2f} rad/s, holds when left still and "
+                        "breaks free when pushed. Nothing here limits the force on the gel yet."
+                    )
+                else:
+                    print(
+                        "Hand-guide mode (Pilot buttons): no arm command will be sent. Move the arm with the "
+                        "robot's guiding buttons; nothing here limits the force on the gel."
+                    )
             elif streaming and robot is not None:
                 robot.start_stream(args.watchdog_ms, args.max_joint_speed, args.max_joint_acceleration)
                 streaming_active = True
@@ -776,6 +886,8 @@ def run(args: argparse.Namespace) -> int:
 
             if args.hand_guide:
                 controls = "A: close gripper | B: open gripper | Back: quit"
+                if guiding_active:
+                    controls += " | RB: resume after a hold"
             else:
                 print("\nTeleoperation is active; moving a control commands the robot immediately.")
                 print(
@@ -795,6 +907,8 @@ def run(args: argparse.Namespace) -> int:
             last_open_count = initial_snapshot.press_counts[mapping.open_button]
             last_home_count = initial_snapshot.press_counts[mapping.home_button]
             last_record_count = initial_snapshot.press_counts[mapping.record_button]
+            last_resume_count = initial_snapshot.press_counts[mapping.yaw_up_button]
+            last_hold_message: str | None = None
             last_status = 0.0
             idle_sleep = min(0.02, args.command_period / 4.0)
             stream_period = 1.0 / args.stream_rate
@@ -923,7 +1037,23 @@ def run(args: argparse.Namespace) -> int:
                     continue
 
                 if args.hand_guide and robot is not None:
-                    q = hand_guide_tick(robot, collector)
+                    if heartbeat is not None:
+                        heartbeat.check_health()
+                        resume_count = snapshot.press_counts[mapping.yaw_up_button]
+                        if resume_count > last_resume_count:
+                            robot.resume_guide()
+                        last_resume_count = resume_count
+                    state = hand_guide_tick(robot, collector)
+                    q = np.asarray(state["qpos"], dtype=float)
+                    if heartbeat is not None:
+                        message = hold_message(state)
+                        if message != last_hold_message:
+                            if message is not None:
+                                rumbler.error()
+                                print(f"\n{message}")
+                            elif last_hold_message is not None:
+                                print("\nArm free again.")
+                            last_hold_message = message
                     remaining = stream_period - (time.monotonic() - loop_started)
                     if remaining > 0:
                         time.sleep(remaining)
@@ -1024,6 +1154,14 @@ def run(args: argparse.Namespace) -> int:
                     robot.stop_stream()
                 except Exception as error:  # noqa: BLE001 - closing the client still triggers the watchdog
                     LOG.warning("Could not explicitly stop Bamboo stream: %s", error)
+            if guiding_active:
+                try:
+                    robot.stop_guide()
+                except Exception as error:  # noqa: BLE001 - without updates the watchdog holds the arm
+                    LOG.warning("Could not explicitly stop Bamboo guide mode: %s", error)
+        if heartbeat is not None:
+            heartbeat.stop()
+        if robot is not None:
             robot.close()
 
 

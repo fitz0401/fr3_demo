@@ -74,9 +74,9 @@ class HandGuideTest(unittest.TestCase):
         robot.state.return_value = {"qpos": [0.1] * 7, "dq": [0.25, 0, 0, 0, 0, 0, -0.5]}
         collector = MagicMock()
 
-        q = hand_guide_tick(robot, collector)
+        state = hand_guide_tick(robot, collector)
 
-        np.testing.assert_allclose(q, [0.1] * 7)
+        np.testing.assert_allclose(state["qpos"], [0.1] * 7)
         recorded = collector.set_action.call_args.args[0]
         np.testing.assert_allclose(recorded, [0.25, 0, 0, 0, 0, 0, -0.5])
         robot.start_stream.assert_not_called()

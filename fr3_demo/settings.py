@@ -60,6 +60,15 @@ _SCHEMA: dict[str, set[str]] = {
         "max_age_ms",
         "rotate_180",
     },
+    "guide": {
+        "pilot_buttons",
+        "watchdog_ms",
+        "max_joint_velocity",
+        "idle_hold_s",
+        "max_start_force",
+        "heartbeat_hz",
+    },
+    "payload": {"mass_kg", "center_of_mass_m"},
     "teleop": {
         "linear_speed",
         "angular_speed",
@@ -146,6 +155,8 @@ def teleop_defaults(config: dict[str, Any]) -> dict[str, Any]:
     cameras = config.get("cameras", {})
     recording = config.get("recording", {})
     tactile = config.get("tactile", {})
+    guide = config.get("guide", {})
+    payload = config.get("payload", {})
     teleop = config.get("teleop", {})
     home = config.get("home", {})
     workspace = config.get("workspace", {})
@@ -196,6 +207,14 @@ def teleop_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "tactile_fps": tactile.get("fps"),
         "tactile_max_age_ms": tactile.get("max_age_ms"),
         "tactile_rotate_180": tactile.get("rotate_180"),
+        "pilot_guide": guide.get("pilot_buttons"),
+        "guide_watchdog_ms": guide.get("watchdog_ms"),
+        "guide_max_joint_velocity": guide.get("max_joint_velocity"),
+        "guide_idle_hold_s": guide.get("idle_hold_s"),
+        "guide_max_start_force": guide.get("max_start_force"),
+        "guide_heartbeat_hz": guide.get("heartbeat_hz"),
+        "payload_mass_kg": payload.get("mass_kg"),
+        "payload_com_m": payload.get("center_of_mass_m"),
         "linear_speed": teleop.get("linear_speed"),
         "angular_speed": teleop.get("angular_speed"),
         "stream_rate": teleop.get("stream_rate"),

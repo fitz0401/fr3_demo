@@ -117,6 +117,33 @@ max_age_ms = 60.0
 # Rotate the stored tactile image by 180 degrees.
 rotate_180 = false
 
+# Hand guiding (fr3-collect --hand-guide). With a Bamboo server that has guide
+# mode, the arm floats and is moved by hand without the guiding buttons; with
+# an older server, or pilot_buttons = true, nothing is commanded and the
+# robot's own guiding buttons move it. Bamboo's defaults apply until these are
+# uncommented.
+[guide]
+# pilot_buttons = false
+# Hold the arm if fr3-collect stops sending updates for this long.
+# watchdog_ms = 250
+# Joints resist above this speed (rad/s). Keep it at the streaming limit
+# ([teleop] max_joint_speed) so every demonstration can be replayed.
+# max_joint_velocity = 0.35
+# Hold the arm after this many seconds still; it breaks free when pushed.
+# 0 turns the idle hold off.
+# idle_hold_s = 1.0
+# Refuse to start while Franka's external force estimate exceeds this (N):
+# the gripper's weight is not compensated, or a hand is already on the arm.
+# max_start_force = 5.0
+# heartbeat_hz = 30.0
+
+# Payload beyond Desk's end effector, declared to Franka at session start so
+# its gravity compensation includes it. Leave this out if Desk already lists
+# the gripper's mass, or the weight is counted twice.
+# [payload]
+# mass_kg = 0.95
+# center_of_mass_m = [0.0, 0.0, 0.06]  # flange frame
+
 [teleop]
 linear_speed = 0.08
 angular_speed = 0.35
