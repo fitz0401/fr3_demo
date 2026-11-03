@@ -111,7 +111,7 @@ class GuideHeartbeatTest(unittest.TestCase):
         heartbeat = GuideHeartbeat(lambda: client, rate_hz=200.0)
         heartbeat.start()
         self.assertTrue(_wait_for(lambda: client.closed))
-        with self.assertRaisesRegex(RuntimeError, "(?s)User stopped.*Release it so the lights turn blue"):
+        with self.assertRaisesRegex(RuntimeError, "(?s)User stopped.*Switch Desk to Execution"):
             heartbeat.check_health()
         heartbeat.stop()
 
@@ -128,14 +128,14 @@ class GuideHeartbeatTest(unittest.TestCase):
 
 class GuideFailureAdviceTest(unittest.TestCase):
     def test_raw_franka_errors_get_advice(self) -> None:
-        self.assertIn("Release it", guide_failure_advice(USER_STOPPED))
+        self.assertIn("Switch Desk to Execution", guide_failure_advice(USER_STOPPED))
         pressed = "Franka guide control error: libfranka: Move command aborted: User Stop pressed!"
         self.assertIn("was pressed", guide_failure_advice(pressed))
         reflex = 'libfranka: Move command aborted: motion aborted by reflex! ["joint_velocity_violation"]'
         self.assertIn("reflex", guide_failure_advice(reflex))
 
     def test_bamboo_messages_that_already_say_what_to_do_get_none(self) -> None:
-        refusal = 'Franka is user-stopped (robot mode "User stopped"): the user stop button is pressed. Release it'
+        refusal = 'Franka is not in Execution mode (robot mode "User stopped"): white lights mean Programming mode'
         self.assertIsNone(guide_failure_advice(refusal))
         self.assertIsNone(guide_failure_advice("libfranka: something new"))
 
@@ -146,7 +146,7 @@ class GuideFailureAdviceTest(unittest.TestCase):
         client.start_guiding.return_value = {"success": False, "error": USER_STOPPED.split(": ", 1)[1]}
         client_class.return_value = client
         robot = BambooRobot("127.0.0.1", 5555, 5559, "robotiq", False)
-        with self.assertRaisesRegex(RuntimeError, "(?s)Could not start guide mode.*Release it"):
+        with self.assertRaisesRegex(RuntimeError, "(?s)Could not start guide mode.*Switch Desk to Execution"):
             robot.start_guide(250, 0.35)
 
 

@@ -19,8 +19,17 @@ GUIDE_ENDED = ("Guide mode stopped", "Guide mode is not running")
 # libfranka's words for why a motion ended or was refused, and what the
 # operator does about it. More specific markers come first.
 FRANKA_ADVICE = (
-    ("user stop pressed", "The user stop was pressed. Release it so the lights turn blue, then run fr3-collect again."),
-    ("user stopped", "The user stop is pressed. Release it so the lights turn blue, then run fr3-collect again."),
+    (
+        "user stop pressed",
+        "The user stop was pressed. Release it, check Desk is still in Execution mode, then run fr3-collect again.",
+    ),
+    (
+        "user stopped",
+        (
+            "Franka is not in Execution mode: white lights mean Desk is in Programming mode, otherwise the user "
+            "stop is pressed. Switch Desk to Execution and release the user stop, then run fr3-collect again."
+        ),
+    ),
     (
         "reflex",
         "Franka stopped the arm on a reflex, such as a collision. Run fr3-collect again; guide mode clears the reflex as it starts.",
