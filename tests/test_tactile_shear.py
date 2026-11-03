@@ -81,6 +81,21 @@ def _render(points, *, hidden=None, shading=None, noise: float = 2.0, seed: int 
     return np.clip(np.round(image), 0, 255).astype(np.uint8)
 
 
+def _lens(points: np.ndarray, k: float) -> np.ndarray:
+    """Barrel distortion, as a wide lens draws the gel's grid in towards the corners."""
+
+    offset = (points - CENTRE) / 200.0
+    return CENTRE + 200.0 * offset * (1.0 - k * np.sum(offset**2, axis=1, keepdims=True))
+
+
+def _every_other(grid: np.ndarray) -> np.ndarray:
+    """Keeps every other row and column of dots, so no kept dot has a kept grid neighbour."""
+
+    columns = len(np.arange(-3 * SPACING, WIDTH + 3 * SPACING, SPACING))
+    index = np.arange(len(grid))
+    return (index // columns % 2 == 0) & (index % columns % 2 == 0)
+
+
 def _nearest(found: np.ndarray, truth: np.ndarray) -> np.ndarray:
     offset = found[:, None, :] - truth[None, :, :]
     return np.hypot(offset[..., 0], offset[..., 1]).min(axis=1)
@@ -97,7 +112,7 @@ class _Gel:
     def __init__(self, grid: np.ndarray | None = None, params: MarkerParams | None = None) -> None:
         self.grid = _grid() if grid is None else grid
         self.tracker = MarkerShearTracker(params)
-        self.markers = self.tracker.set_reference(_render(self.grid, seed=1000))
+        self.tracker.set_reference(_render(self.grid, seed=1000))
         self.frame = 0
 
     def show(self, image: np.ndarray, frames_later: int = 1) -> ShearEstimate:
@@ -381,6 +396,41 @@ class FailClosedTest(unittest.TestCase):
                     self.assertFalse(estimate.valid)
                     self.assertIn("re-zero", estimate.reason)
                 self.assertTrue(unloaded.valid, unloaded.reason)
+
+    def test_a_jump_hidden_from_the_step_check_is_caught_against_the_reference(self) -> None:
+        # With every other row and column hidden, no followed dot has a grid
+        # neighbour, so the jump frame cannot be judged; back in full view,
+        # the field against the reference gives the jump away.
+        gel = _Gel()
+        gel.pose()
+        sparse = gel.show(_render(_moved(gel.grid[_every_other(gel.grid)], shift=(SPACING, 0.0)), seed=50))
+        full = gel.pose(shift=(SPACING, 0.0))
+
+        self.assertFalse(sparse.valid)
+        self.assertNotIn("lost track", sparse.reason)
+        self.assertFalse(full.valid)
+        self.assertIn("lost track", full.reason)
+
+    def test_lens_distortion_cannot_tell_a_regular_grid_from_itself_one_spacing_over(self) -> None:
+        # A gel moved by a whole spacing images exactly like the unloaded gel,
+        # distortion and all, so a lost track must not come back by itself.
+        printed = _grid(jitter=0.0)
+        for k in (0.05, 0.1):
+            with self.subTest(k=k):
+                tracker = MarkerShearTracker()
+                tracker.set_reference(_render(_lens(printed, k), seed=1000))
+                shifts = ((0.0, 0.0), (0.6 * SPACING, 0.0), (SPACING, 0.0), (0.0, 0.0))
+                estimates = [
+                    tracker.update(
+                        _render(_lens(printed + np.asarray(shift), k), seed=frame), frame * FRAME_PERIOD, frame
+                    )
+                    for frame, shift in enumerate(shifts, 1)
+                ]
+
+                self.assertTrue(estimates[0].valid, estimates[0].reason)
+                for estimate in estimates[1:]:
+                    self.assertFalse(estimate.valid)
+                self.assertIn("re-zero", estimates[2].reason)
 
     def test_a_gel_snapping_back_to_rest_is_reacquired_at_once(self) -> None:
         gel = _Gel()

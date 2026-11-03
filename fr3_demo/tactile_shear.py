@@ -19,20 +19,19 @@ and spread.
 Fail closed: whenever too few dots match or the fit does not explain them, the
 estimate is valid=False with a reason and NaN in every motion field. Motion too
 fast to follow safely, too few dots to carry identities, a poor fit or a long
-gap between frames loses the track. So does a frame whose dots fit their
-neighbours' last positions clearly better than their own, the mark of a jump by
-about a whole spacing, which would otherwise read as a small motion. A lost
-tracker matches straight against the reference with a tight gate, which can
-only succeed near the unloaded state, and accepts the result only if the dots
-fit the reference clearly better than the reference shifted by one spacing: on
-a regular grid, a gel held sheared by a whole spacing would otherwise pass for
-unloaded. Both checks compare how rough the dots' displacement field is under
-each pairing, since smooth fields (shear, lens distortion, broad deformation)
-are what both share, and so both need a printed grid irregular enough to tell
-neighbours apart. Lens distortion does not help: a gel shifted by a whole
-spacing images exactly like the unloaded gel. On a perfectly regular grid a
-whole-spacing jump between two frames goes unseen, and a lost track only comes
-back by re-zeroing.
+gap between frames loses the track. So does a jump by about a whole spacing,
+which lands each dot on its neighbour's spot and would otherwise read as a
+small motion. The gel's displacement field is smooth, while a pairing one
+spacing off carries the printed grid's jitter, so a field that turns smooth
+when every dot is taken for its neighbour gives the jump away. A lost tracker
+matches straight against the reference with a tight gate, which can only
+succeed near the unloaded state, and accepts the result only if taking every
+dot for its neighbour makes the field clearly rougher; otherwise a gel held
+sheared by a whole spacing would pass for unloaded. Both checks need a printed
+grid irregular enough to tell neighbours apart, and lens distortion does not
+help: a gel shifted by a whole spacing images exactly like the unloaded gel. On
+a perfectly regular grid a whole-spacing jump goes unseen, and a lost track
+only comes back by re-zeroing.
 """
 
 from __future__ import annotations
@@ -46,8 +45,8 @@ import numpy as np
 # Background brightness (0-255) below which a region counts as unlit: dividing
 # by a near-black envelope would turn sensor noise into dark "dots".
 _MIN_BACKGROUND = 40.0
-# Neighbour distances on a dot grid are nearly uniform; for random dark blobs
-# they vary by about half their mean.
+# Neighbour distances on a dot grid vary by a few percent; between random dark
+# blobs, by a third or more.
 _MAX_SPACING_CV = 0.35
 # A frame whose dark-blob mask covers more than this multiple of the
 # reference's share, plus this share of the image, is noise or a corrupt
@@ -70,11 +69,14 @@ class ShearEstimate:
     """The marker field's motion against the reference, or why there is none.
 
     Image pixels as the frame arrives (after any rotate_180), x right and y
-    down, with pixel centres at integer coordinates. ``twist_rad`` is positive
-    for a counter-clockwise turn of the dots as the image is displayed (row 0
-    at the top), the usual math sense with y up; measured directly in the
-    x-right, y-down pixel axes the same turn has the opposite sign. When
-    ``valid`` is False every motion field is NaN, never a number to act on.
+    down, with pixel centres at integer coordinates. ``shear_px`` is how far
+    the centroid of the matched reference dots moved; ``twist_rad`` and
+    ``spread`` (scale - 1) are about that centroid; ``max_displacement_px`` is
+    the largest single dot's motion. ``twist_rad`` is positive for a
+    counter-clockwise turn of the dots as the image is displayed (row 0 at the
+    top), the usual math sense with y up; measured directly in the x-right,
+    y-down pixel axes the same turn has the opposite sign. When ``valid`` is
+    False every motion field is NaN, never a number to act on.
     """
 
     timestamp: float
@@ -236,32 +238,45 @@ def _match(predicted: np.ndarray, detected: np.ndarray, gate: float) -> tuple[np
     return rows[unique], columns[unique]
 
 
+def _median(values: np.ndarray, axis: int) -> np.ndarray:
+    """Median along ``axis`` of the finite values, NaN where there are none, keeping the axis.
+
+    np.nanmedian warns on an empty slice, and silencing warnings is not
+    thread-safe; NaN sorts last, so the middle of the finite values is found
+    by count.
+    """
+
+    count = np.count_nonzero(np.isfinite(values), axis=axis, keepdims=True)
+    ordered = np.sort(values, axis=axis)
+    low = np.take_along_axis(ordered, np.maximum(count - 1, 0) // 2, axis=axis)
+    high = np.take_along_axis(ordered, count // 2, axis=axis)
+    return 0.5 * (low + high)
+
+
 def _second_differences(field: np.ndarray, axes: np.ndarray) -> np.ndarray:
     """Along each grid axis, each dot's vector minus the mean of its two neighbours' there.
 
-    ``axes`` holds, per axis, the neighbour indices on either side (-1 for
-    none). Returns (axes, dots, 2), NaN where a vector is unknown.
+    ``field`` is (..., dots, 2) and ``axes`` holds, per axis, the neighbour
+    indices on either side (-1 for none). Returns (..., axes, dots, 2), NaN
+    where a vector is unknown.
     """
 
-    padded = np.vstack((field, _NAN_ROW))
-    return field[None] - 0.5 * (padded[axes[:, 0]] + padded[axes[:, 1]])
+    padded = np.concatenate((field, np.full((*field.shape[:-2], 1, 2), np.nan)), axis=-2)
+    return field[..., None, :, :] - 0.5 * (padded[..., axes[:, 0], :] + padded[..., axes[:, 1], :])
 
 
-def _roughness(differences: np.ndarray, keep: np.ndarray) -> float:
-    """Median size of the kept second differences once each axis's common part is removed.
+def _roughness(differences: np.ndarray) -> np.ndarray:
+    """Per grid step, the median size of the second differences once each axis's common part is removed.
 
-    A smooth field leaves second differences that are nearly the same
-    everywhere (lens curvature, say); what varies from dot to dot is the
-    printed grid's jitter and centroid noise.
+    ``differences`` is (steps, axes, dots, 2), NaN for dots left out. A smooth
+    field leaves second differences that are nearly the same everywhere (lens
+    curvature, say); what varies from dot to dot is the printed grid's jitter
+    and centroid noise.
     """
 
-    sizes = []
-    for along, kept in zip(differences, keep):
-        values = along[kept]
-        if len(values):
-            values = values - np.median(values, axis=0)
-            sizes.append(np.hypot(values[:, 0], values[:, 1]))
-    return float(np.median(np.concatenate(sizes)))
+    centred = differences - _median(differences, axis=2)
+    sizes = np.hypot(centred[..., 0], centred[..., 1])
+    return _median(sizes.reshape(len(sizes), -1), axis=1)[:, 0]
 
 
 def _pairing_roughness(
@@ -279,14 +294,12 @@ def _pairing_roughness(
     own = _second_differences(current - source, axes)
     known = np.isfinite(own[..., 0])
     needed = max(fewest, 0.5 * np.count_nonzero(known))
-    current = np.vstack((current, _NAN_ROW))
-    pairs = []
-    for table in neighbours:
-        shifted = _second_differences(current[table] - source, axes)
-        both = known & np.isfinite(shifted[..., 0])
-        if np.count_nonzero(both) >= needed:
-            pairs.append((_roughness(own, both), _roughness(shifted, both)))
-    return pairs
+    shifted = _second_differences(np.vstack((current, _NAN_ROW))[neighbours] - source, axes)
+    both = known & np.isfinite(shifted[..., 0])
+    own_rough = _roughness(np.where(both[..., None], own, np.nan))
+    shifted_rough = _roughness(np.where(both[..., None], shifted, np.nan))
+    counts = np.count_nonzero(both, axis=(1, 2))
+    return [(float(o), float(s)) for o, s, n in zip(own_rough, shifted_rough, counts) if n >= needed]
 
 
 def _neighbour_distances(points: np.ndarray) -> np.ndarray:
