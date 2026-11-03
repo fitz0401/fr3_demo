@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import faulthandler
 import logging
 import os
 import signal
@@ -319,6 +321,16 @@ HAND_GUIDE_ACTION_SOURCE = "measured_joint_velocity"
 # Teleop already stops driving into a loaded gel at level 1 (gel.limit_twist);
 # past this the stream yields, in case the load keeps rising anyway.
 GEL_TELEOP_STOP_LEVEL = 1.2
+# A shutdown has been seen to hang the terminal. If closing everything down
+# takes longer than this, every thread's stack is printed (to show where) and
+# the process exits; Bamboo's watchdogs hold or brake the arm without us.
+SHUTDOWN_TIMEOUT_S = 45.0
+# The same, for the interpreter's own exit once shutdown is done.
+EXIT_TIMEOUT_S = 10.0
+
+
+def _watch_interpreter_exit() -> None:
+    faulthandler.dump_traceback_later(EXIT_TIMEOUT_S, exit=True)
 
 
 def hand_guide_tick(robot: Any, collector: Any | None) -> dict:
@@ -796,6 +808,12 @@ def run(args: argparse.Namespace) -> int:
 
     def request_stop(*_: object) -> None:
         nonlocal stop
+        if stop:
+            # Asked twice: get out now, even mid-shutdown, without Python's
+            # teardown (half-closed cameras can abort it). Bamboo's watchdog
+            # holds or brakes the arm without us.
+            print("\nForce quit.", flush=True)
+            os._exit(130)
         stop = True
 
     signal.signal(signal.SIGINT, request_stop)
@@ -1266,6 +1284,9 @@ def run(args: argparse.Namespace) -> int:
                 print(f"Add language with: fr3-annotate --data-dir {collector.session_dir}")
             return 0
     finally:
+        print("\nShutting down (Ctrl-C again to force quit)...", flush=True)
+        faulthandler.dump_traceback_later(SHUTDOWN_TIMEOUT_S, exit=True)
+        atexit.register(_watch_interpreter_exit)
         if collector is not None:
             try:
                 completed = collector.close()
@@ -1312,6 +1333,7 @@ def run(args: argparse.Namespace) -> int:
                 LOG.warning("Could not clear Bamboo contact limits: %s", error)
         if robot is not None:
             robot.close()
+        faulthandler.cancel_dump_traceback_later()
 
 
 def collect_main() -> int:
