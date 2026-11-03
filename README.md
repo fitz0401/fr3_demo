@@ -208,9 +208,10 @@ How depends on the Bamboo server:
   Grab it anywhere and move it, with no guiding buttons. Joints resist above
   `[guide] max_joint_velocity` (0.35 rad/s by default, the streaming limit, so
   every demonstration can be replayed). Left still for a second, the arm holds
-  its pose and breaks free when pushed. If the update stream stops or a joint
-  reaches its limit, the arm damps to a stop and holds; press **RB** to resume
-  once the cause has cleared.
+  its pose and breaks free when pushed. Near a joint limit it pushes back,
+  harder the closer you get, but never blocks moving away. If the update
+  stream stops, the arm damps to a stop and holds; press **RB** to resume once
+  it is running again.
 - **Pilot buttons** (an older server, or `--pilot-guide`): the robot's own
   guiding buttons move the arm, as before.
 
