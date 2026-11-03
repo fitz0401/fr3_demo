@@ -61,6 +61,8 @@ def require_free_space(path: Path, minimum_bytes: int) -> int:
 # Stored under frames/<key>/ like a camera, but at the sensor's own rate rather
 # than on the 15 Hz grid.
 TACTILE_KEY = "tactile_image"
+# Actions an operator produced by moving the arm, not by commanding it.
+MEASURED_ACTION_SOURCE = "measured_joint_velocity"
 
 WEIGHT_READINGS: tuple[tuple[str, str], ...] = (
     ("bottle_before_g", "bottle before the pour"),
@@ -237,6 +239,32 @@ class _AsyncImageWriter:
         for thread in self._threads:
             thread.join(timeout=2.0)
         self._raise_if_failed()
+
+
+def forward_difference_velocity(
+    row_times: np.ndarray, raw_times: np.ndarray, raw_positions: np.ndarray, horizon: float
+) -> np.ndarray:
+    """Average joint velocity over the ``horizon`` after each row, from raw samples.
+
+    This is the velocity a streamed command would have needed to reproduce the
+    motion over the next control period, so a measured action lines up with a
+    commanded one. Rows too close to the end use the last ``horizon`` instead.
+    """
+
+    raw_times = np.asarray(raw_times, dtype=np.float64)
+    raw_positions = np.asarray(raw_positions, dtype=np.float64)
+    first, last = raw_times[0], raw_times[-1]
+    starts = np.clip(np.asarray(row_times, dtype=np.float64), first, last)
+    ends = np.minimum(starts + horizon, last)
+    short = ends - starts < 0.5 * horizon
+    starts = np.where(short, np.maximum(ends - horizon, first), starts)
+    span = np.maximum(ends - starts, 1e-9)
+    velocity = np.empty((len(starts), raw_positions.shape[1]), dtype=np.float64)
+    for joint in range(raw_positions.shape[1]):
+        start_q = np.interp(starts, raw_times, raw_positions[:, joint])
+        end_q = np.interp(ends, raw_times, raw_positions[:, joint])
+        velocity[:, joint] = (end_q - start_q) / span
+    return velocity
 
 
 class RawEpisodeWriter:
@@ -598,6 +626,17 @@ class RawEpisodeWriter:
         }
         if self.record_force:
             trajectory["joint_torque"] = np.stack(self._joint_torques)
+        if self._metadata.get("action_source") == MEASURED_ACTION_SOURCE and self._raw_force and len(self._raw_force) >= 2:
+            # The control loop samples the arm between blocking calls (a gripper
+            # command stalls it for about a second), so derive the action from
+            # the uninterrupted raw arm samples instead.
+            trajectory["action_joint_velocity"] = forward_difference_velocity(
+                trajectory["robot_timestamp"],
+                np.asarray([s.controller_timestamp for s in self._raw_force], dtype=np.float64),
+                np.stack([s.qpos for s in self._raw_force]),
+                1.0 / self.fps,
+            ).astype(trajectory["action_joint_velocity"].dtype)
+            self._metadata["action_derivation"] = "forward_difference_of_raw_joint_position_over_one_row"
         # Tactile: frames/tactile_image holds one JPEG per captured frame at the
         # sensor's rate, so these raw_tactile_* arrays are a different length
         # from the 15 Hz columns, and tactile_frame_index maps a grid row onto
