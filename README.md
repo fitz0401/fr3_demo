@@ -365,6 +365,12 @@ Annotate every episode separately:
 fr3-annotate --data-dir data/raw/session_YYYYMMDD_HHMMSS
 ```
 
+A robot replay (`fr3-collect --replay`) is not asked about: it takes its
+demonstration's instruction, and follows it when the demonstration's is
+replaced with `--replace`. Annotating a session that is still recording is
+safe: only the instruction is written, into the metadata as it is on disk
+at that moment.
+
 Prompt once and label every currently unlabeled episode, preserving existing
 labels:
 
@@ -442,6 +448,44 @@ resampling, so the complete stream is written beside the dataset as well:
 If only some episodes have tactile, the `tactile_image` feature is omitted
 rather than padded, while the sidecars for the episodes that do have it are
 still written so nothing recorded is discarded.
+
+The gel image barely changes while peeling: the markers move 1-3 px, about 1%
+of the frame. Conversion therefore also measures that motion, following the
+markers through every captured frame from each episode's first gel frame:
+
+- `tactile_deformation` — marker shift (`shift_x_px`, `shift_y_px`, image
+  axes), `twist_rad` and `spread` (how much the marker field grew: pressing),
+  per 15 Hz row.
+- `tactile_tracked` — 1 where the markers were tracked; 0 (with zero
+  deformation) where they were lost.
+
+These need the marker gel and OpenCV (`pip install -e '.[tactile]'`); with a
+plain gel, they are left out and conversion says why.
+
+### Force in the dataset
+
+- `joint_torque` — Franka's measured joint torque, `tau_J` (N m).
+- `external_wrench` and `external_joint_torque` — Franka's own force
+  estimate: the wrench in the robot base frame (N, N m) and per joint (N m),
+  positive for what the robot applies to its surroundings. During hand
+  guiding it includes the hand; in a replay or teleop, nobody touches the arm,
+  so it is the task's own force. It has an offset of a few newtons that
+  depends on how the arm is held, so compare it with its value just before
+  contact.
+- `force/episode_NNNNNN.npz` — the arm stream as sampled (up to 1 kHz):
+  `joint_torque`, `joint_position`, `external_wrench`,
+  `external_joint_torque`, their `robot_timestamp`, and the rows'
+  `row_robot_timestamp` on the same controller clock.
+
+Each feature is carried only when every episode has it, as for tactile.
+
+`meta/fr3_episodes.json` records where each episode came from: its source
+episode, `kind` (`hand_guided`, `replay` or `teleop`), `action_source`, and
+for a replay its demonstration (`replay_of`, with that demonstration's index
+here when it was converted too) and how the replay went. A hand-guided
+demonstration's action is the motion it measured, while a replay's or
+teleop's is the velocity it commanded. Conversion notes when a dataset mixes
+them; `--episodes replays` converts the replays alone.
 
 Schema-v1 recordings used loop-index alignment and are rejected by default. To
 convert one only after manually accepting its timing risk, add:

@@ -78,6 +78,111 @@ def select_episodes(episodes: Sequence[Path], kind: str = "all") -> tuple[list[P
 
 
 TACTILE_KEY = "tactile_image"
+# Franka's external force estimate as the recorder stores it: the wrench in
+# the robot base frame and the joint torques, positive for what the robot
+# applies to its surroundings. During hand guiding it includes the hand.
+EXTERNAL_FEATURES: dict[str, list[str]] = {
+    "external_wrench": ["force_x", "force_y", "force_z", "torque_x", "torque_y", "torque_z"],
+    "external_joint_torque": [f"joint_{joint}" for joint in range(1, 8)],
+}
+# The gel's own deformation, from its marker dots, against the episode's
+# first gel frame: a 1-3 px marker shift is plain here, where the image
+# barely changes. Zero, with tactile_tracked 0, where the markers were lost.
+DEFORMATION_KEY = "tactile_deformation"
+DEFORMATION_NAMES = ["shift_x_px", "shift_y_px", "twist_rad", "spread"]
+TRACKED_KEY = "tactile_tracked"
+
+
+def _episode_kind(metadata: dict[str, Any]) -> str:
+    if "replay_of" in metadata:
+        return "replay"
+    return "hand_guided" if metadata.get("action_source") == "measured_joint_velocity" else "teleop"
+
+
+def _episodes_missing(episodes: Sequence[Path], keys: Sequence[str]) -> list[Path]:
+    """Episodes whose trajectory lacks any of ``keys``."""
+
+    missing = []
+    for episode in episodes:
+        with np.load(episode / "trajectory.npz") as trajectory:
+            if not set(keys) <= set(trajectory.files):
+                missing.append(episode)
+    return missing
+
+
+def tactile_deformation(episode: Path) -> tuple[np.ndarray, np.ndarray] | str:
+    """Per grid row, the gel's marker shift, twist and spread since the episode's first gel frame.
+
+    The markers are followed through every captured frame, at the sensor's
+    rate, and each row takes the frame its tactile_frame_index names. Returns
+    (deformation (rows, 4), tracked (rows, 1)), or why it cannot: no tactile
+    stream, a gel without a marker grid, or no OpenCV.
+    """
+
+    try:
+        import cv2
+
+        from fr3_demo.tactile_shear import MarkerShearTracker
+    except ImportError as error:
+        return f"OpenCV is not installed ({error}); run: pip install -e '.[tactile]'"
+    with np.load(episode / "trajectory.npz") as trajectory:
+        if "tactile_frame_index" not in trajectory.files:
+            return "it has no tactile stream"
+        stamps = np.asarray(trajectory["raw_tactile_timestamp"], dtype=np.float64)
+        rows = np.asarray(trajectory["tactile_frame_index"], dtype=np.int64)
+    paths = sorted((episode / "frames" / TACTILE_KEY).glob("frame_*.jpg"))
+    if len(paths) != len(stamps) or (rows.size and int(rows.max()) >= len(paths)):
+        return f"{len(paths)} gel frames do not match its {len(stamps)} tactile timestamps"
+
+    def load(path: Path) -> np.ndarray | None:
+        image = cv2.imread(str(path))
+        # The live guard sees RGB frames; keep the same channel order.
+        return None if image is None else cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    tracker = MarkerShearTracker()
+    first = load(paths[0])
+    if first is None:
+        return "its first gel frame cannot be read"
+    try:
+        tracker.set_reference(first)
+    except ValueError as error:
+        return f"its first gel frame shows no marker grid ({error})"
+    deformation = np.zeros((len(paths), len(DEFORMATION_NAMES)), dtype=np.float32)
+    tracked = np.zeros(len(paths), dtype=np.float32)
+    for index, path in enumerate(paths):
+        image = load(path)
+        if image is None:
+            continue
+        estimate = tracker.update(image, float(stamps[index]), index)
+        if estimate.valid:
+            deformation[index] = (*estimate.shear_px, estimate.twist_rad, estimate.spread)
+            tracked[index] = 1.0
+    return deformation[rows], tracked[rows][:, None]
+
+
+def write_force_sidecar(root: Path, episode_index: int, episode: Path) -> bool:
+    """Copy one episode's unsampled arm stream (joint torque, Franka's force estimate) next to the dataset.
+
+    The parquet carries the force at 15 Hz, interpolated; the recorder sampled
+    the arm at up to 1 kHz. The rows' robot timestamps are included, so both
+    sit on the controller's clock.
+    """
+
+    with np.load(episode / "trajectory.npz") as trajectory:
+        if "raw_force_robot_timestamp" not in trajectory.files:
+            return False
+        payload = {
+            key.removeprefix("raw_force_"): np.asarray(trajectory[key])
+            for key in trajectory.files
+            if key.startswith("raw_force_")
+        }
+        payload["row_robot_timestamp"] = np.asarray(trajectory["robot_timestamp"], dtype=np.float64)
+        payload["row_host_timestamp"] = np.asarray(trajectory["host_monotonic_timestamp"], dtype=np.float64)
+    payload["source_episode"] = np.asarray(episode.name)
+    directory = root / "force"
+    directory.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(directory / f"episode_{episode_index:06d}.npz", **payload)
+    return True
 
 
 def _tactile_size(episode: Path) -> tuple[int, int]:
@@ -102,6 +207,8 @@ def _episodes_with_tactile(episodes: Sequence[Path]) -> list[Path]:
 def _features(
     include_joint_torque: bool = False,
     tactile_shape: tuple[int, int] | None = None,
+    include_external: bool = False,
+    include_deformation: bool = False,
 ) -> dict[str, dict[str, Any]]:
     features: dict[str, dict[str, Any]] = {
         "exterior_image_1_left": {
@@ -138,6 +245,12 @@ def _features(
             "shape": (*tactile_shape, 3),
             "names": ["height", "width", "channel"],
         }
+    if include_external:
+        for key, names in EXTERNAL_FEATURES.items():
+            features[key] = {"dtype": "float32", "shape": (len(names),), "names": names}
+    if include_deformation:
+        features[DEFORMATION_KEY] = {"dtype": "float32", "shape": (len(DEFORMATION_NAMES),), "names": DEFORMATION_NAMES}
+        features[TRACKED_KEY] = {"dtype": "float32", "shape": (1,), "names": ["tracked"]}
     return features
 
 
@@ -341,17 +454,59 @@ def convert(
         )
     else:
         print(f"Including joint_torque from all {len(episodes)} episodes.")
+    kinds = {episode: _episode_kind(episode_metadata[episode]) for episode in episodes}
+    # Franka's force estimate follows the same rule as joint_torque.
+    without_external = _episodes_missing(episodes, list(EXTERNAL_FEATURES))
+    include_external = not without_external
+    if include_external:
+        print(
+            "Including Franka's force estimate (external_wrench, external_joint_torque) "
+            f"from all {len(episodes)} episodes."
+        )
+        if "hand_guided" in kinds.values():
+            print("  In hand-guided demonstrations it includes your hand; replays and teleop measure the task alone.")
+    else:
+        print(
+            f"Omitting Franka's force estimate: {len(without_external)} of {len(episodes)} episodes were recorded "
+            "before it was captured."
+        )
+    deformations: dict[Path, tuple[np.ndarray, np.ndarray]] = {}
+    if tactile_shape is not None:
+        for episode in episodes:
+            result = tactile_deformation(episode)
+            if isinstance(result, str):
+                print(f"Omitting {DEFORMATION_KEY}: {episode.name}: {result}.")
+                deformations = {}
+                break
+            deformations[episode] = result
+        else:
+            seen = np.concatenate([tracked.ravel() for _, tracked in deformations.values()])
+            peak = max(float(np.hypot(values[:, 0], values[:, 1]).max()) for values, _ in deformations.values())
+            print(
+                f"Including {DEFORMATION_KEY} (marker shift, twist, spread from each episode's first gel frame): "
+                f"markers tracked in {seen.mean():.1%} of rows, largest shift {peak:.1f} px."
+            )
+    sources = {str(episode_metadata[episode].get("action_source", "commanded_joint_velocity")) for episode in episodes}
+    if len(sources) > 1:
+        counts = {kind: list(kinds.values()).count(kind) for kind in sorted(set(kinds.values()))}
+        print(
+            f"Note: these episodes mix action sources {sorted(sources)} ({counts}): a hand-guided demonstration's "
+            "action is the motion it measured, a replay's or teleop's the velocity it commanded. "
+            "--episodes replays converts the replays alone."
+        )
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
         robot_type="fr3",
         fps=int(dataset_fps),
         root=root,
-        features=_features(include_joint_torque, tactile_shape),
+        features=_features(include_joint_torque, tactile_shape, include_external, bool(deformations)),
         use_videos=True,
         image_writer_threads=4,
     )
 
     tactile_entries: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
+    dataset_index = {episode: index for index, episode in enumerate(episodes)}
     for episode_index, episode in enumerate(episodes):
         metadata = episode_metadata[episode]
         task = str(metadata["language_instruction"]).strip()
@@ -396,6 +551,13 @@ def convert(
                 }
                 if include_joint_torque:
                     frame["joint_torque"] = np.asarray(trajectory["joint_torque"][index], dtype=np.float32)
+                if include_external:
+                    for key in EXTERNAL_FEATURES:
+                        frame[key] = np.asarray(trajectory[key][index], dtype=np.float32)
+                if deformations:
+                    values, tracked = deformations[episode]
+                    frame[DEFORMATION_KEY] = values[index]
+                    frame[TRACKED_KEY] = tracked[index]
                 if tactile_rows is not None:
                     # Nearest-frame selection was already resolved at recording
                     # time, so this only follows the stored index.
@@ -408,6 +570,28 @@ def convert(
         tactile_entry = write_tactile_sidecar(Path(dataset.root), episode_index, episode)
         if tactile_entry is not None:
             tactile_entries.append(tactile_entry)
+        has_force_stream = write_force_sidecar(Path(dataset.root), episode_index, episode)
+        record: dict[str, Any] = {
+            "episode_index": episode_index,
+            "source": f"{episode.parent.name}/{episode.name}",
+            "kind": kinds[episode],
+            "action_source": metadata.get("action_source", "commanded_joint_velocity"),
+            "task": task,
+            "frames": frame_count,
+            "force_stream": f"force/episode_{episode_index:06d}.npz" if has_force_stream else None,
+        }
+        if "replay_of" in metadata:
+            demonstration = episode.parent / str(metadata["replay_of"])
+            record["replay_of"] = {
+                "source": f"{episode.parent.name}/{demonstration.name}",
+                "episode_index": dataset_index.get(demonstration),
+            }
+            record["replay"] = metadata.get("replay")
+        if deformations:
+            values, tracked = deformations[episode]
+            record["tactile_tracked"] = round(float(tracked.mean()), 4)
+            record["tactile_max_shift_px"] = round(float(np.hypot(values[:, 0], values[:, 1]).max()), 3)
+        records.append(record)
         report = sync_reports[episode]
         sync_status = "legacy/index-aligned"
         if report is not None:
@@ -446,6 +630,27 @@ def convert(
             f"{min(rates):.1f}-{max(rates):.1f} Hz ({total / max(1, grid):.2f}x the 15 Hz grid), "
             f"{sum(e['bytes'] for e in tactile_entries) / 1e6:.0f} MB in tactile/."
         )
+
+    meta_directory = Path(dataset.root) / "meta"
+    meta_directory.mkdir(parents=True, exist_ok=True)
+    (meta_directory / "fr3_episodes.json").write_text(
+        json.dumps(
+            {
+                "about": (
+                    "Where each episode came from: kind is hand_guided (actions are the measured motion), "
+                    "replay (the robot replaying a hand-guided demonstration; actions are the commanded "
+                    "velocities) or teleop (commanded velocities). force/ holds each episode's unsampled arm "
+                    "stream; external_* is Franka's force estimate in the base frame, positive for what the "
+                    "robot applies to its surroundings. tactile_deformation is the gel's marker shift (x, y px), "
+                    "twist (rad) and spread since the episode's first gel frame."
+                ),
+                "episodes": records,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     if push:
         dataset.push_to_hub(

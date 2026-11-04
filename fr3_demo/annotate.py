@@ -13,6 +13,31 @@ def _write_metadata(path: Path, metadata: dict) -> None:
     temporary.replace(path)
 
 
+def _set_language(path: Path, instruction: str) -> None:
+    """Write only the instruction, into the metadata as it is on disk now.
+
+    A session can still be recording: a replay that finishes while a prompt
+    waits links itself into its demonstration's metadata, and writing back a
+    copy read before the prompt would drop that link.
+    """
+
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    metadata["language_instruction"] = instruction
+    _write_metadata(path, metadata)
+
+
+def _demonstration_language(path: Path, metadata: dict) -> str | None:
+    """For a replay, its demonstration's instruction ("" when it has none); None for any other episode."""
+
+    name = metadata.get("replay_of")
+    if not name:
+        return None
+    demonstration = path.parent.parent / str(name) / "metadata.json"
+    if not demonstration.is_file():
+        return ""
+    return str(json.loads(demonstration.read_text(encoding="utf-8")).get("language_instruction") or "").strip()
+
+
 def episode_metadata_paths(data_dir: Path) -> list[Path]:
     return sorted(
         path
@@ -57,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     instruction_mode.add_argument(
         "--language", help="apply this instruction to every selected episode instead of prompting"
     )
+    # Without --language or --all, a robot replay (fr3-collect --replay) is not asked about:
+    # it takes its demonstration's instruction, which is asked first (it records first).
     instruction_mode.add_argument(
         "--all",
         dest="one_for_all",
@@ -98,6 +125,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.weights:
             weighed += _annotate_weights(path, metadata, args)
         existing = str(metadata.get("language_instruction") or "").strip()
+        inherited = None if args.one_for_all or args.language is not None else _demonstration_language(path, metadata)
+        if inherited is not None:
+            # A replay does what its demonstration did: same instruction, and
+            # it follows when the demonstration's is replaced.
+            if existing and (existing == inherited or not args.replace):
+                note = "" if existing == inherited or not inherited else f"; its demonstration says {inherited!r}"
+                print(f"{path.parent}: {existing!r} (kept{note})")
+                continue
+            if not inherited:
+                print(f"{path.parent}: skipped (its demonstration {metadata['replay_of']} has no instruction yet)")
+                continue
+            _set_language(path, inherited)
+            print(f"{path.parent}: {inherited!r} (from its demonstration {metadata['replay_of']})")
+            updated += 1
+            continue
         if existing and not args.replace:
             print(f"{path.parent}: {existing!r} (kept)")
             continue
@@ -110,8 +152,7 @@ def main(argv: list[str] | None = None) -> int:
         if not instruction:
             print(f"{path.parent}: skipped")
             continue
-        metadata["language_instruction"] = instruction
-        _write_metadata(path, metadata)
+        _set_language(path, instruction)
         print(f"{path.parent}: {instruction!r}")
         updated += 1
 
