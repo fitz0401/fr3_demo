@@ -212,3 +212,94 @@ center_of_mass_m = [0.0, 0.0, 0.06]
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HomeFromGuideTest(unittest.TestCase):
+    def _args(self, contact_limits=None):
+        import argparse
+
+        return argparse.Namespace(
+            no_contact_limits=False,
+            contact_limits=contact_limits,
+            home_speed=0.2,
+            max_joint_speed=0.35,
+            max_joint_acceleration=1.5,
+            watchdog_ms=250,
+            home_timeout=15.0,
+            stream_rate=30.0,
+            guide_watchdog_ms=250,
+            guide_max_joint_velocity=0.35,
+            guide_idle_hold_s=None,
+            guide_max_start_force=None,
+        )
+
+    def _run(self, robot, args, stop=lambda: False, gel_guard=None, homing=None):
+        from fr3_demo import teleop
+
+        old, new = MagicMock(), MagicMock()
+        with (
+            patch.object(teleop, "stream_home", side_effect=homing) as home,
+            patch.object(teleop.time, "sleep"),
+        ):
+            result = teleop.home_from_guide(robot, args, old, lambda: new, stop, gel_guard)
+        return result, old, new, home
+
+    def test_leaves_guide_mode_homes_and_floats_again(self) -> None:
+        robot = MagicMock()
+        result, old, new, home = self._run(robot, self._args())
+        old.stop.assert_called_once_with()
+        names = [call[0] for call in robot.method_calls]
+        self.assertEqual(names, ["stop_guide", "start_stream", "stop_stream", "start_guide"])
+        home.assert_called_once()
+        new.start.assert_called_once_with()
+        self.assertIs(result, new)
+
+    def test_the_homing_stream_gets_the_contact_limits(self) -> None:
+        robot = MagicMock()
+        limits = {"max_force_n": 15.0}
+        self._run(robot, self._args(contact_limits=limits))
+        names = [call[0] for call in robot.method_calls]
+        self.assertEqual(
+            names,
+            [
+                "stop_guide",
+                "apply_contact_limits",
+                "start_stream",
+                "stop_stream",
+                "clear_contact_limits",
+                "start_guide",
+            ],
+        )
+        robot.apply_contact_limits.assert_called_once_with(limits)
+
+    def test_waits_for_a_hand_to_let_go_before_guiding_again(self) -> None:
+        robot = MagicMock()
+        refusal = RuntimeError("Could not start guide mode: External force estimate is 7.1 N before guiding starts")
+        robot.start_guide.side_effect = [refusal, refusal, None]
+        result, _, new, _ = self._run(robot, self._args())
+        self.assertEqual(robot.start_guide.call_count, 3)
+        self.assertIs(result, new)
+        robot.start_guide.side_effect = RuntimeError("Franka is not in Execution mode")
+        with self.assertRaisesRegex(RuntimeError, "Execution mode"):
+            self._run(robot, self._args())
+
+    def test_a_loaded_gel_stops_homing_but_guiding_resumes(self) -> None:
+        robot = MagicMock()
+        guard = MagicMock()
+        guard.check.return_value = "the gel load reached level 1.02 (10.2 N estimated)"
+        result, _, new, _ = self._run(
+            robot, self._args(), gel_guard=guard, homing=InterruptedError("Homing interrupted")
+        )
+        robot.stop_stream.assert_called_once_with()
+        robot.start_guide.assert_called_once()
+        self.assertIs(result, new)
+
+    def test_a_session_ending_during_homing_leaves_guide_mode_off(self) -> None:
+        robot = MagicMock()
+        result, _, new, _ = self._run(
+            robot, self._args(), stop=lambda: True, homing=InterruptedError("Homing interrupted")
+        )
+        self.assertIsNone(result)
+        robot.start_guide.assert_not_called()
+        robot.stop_stream.assert_called_once_with()
+        new.start.assert_not_called()

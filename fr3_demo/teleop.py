@@ -19,7 +19,7 @@ import numpy as np
 from bamboo import BambooFrankaClient
 
 from fr3_demo.contact import describe_contact_limits
-from fr3_demo.gel import limit_twist
+from fr3_demo.gel import GelStreamGuard, limit_twist
 from fr3_demo.guide import GuideHeartbeat, choose_guide_mode, describe_guide_failure, hold_message
 from fr3_demo.joystick import JoystickSnapshot, LinuxJoystick, axis, button, shaped_axis
 from fr3_demo.kinematics import WorkspaceBounds, forward_kinematics, resolved_rate_step
@@ -395,6 +395,83 @@ def stream_home(
         if remaining > 0:
             time.sleep(remaining)
 
+
+
+# Pause between leaving guide mode and homing, for hands to come off the arm.
+GUIDE_HOME_PAUSE_S = 1.0
+# How long restarting guide mode after homing waits for the arm to be let go.
+GUIDE_RESTART_WAIT_S = 10.0
+
+
+def home_from_guide(
+    robot: BambooRobot,
+    args: argparse.Namespace,
+    heartbeat: GuideHeartbeat | None,
+    new_heartbeat: Callable[[], GuideHeartbeat],
+    stop_requested: Callable[[], bool],
+    gel_guard: Any | None = None,
+) -> GuideHeartbeat | None:
+    """Leave guide mode, home by streaming, and float the arm again.
+
+    Bamboo runs one control loop at a time: guide mode stops (the arm damps to
+    a stop and holds), a stream homes the arm (under [contact] when that is
+    set, and stopping early if the gel guard objects), and guide mode starts
+    again, waiting for the arm to be let go if a hand is still on it. Returns
+    the new heartbeat, or None when the session is ending and guide mode was
+    left off.
+    """
+
+    if heartbeat is not None:
+        heartbeat.stop()
+    robot.stop_guide()
+    print("\nHoming: hands off the arm. Guide mode resumes after homing.", flush=True)
+    time.sleep(GUIDE_HOME_PAUSE_S)
+    limits = None if args.no_contact_limits else args.contact_limits
+    if limits is not None:
+        robot.apply_contact_limits(limits)
+    speed = min(args.home_speed, args.max_joint_speed)
+
+    def interrupted() -> bool:
+        return stop_requested() or (gel_guard is not None and gel_guard.check() is not None)
+
+    homed = False
+    robot.start_stream(args.watchdog_ms, args.max_joint_speed, args.max_joint_acceleration)
+    try:
+        print(f"Homing at up to {speed:.2f} rad/s...")
+        stream_home(robot, HOME_JOINTS, speed, args.home_timeout, args.stream_rate, stop_requested=interrupted)
+        homed = True
+    except InterruptedError:
+        reason = None if gel_guard is None else gel_guard.check()
+        print("Homing stopped" + (f": {reason}" if reason else "") + ".")
+    finally:
+        robot.stop_stream()
+        if limits is not None:
+            robot.clear_contact_limits()
+    if stop_requested():
+        return None
+    deadline = time.monotonic() + GUIDE_RESTART_WAIT_S
+    asked = False
+    while True:
+        try:
+            robot.start_guide(
+                args.guide_watchdog_ms,
+                args.guide_max_joint_velocity,
+                args.guide_idle_hold_s,
+                args.guide_max_start_force,
+            )
+            break
+        except RuntimeError as error:
+            # Guide mode refuses to start while something pushes on the arm.
+            if "External force estimate" not in str(error) or time.monotonic() >= deadline or stop_requested():
+                raise
+            if not asked:
+                print("Let go of the arm: guide mode starts once nothing pushes on it.")
+                asked = True
+            time.sleep(0.5)
+    heartbeat = new_heartbeat()
+    heartbeat.start()
+    print(("Homing complete; " if homed else "") + "guide mode is back on: the arm floats again.")
+    return heartbeat
 
 def _pose_error(model: np.ndarray, measured: np.ndarray) -> tuple[float, float]:
     position_error = float(np.linalg.norm(model[:3, 3] - measured[:3, 3]))
@@ -1015,7 +1092,7 @@ def run(args: argparse.Namespace) -> int:
             if args.hand_guide:
                 controls = "A: close gripper | B: open gripper | Back: quit"
                 if guiding_active:
-                    controls += " | RB: resume after a hold"
+                    controls += " | Menu: home | RB: resume after a hold"
             else:
                 print("\nTeleoperation is active; moving a control commands the robot immediately.")
                 print(
@@ -1116,8 +1193,26 @@ def run(args: argparse.Namespace) -> int:
                     continue
 
                 if home_requested and args.hand_guide:
-                    rumbler.error()
-                    print("\nHoming is disabled in --hand-guide mode: it would move the arm under your hands.")
+                    if not guiding_active or robot is None:
+                        rumbler.error()
+                        print("\nHoming here needs Bamboo's guide mode; with the Pilot buttons, home in teleop.")
+                        continue
+                    if collector is not None and collector.active:
+                        collector.set_action(np.zeros(7))
+                        rumbler.error()
+                        print("\nStop recording with X before homing.")
+                        continue
+                    guiding_active = False
+                    heartbeat = home_from_guide(
+                        robot,
+                        args,
+                        heartbeat,
+                        lambda: GuideHeartbeat(robot.new_arm_client, args.guide_heartbeat_hz, gel=gel),
+                        lambda: stop,
+                        None if gel is None else GelStreamGuard(gel),
+                    )
+                    guiding_active = heartbeat is not None
+                    last_hold_message = None
                     continue
 
                 if home_requested:

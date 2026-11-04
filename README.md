@@ -231,8 +231,11 @@ and declare them in `[payload]` (unless Desk already lists that mass).
 
 The action is the arm's own motion: each row stores the average joint
 velocity over the next row period, from the 1 kHz joint positions, and the
-episode metadata says `action_source: measured_joint_velocity`. Homing is
-refused in this mode. With `[gel]` on, the GelSight guard below protects the
+episode metadata says `action_source: measured_joint_velocity`. In guide
+mode **Menu** homes the arm between episodes: guide mode stops, so let go,
+the arm streams home (under `[contact]` when it is set), and guide mode comes
+back on its own, waiting for your hand to leave the arm if it is still on it.
+It is refused while recording, and with the Pilot buttons. With `[gel]` on, the GelSight guard below protects the
 gel while you guide; without it nothing limits the force on the gel.
 
 ### Protecting the GelSight
