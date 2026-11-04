@@ -238,6 +238,53 @@ back on its own, waiting for your hand to leave the arm if it is still on it.
 It is refused while recording, and with the Pilot buttons. With `[gel]` on, the GelSight guard below protects the
 gel while you guide; without it nothing limits the force on the gel.
 
+### Replaying each demonstration
+
+```bash
+fr3-collect --hand-guide --replay --record-tactile
+```
+
+While you guide the arm, Franka's force estimate mixes your hand with the
+contact. With `--replay`, each demonstration is replayed by the robot alone
+right after you record it, and the replay is recorded too:
+
+1. **X** starts recording; guide the demonstration; **X** stops it. End with
+   the tool clear of the fruit: the arm next moves straight (in joint space)
+   to where the demonstration started.
+2. Hands off: guide mode stops, the arm streams to the demonstration's start
+   pose and replays it while a new episode records, then homes.
+3. Guide mode comes back on; the next **X** starts the next demonstration.
+
+Nobody touches the arm during a replay, so Franka's force estimate is the
+force of the task itself; it is recorded as `external_wrench` and
+`external_joint_torque` (see Recording format). Your hands are out of the
+camera views too. The replay follows the joint path the arm actually took.
+Where the blade meets resistance the arm is pushed off that path, so the
+replay presses until the blade is where yours was, up to `[contact]
+max_force_n`. It runs under the streaming limits a policy has
+(`[teleop] max_joint_speed` and `max_joint_acceleration`), so the fast parts
+of a demonstration come out a little smoother.
+
+A replay needs `[contact]` enabled (measure `contact_point_m`), `[gel]`
+enabled while the GelSight is in use, and Bamboo's guide mode; the session
+refuses to start otherwise. During a replay **X** or **B** stops it (the arm
+stops and holds) and **Back** stops it and quits. It also stops when the gel
+reaches its limit, when Bamboo's contact guard trips, or when the arm is
+pushed more than `--replay-max-path-error` (0.08 rad) off the path; these
+yield, so the arm goes soft and the load falls. After any stop, guide mode
+comes back where the arm is: free the blade by hand, then **Menu** homes.
+To reset the scene first (a fresh fruit), add `--replay-wait`: the arm then
+waits at the start pose for **X** (**B** skips that replay).
+
+The replay is an ordinary episode whose actions are the joint velocities the
+robot was commanded (`action_source: replay_joint_velocity_command`). Its
+metadata names its demonstration (`replay_of`) and says how the replay went
+(`replay.completed`, why it stopped, how far it was pushed off the path); the
+demonstration lists its replays. A demonstration that opens or closes the
+gripper is not replayed. To train on the robot's replays only, convert with
+`fr3-convert --episodes replays`; replays that stopped early are always left
+out.
+
 ### Protecting the GelSight
 
 Two independent layers, both off until enabled in `config.toml`:
@@ -287,7 +334,12 @@ one session.
   monotonic-time grid. Each completed episode includes `sync_report.json`, and
   an out-of-tolerance episode is aborted.
 - Robot position, velocity, and measured joint torque (`tau_J`, Nm), gripper
-  state, actions, and camera timing metadata share that timeline.
+  state, actions, and camera timing metadata share that timeline. With
+  `record_force`, so does Franka's external force estimate when Bamboo reports
+  it: `external_wrench` (N and N m, base frame) and `external_joint_torque`
+  (N m), positive for what the robot applies to its surroundings, with the
+  unsampled stream in `raw_force_external_*`. It counts every push from
+  outside, a hand on the arm included.
 - JPEGs are stored at the DROID size, 320x180. Set both configured image
   dimensions to `0` for native resolution. Collection stops before the disk
   falls below `min_free_gb`.
@@ -356,6 +408,11 @@ fr3-convert \
   --push-to-hub
 ```
 
+Sessions recorded with `--replay` hold both hand demonstrations and the
+robot's replays of them: `--episodes demos` or `--episodes replays` converts
+one kind only (default: both), and replays that stopped early are always left
+out.
+
 Add `--public` only when the images are safe to publish. Conversion rejects
 missing language, mismatched frames, and an existing output directory. The
 output follows the OpenPI DROID layout with exterior and wrist RGB, joint and
@@ -414,6 +471,7 @@ the gripper before inference; policy motion additionally requires `--execute`.
 | `fr3-teleop` | Joystick teleoperation |
 | `fr3-collect` | Teleoperation with synchronized recording |
 | `fr3-collect --hand-guide` | Hand-guided recording (Bamboo guide mode or Pilot buttons) |
+| `fr3-collect --hand-guide --replay` | Hand-guided recording, each demonstration replayed and recorded by the robot |
 | `fr3-camera-list` | List RealSense serial numbers |
 | `fr3-camera-rviz` | Preview all cameras in RViz (standalone; not while collecting) |
 | `fr3-annotate` | Add episode language instructions |

@@ -51,6 +51,32 @@ def find_episodes(data_dirs: Path | Sequence[Path]) -> list[Path]:
     return sorted(episodes)
 
 
+# Which episodes to convert: hand demonstrations, the robot's replays of
+# them (fr3-collect --hand-guide --replay), or both.
+EPISODE_KINDS = ("all", "demos", "replays")
+
+
+def select_episodes(episodes: Sequence[Path], kind: str = "all") -> tuple[list[Path], list[Path]]:
+    """Keep the kind asked for; return (kept, replays left out because they stopped early).
+
+    A replay that stopped early (the operator, the gel guard or the contact
+    guard ended it) is an unfinished demonstration, so it is never kept.
+    """
+
+    if kind not in EPISODE_KINDS:
+        raise ValueError(f"episode kind must be one of {', '.join(EPISODE_KINDS)}")
+    kept: list[Path] = []
+    stopped: list[Path] = []
+    for episode in episodes:
+        metadata = json.loads((episode / "metadata.json").read_text(encoding="utf-8"))
+        is_replay = "replay_of" in metadata
+        if is_replay and not (metadata.get("replay") or {}).get("completed", False):
+            stopped.append(episode)
+        elif kind == "all" or (kind == "replays") == is_replay:
+            kept.append(episode)
+    return kept, stopped
+
+
 TACTILE_KEY = "tactile_image"
 
 
@@ -249,12 +275,16 @@ def convert(
     push: bool = False,
     public: bool = False,
     allow_legacy_unsynchronized: bool = False,
+    episode_kind: str = "all",
 ) -> Path:
-    episodes = find_episodes(data_dirs)
+    episodes, stopped_replays = select_episodes(find_episodes(data_dirs), episode_kind)
+    if stopped_replays:
+        print(f"Leaving out {len(stopped_replays)} replay(s) that stopped early.")
     if not episodes:
         roots = [data_dirs] if isinstance(data_dirs, Path) else list(data_dirs)
         joined = ", ".join(str(path) for path in roots)
-        raise RuntimeError(f"No completed raw episodes found under: {joined}")
+        only = "" if episode_kind == "all" else f" (converting {episode_kind} only)"
+        raise RuntimeError(f"No completed raw episodes found under: {joined}{only}")
     missing_language = []
     episode_metadata: dict[Path, dict[str, Any]] = {}
     sync_reports: dict[Path, dict[str, Any] | None] = {}
@@ -449,6 +479,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="allow schema-v1 episodes that were aligned only by recorder-loop index",
     )
+    parser.add_argument(
+        "--episodes",
+        choices=EPISODE_KINDS,
+        default="all",
+        help=(
+            "convert the hand demonstrations, the robot's replays of them, or both (default: %(default)s); "
+            "replays that stopped early are always left out"
+        ),
+    )
     args = parser.parse_args(argv)
     output = convert(
         args.data_dirs,
@@ -457,6 +496,7 @@ def main(argv: list[str] | None = None) -> int:
         args.push_to_hub,
         args.public,
         args.allow_legacy_unsynchronized,
+        args.episodes,
     )
     print(f"LeRobot dataset: {output}")
     return 0

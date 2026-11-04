@@ -141,6 +141,24 @@ class RobotSample:
     controller_timestamp: float
     request_send_monotonic: float
     response_receive_monotonic: float
+    # Franka's external force estimate (O_F_ext_hat_K, 6) and external joint
+    # torque (tau_ext_hat_filtered, 7), when the controller reports them.
+    ext_wrench: np.ndarray | None = None
+    tau_ext: np.ndarray | None = None
+
+
+# Franka's external force estimate, recorded beside tau_J when the controller
+# reports it. With nobody touching the arm (teleop, a replay, a policy) it is
+# the force of the task itself.
+EXTERNAL_FORCE_SIGNAL = {
+    "fields": ["external_wrench", "external_joint_torque"],
+    "raw_fields": ["raw_force_external_wrench", "raw_force_external_joint_torque"],
+    "source": "franka O_F_ext_hat_K and tau_ext_hat_filtered",
+    "unit": "N, Nm",
+    "frame": "external_wrench: robot base frame, torque about Franka's stiffness frame K; external_joint_torque: joint",
+    "sign": "what the robot applies to its environment is positive",
+    "note": "Includes every external push: a hand on the arm during hand guiding counts too.",
+}
 
 
 @dataclass(frozen=True)
@@ -288,6 +306,7 @@ class RawEpisodeWriter:
         record_force: bool = True,
         tactile: dict[str, Any] | None = None,
         action_source: str | None = None,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> None:
         self.episode_index = episode_index
         self.fps = fps
@@ -352,6 +371,8 @@ class RawEpisodeWriter:
         self._joint_positions: list[np.ndarray] = []
         self._joint_velocities: list[np.ndarray] = []
         self._joint_torques: list[np.ndarray] = []
+        self._external_wrenches: list[np.ndarray | None] = []
+        self._external_torques: list[np.ndarray | None] = []
         self._raw_force: list[RobotSample] = []
         self._action_joint_velocities: list[np.ndarray] = []
         self._action_joint_timestamps: list[float] = []
@@ -428,6 +449,11 @@ class RawEpisodeWriter:
             # Only non-default sources are recorded, so teleop episodes keep
             # exactly the metadata they had before this key existed.
             self._metadata["action_source"] = action_source
+        if extra_metadata:
+            clashing = set(extra_metadata) & set(self._metadata)
+            if clashing:
+                raise ValueError(f"Episode metadata cannot replace {', '.join(sorted(clashing))}")
+            self._metadata.update(extra_metadata)
         _write_json(self.path / "metadata.json", self._metadata)
 
     @property
@@ -508,6 +534,9 @@ class RawEpisodeWriter:
         self._joint_velocities.append(np.asarray(state["dq"], dtype=np.float32))
         if self.record_force:
             self._joint_torques.append(np.asarray(state["tau_J"], dtype=np.float32))
+            wrench, external = state.get("ext_wrench"), state.get("tau_ext")
+            self._external_wrenches.append(None if wrench is None else np.asarray(wrench, dtype=np.float32))
+            self._external_torques.append(None if external is None else np.asarray(external, dtype=np.float32))
         if self._tactile_writer is not None:
             # The writer holds the full-rate stream it has already stored, so it
             # resolves the nearest frame itself. The grid row is emitted one
@@ -629,6 +658,11 @@ class RawEpisodeWriter:
         }
         if self.record_force:
             trajectory["joint_torque"] = np.stack(self._joint_torques)
+            # Only when every row has it: an older controller reports none.
+            if all(value is not None for value in self._external_wrenches + self._external_torques):
+                trajectory["external_wrench"] = np.stack(self._external_wrenches)
+                trajectory["external_joint_torque"] = np.stack(self._external_torques)
+                self._metadata["force_signal"]["external"] = EXTERNAL_FORCE_SIGNAL
         if self._metadata.get("action_source") == MEASURED_ACTION_SOURCE and self._raw_force and len(self._raw_force) >= 2:
             # The control loop samples the arm between blocking calls (a gripper
             # command stalls it for about a second), so derive the action from
@@ -665,6 +699,9 @@ class RawEpisodeWriter:
             trajectory["raw_force_response_receive_timestamp"] = np.asarray(
                 [s.response_receive_monotonic for s in self._raw_force], dtype=np.float64
             )
+            if all(s.ext_wrench is not None and s.tau_ext is not None for s in self._raw_force):
+                trajectory["raw_force_external_wrench"] = np.stack([s.ext_wrench for s in self._raw_force])
+                trajectory["raw_force_external_joint_torque"] = np.stack([s.tau_ext for s in self._raw_force])
         for key, values in self._robot_timing.items():
             trajectory[key] = np.asarray(values, dtype=np.float64)
         for key, values in self._gripper_timing.items():
@@ -920,7 +957,14 @@ class DemoCollector:
                 continue
         return max(indices, default=-1) + 1
 
-    def start_episode(self) -> Path:
+    def start_episode(
+        self,
+        *,
+        action_source: str | None = None,
+        extra_metadata: dict[str, Any] | None = None,
+    ) -> Path:
+        """Start recording an episode; ``action_source`` replaces the session's for this one only."""
+
         self.check_health()
         require_free_space(self.session_dir, self.min_free_bytes)
         self.cameras.snapshot()
@@ -946,7 +990,8 @@ class DemoCollector:
                 image_size=self.image_size,
                 record_force=self.record_force,
                 tactile=self._tactile_settings(),
-                action_source=self.action_source,
+                action_source=self.action_source if action_source is None else action_source,
+                extra_metadata=extra_metadata,
             )
             if self.tactile is not None:
                 # Seed the episode with the frame already in the sensor's
@@ -1105,6 +1150,7 @@ class DemoCollector:
                         "Robot state has no tau_J; this bamboo controller cannot report joint torque. "
                         "Set recording.record_force = false to collect without it."
                     )
+                wrench, external = state.get("ext_wrench"), state.get("tau_ext")
                 sample = RobotSample(
                     qpos=np.asarray(state["qpos"], dtype=np.float32),
                     dq=np.asarray(state["dq"], dtype=np.float32),
@@ -1112,6 +1158,8 @@ class DemoCollector:
                     controller_timestamp=float(state["time_sec"]),
                     request_send_monotonic=started,
                     response_receive_monotonic=received,
+                    ext_wrench=None if wrench is None else np.asarray(wrench, dtype=np.float32),
+                    tau_ext=None if external is None else np.asarray(external, dtype=np.float32),
                 )
                 midpoint = (started + received) * 0.5
                 with self._sensor_lock:
@@ -1194,6 +1242,10 @@ class DemoCollector:
             "time_sec": before.controller_timestamp
             + alpha * (after.controller_timestamp - before.controller_timestamp),
         }
+        if before.ext_wrench is not None and after.ext_wrench is not None:
+            state["ext_wrench"] = before.ext_wrench + alpha * (after.ext_wrench - before.ext_wrench)
+        if before.tau_ext is not None and after.tau_ext is not None:
+            state["tau_ext"] = before.tau_ext + alpha * (after.tau_ext - before.tau_ext)
         timing = {
             "robot_before_timestamp": before.controller_timestamp,
             "robot_after_timestamp": after.controller_timestamp,

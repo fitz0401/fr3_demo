@@ -23,6 +23,7 @@ from fr3_demo.gel import GelStreamGuard, limit_twist
 from fr3_demo.guide import GuideHeartbeat, choose_guide_mode, describe_guide_failure, hold_message
 from fr3_demo.joystick import JoystickSnapshot, LinuxJoystick, axis, button, shaped_axis
 from fr3_demo.kinematics import WorkspaceBounds, forward_kinematics, resolved_rate_step
+from fr3_demo.replay import PATH_GAIN, REPLAY_ACTION_SOURCE, ReplayPath, link_replay, run_replay
 from fr3_demo.settings import default_config_path, load_config, teleop_defaults
 
 LOG = logging.getLogger("fr3_teleop")
@@ -401,6 +402,8 @@ def stream_home(
 GUIDE_HOME_PAUSE_S = 1.0
 # How long restarting guide mode after homing waits for the arm to be let go.
 GUIDE_RESTART_WAIT_S = 10.0
+# The same after a replay, which may leave the blade caught in the fruit.
+REPLAY_RESTART_WAIT_S = 30.0
 
 
 def home_from_guide(
@@ -449,7 +452,22 @@ def home_from_guide(
             robot.clear_contact_limits()
     if stop_requested():
         return None
-    deadline = time.monotonic() + GUIDE_RESTART_WAIT_S
+    heartbeat = restart_guide(robot, args, new_heartbeat, stop_requested)
+    print(("Homing complete; " if homed else "") + "guide mode is back on: the arm floats again.")
+    return heartbeat
+
+
+def restart_guide(
+    robot: BambooRobot,
+    args: argparse.Namespace,
+    new_heartbeat: Callable[[], GuideHeartbeat],
+    stop_requested: Callable[[], bool],
+    pushed_message: str = "Let go of the arm: guide mode starts once nothing pushes on it.",
+    wait_s: float = GUIDE_RESTART_WAIT_S,
+) -> GuideHeartbeat:
+    """Start guide mode again, waiting while something still pushes on the arm."""
+
+    deadline = time.monotonic() + wait_s
     asked = False
     while True:
         try:
@@ -465,13 +483,283 @@ def home_from_guide(
             if "External force estimate" not in str(error) or time.monotonic() >= deadline or stop_requested():
                 raise
             if not asked:
-                print("Let go of the arm: guide mode starts once nothing pushes on it.")
+                print(pushed_message)
                 asked = True
             time.sleep(0.5)
     heartbeat = new_heartbeat()
     heartbeat.start()
+    return heartbeat
+
+
+class ReplayControls:
+    """The joystick while a replay runs: X or B stops it, Back stops it and ends the session.
+
+    Only presses made after ``mark`` count, so the X that ended the
+    demonstration does not stop its replay. When waiting at the start pose, X
+    starts the replay and B skips it.
+    """
+
+    def __init__(self, joystick: LinuxJoystick, mapping: Mapping, session_ending: Callable[[], bool]) -> None:
+        self._joystick = joystick
+        self._mapping = mapping
+        self._session_ending = session_ending
+        self.quit = False
+        self.mark()
+
+    def _counts(self, snapshot: JoystickSnapshot) -> tuple[int, int]:
+        return snapshot.press_counts[self._mapping.record_button], snapshot.press_counts[self._mapping.open_button]
+
+    def mark(self) -> None:
+        """Forget the presses made so far."""
+
+        self._marks = self._counts(self._joystick.snapshot())
+
+    def pressed(self) -> tuple[bool, bool]:
+        """Whether X and B were pressed since ``mark``."""
+
+        x, b = self._counts(self._joystick.snapshot())
+        return x > self._marks[0], b > self._marks[1]
+
+    def ending(self) -> str | None:
+        """Why the whole session must stop, if it must."""
+
+        if self._session_ending():
+            self.quit = True
+            return "the session is ending"
+        snapshot = self._joystick.snapshot()
+        if not snapshot.connected:
+            self.quit = True
+            return "the joystick disconnected"
+        if button(snapshot, self._mapping.quit_button):
+            self.quit = True
+            return "you pressed Back"
+        return None
+
+    def stop_reason(self) -> str | None:
+        ending = self.ending()
+        if ending is not None:
+            return ending
+        return "you pressed X or B" if any(self.pressed()) else None
+
+
+def _end_stream(robot: BambooRobot) -> str | None:
+    """Stop the stream; a stream Bamboo already ended reports why instead."""
+
+    try:
+        robot.stop_stream()
+    except RuntimeError as error:
+        return str(error)
+    return None
+
+
+def _guarded_move(
+    robot: BambooRobot,
+    args: argparse.Namespace,
+    target: np.ndarray,
+    interrupted: Callable[[], bool],
+    why_interrupted: Callable[[], str],
+) -> str | None:
+    """Stream to a joint pose at homing speed; None once there, else why it stopped on the way."""
+
+    try:
+        stream_home(
+            robot,
+            target,
+            min(args.home_speed, args.max_joint_speed),
+            args.home_timeout,
+            args.stream_rate,
+            stop_requested=interrupted,
+        )
+    except InterruptedError:
+        return why_interrupted()
+    except RuntimeError as error:
+        # It timed out, or Bamboo ended the stream (its contact guard).
+        return str(error)
+    return None
+
+
+def _wait_for_go(
+    robot: BambooRobot,
+    args: argparse.Namespace,
+    controls: ReplayControls,
+    gel_guard: Any | None,
+) -> str | None:
+    """Hold the start pose until X; None to replay, else why not."""
+
+    print("At the start pose: press X to replay, B to skip it.", flush=True)
+    controls.mark()
+    period = 1.0 / args.stream_rate
+    while True:
+        started = time.monotonic()
+        ending = controls.ending()
+        if ending is not None:
+            return ending
+        go, skip = controls.pressed()
+        if go:
+            controls.mark()
+            return None
+        if skip:
+            return "you skipped it with B"
+        reason = None if gel_guard is None else gel_guard.check()
+        if reason is not None:
+            return reason
+        robot.stream_velocity(np.zeros(7))  # keeps the stream's watchdog fed
+        remaining = period - (time.monotonic() - started)
+        if remaining > 0:
+            time.sleep(remaining)
+
+
+def replay_from_guide(
+    robot: BambooRobot,
+    args: argparse.Namespace,
+    demo: Path,
+    collector: Any,
+    heartbeat: GuideHeartbeat | None,
+    new_heartbeat: Callable[[], GuideHeartbeat],
+    controls: ReplayControls,
+    stop_requested: Callable[[], bool],
+    gel_guard: Any | None = None,
+    rumbler: Any | None = None,
+) -> GuideHeartbeat | None:
+    """Replay the demonstration just recorded, record that replay, home, and float the arm again.
+
+    Guide mode stops and one stream, under [contact], takes the arm to the
+    demonstration's start, replays it while the collector records a new
+    episode linked to the demonstration, and homes. The replay stops early
+    when the operator asks, when the gel guard objects, when the arm is pushed
+    off the path, or when Bamboo's contact guard ends the stream; a stopped
+    replay is kept but marked, and is not followed by homing: guide mode
+    comes back where the arm is, so a caught blade can be freed by hand.
+    Returns the new heartbeat, or None when the session is ending.
+    """
+
+    try:
+        path = ReplayPath.from_episode(demo)
+    except (OSError, KeyError, ValueError) as error:
+        print(f"\nNot replaying {demo.name}: {error}.")
+        return heartbeat
+    if heartbeat is not None:
+        heartbeat.stop()
+    robot.stop_guide()
+    print(
+        f"\nReplaying {demo.name} ({path.duration:.1f} s): hands off the arm. X or B stops the replay, Back quits.",
+        flush=True,
+    )
+    time.sleep(GUIDE_HOME_PAUSE_S)
+
+    def interrupted() -> bool:
+        return controls.stop_reason() is not None or (gel_guard is not None and gel_guard.check() is not None)
+
+    def why_interrupted() -> str:
+        reason = controls.stop_reason() or (None if gel_guard is None else gel_guard.check())
+        return reason or "it was interrupted"
+
+    homed = False
+    stopped = True
+    try:
+        robot.apply_contact_limits(args.contact_limits)
+        robot.start_stream(args.watchdog_ms, args.max_joint_speed, args.max_joint_acceleration)
+        print("Moving to the demonstration's start...")
+        reason = _guarded_move(robot, args, path.start, interrupted, why_interrupted)
+        if reason is None and args.replay_wait:
+            reason = _wait_for_go(robot, args, controls, gel_guard)
+        if reason is not None:
+            print(f"Replay skipped: {reason}.")
+        else:
+            stopped = not _record_replay(robot, args, path, demo, collector, controls, gel_guard, rumbler)
+            if not stopped:
+                print("Homing...")
+                reason = _guarded_move(robot, args, HOME_JOINTS, interrupted, why_interrupted)
+                homed = reason is None
+                if not homed:
+                    print(f"Homing stopped: {reason}.")
+    finally:
+        ended = _end_stream(robot)
+        if ended is not None and not stopped:
+            LOG.warning("The replay stream ended with: %s", ended)
+        robot.clear_contact_limits()
+    if stop_requested() or controls.quit:
+        return None
+    heartbeat = restart_guide(
+        robot,
+        args,
+        new_heartbeat,
+        lambda: stop_requested() or controls.quit,
+        "Guide mode starts once nothing pushes on the arm: free the blade if it is caught, and keep hands off.",
+        REPLAY_RESTART_WAIT_S,
+    )
     print(("Homing complete; " if homed else "") + "guide mode is back on: the arm floats again.")
     return heartbeat
+
+
+def _record_replay(
+    robot: BambooRobot,
+    args: argparse.Namespace,
+    path: ReplayPath,
+    demo: Path,
+    collector: Any,
+    controls: ReplayControls,
+    gel_guard: Any | None,
+    rumbler: Any | None,
+) -> bool:
+    """Replay from the start pose while recording; True when it ran to the end."""
+
+    replay = collector.start_episode(action_source=REPLAY_ACTION_SOURCE, extra_metadata={"replay_of": demo.name})
+    if rumbler is not None:
+        rumbler.recording_started()
+    print(f"⬆️ Recording the replay: {replay}")
+
+    def stop_reason() -> str | None:
+        collector.check_health()  # a failed recorder ends the replay with its own error
+        return controls.stop_reason()
+
+    outcome = None
+    try:
+        outcome = run_replay(
+            robot,
+            path,
+            rate_hz=args.stream_rate,
+            max_speed=args.max_joint_speed,
+            max_path_error=args.replay_max_path_error,
+            gel_guard=gel_guard,
+            stop_reason=stop_reason,
+            on_command=collector.set_action,
+        )
+    finally:
+        collector.set_action(np.zeros(7))
+        try:
+            replay = collector.stop_episode()
+        except Exception as error:  # the replay's own failure, if any, matters more
+            if outcome is not None:
+                raise
+            LOG.error("Could not finish the replay's recording: %s", error)
+    link_replay(
+        demo,
+        replay,
+        outcome,
+        {
+            "path_gain": PATH_GAIN,
+            "max_path_error_limit_rad": args.replay_max_path_error,
+            "max_joint_speed": args.max_joint_speed,
+            "contact_limits": args.contact_limits,
+        },
+    )
+    if outcome.completed:
+        if rumbler is not None:
+            rumbler.recording_stopped()
+        print(
+            f"✅ Replay recorded: {replay} (it kept within {outcome.max_path_error_rad:.3f} rad of the "
+            "demonstrated path)"
+        )
+        return True
+    if rumbler is not None:
+        rumbler.error()
+    print(f"⛔ Replay stopped after {outcome.duration_s:.1f} s: {outcome.reason}.")
+    print(f"   {replay.name} is kept, marked as stopped (replay.completed = false in its metadata).")
+    if not outcome.by_operator:
+        print("   Guide mode comes back where the arm is: free the blade by hand, then Menu homes.")
+    return False
+
 
 def _pose_error(model: np.ndarray, measured: np.ndarray) -> tuple[float, float]:
     position_error = float(np.linalg.norm(model[:3, 3] - measured[:3, 3]))
@@ -612,6 +900,27 @@ def _create_parser() -> argparse.ArgumentParser:
         help="refuse to start guiding above this external force estimate in N (default: Bamboo's 5 N)",
     )
     parser.add_argument("--guide-heartbeat-hz", type=float, default=30.0, help="guide update rate")
+    parser.add_argument(
+        "--replay",
+        action="store_true",
+        help=(
+            "with --hand-guide: stopping a recording with X replays it on the arm right away (from its start pose, "
+            "under [contact] and the gel guard), records the replay as its own episode, then homes"
+        ),
+    )
+    parser.add_argument(
+        "--replay-wait",
+        action="store_true",
+        help="with --replay, wait at the demonstration's start pose for X before replaying (B skips)",
+    )
+    parser.add_argument(
+        "--replay-max-path-error",
+        type=float,
+        # A replay lags a fast demo by up to ~0.03 rad (the stream's acceleration limit, measured on real demos
+        # in simulation), and contact at the push cap adds ~0.01 rad.
+        default=0.08,
+        help="stop a replay once the arm is pushed this far off the demonstrated path, in rad (default: %(default)s)",
+    )
     parser.add_argument(
         "--payload-mass-kg",
         type=float,
@@ -818,6 +1127,27 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         )
     if args.hand_guide and not args.collect:
         parser.error("--hand-guide records demonstrations, so it requires --collect (use fr3-collect --hand-guide)")
+    replay_tuned = args.replay_wait or args.replay_max_path_error != parser.get_default("replay_max_path_error")
+    if replay_tuned and not args.replay:
+        parser.error("--replay-wait and --replay-max-path-error only apply with --replay")
+    if args.replay:
+        if not args.hand_guide:
+            parser.error("--replay replays hand-guided demonstrations, so it requires --hand-guide")
+        if args.contact_limits is None or args.no_contact_limits:
+            parser.error(
+                "--replay needs the contact limits: set enabled = true under [contact] in the config "
+                "(and measure contact_point_m to where the tool meets the fruit)"
+            )
+        # A replay presses until the blade is where the demonstration had it; the push cap is what bounds that.
+        if args.contact_limits.get("shadow") or not args.contact_limits.get("max_force_n", 0.0) > 0.0:
+            parser.error("--replay needs the push cap applied: set max_force_n and shadow = false under [contact]")
+        if (args.record_tactile or args.gel is not None) and (args.gel is None or args.no_gel_guard):
+            parser.error(
+                "--replay needs the gel guard while the GelSight is in use: "
+                "set enabled = true under [gel] in the config"
+            )
+        if not 0.0 < args.replay_max_path_error <= 0.2:
+            parser.error("--replay-max-path-error must be in (0, 0.2] rad")
     if not 50 <= args.guide_watchdog_ms <= 500:
         parser.error("--guide-watchdog-ms must be between 50 and 500")
     if args.guide_max_joint_velocity <= 0:
@@ -1073,6 +1403,15 @@ def run(args: argparse.Namespace) -> int:
                 print(f"Streaming control active at {args.stream_rate:.0f} Hz (watchdog: {args.watchdog_ms} ms).")
             elif args.legacy_waypoints and not args.dry_run:
                 LOG.warning("Legacy waypoint mode intentionally stops after every command and will feel laggy")
+            if args.replay:
+                if not guiding_active:
+                    raise RuntimeError("--replay needs Bamboo's guide mode; with the Pilot buttons it cannot replay")
+                print(
+                    "Replay: stopping a recording with X replays it on the arm from its start pose, under the "
+                    "contact limits" + (" and the gel guard" if gel is not None else "") + ", records the replay "
+                    "as its own episode, and homes. X or B stops a replay, Back quits."
+                    + (" The arm waits at the start pose for X." if args.replay_wait else "")
+                )
 
             def pause_stream() -> None:
                 """Idle the arm before anything blocks for operator input."""
@@ -1102,7 +1441,7 @@ def run(args: argparse.Namespace) -> int:
                 )
                 controls = "A: close gripper | B: open gripper | Menu: home | Back: quit"
             if collector is not None:
-                controls += " | X: start/stop recording"
+                controls += " | X: start/stop recording" + (" (stopping replays it)" if args.replay else "")
             print(controls)
             print("Keep a hand on the physical E-stop.\n")
 
@@ -1176,6 +1515,32 @@ def run(args: argparse.Namespace) -> int:
                             )
                             _store_weights(completed, pending_weights)
                         pending_weights.clear()
+                        if args.replay and guiding_active and robot is not None:
+                            replay_controls = ReplayControls(joystick, mapping, lambda: stop)
+                            guiding_active = False
+                            heartbeat = replay_from_guide(
+                                robot,
+                                args,
+                                completed,
+                                collector,
+                                heartbeat,
+                                lambda: GuideHeartbeat(robot.new_arm_client, args.guide_heartbeat_hz, gel=gel),
+                                replay_controls,
+                                lambda: stop,
+                                None if gel is None else GelStreamGuard(gel),
+                                rumbler,
+                            )
+                            guiding_active = heartbeat is not None
+                            last_hold_message = None
+                            if replay_controls.quit and not stop:
+                                request_stop()
+                            # The presses that steered the replay are spent.
+                            spent = joystick.snapshot()
+                            last_close_count = spent.press_counts[mapping.close_button]
+                            last_open_count = spent.press_counts[mapping.open_button]
+                            last_home_count = spent.press_counts[mapping.home_button]
+                            last_record_count = spent.press_counts[mapping.record_button]
+                            last_resume_count = spent.press_counts[mapping.yaw_up_button]
                     else:
                         if args.weigh:
                             print("\nWeigh the bottle and the cup before this demonstration:")
