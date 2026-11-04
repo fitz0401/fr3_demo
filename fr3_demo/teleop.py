@@ -688,7 +688,10 @@ def replay_from_guide(
         "Guide mode starts once nothing pushes on the arm: free the blade if it is caught, and keep hands off.",
         REPLAY_RESTART_WAIT_S,
     )
-    print(("Homing complete; " if homed else "") + "guide mode is back on: the arm floats again.")
+    print(
+        ("Homing complete; " if homed else "")
+        + "guide mode is back on: the arm floats again. Press X to record the next demonstration."
+    )
     return heartbeat
 
 

@@ -156,11 +156,11 @@ center_of_mass_m = [0.0, 0.0, 0.07]  # flange frame
 # (a 1 kg bottle reads about 10 N), so enable them for contact tasks such as
 # peeling, not lifting tasks such as pouring. Watch them with fr3-contact-check.
 [contact]
-enabled = false
+enabled = true
 # true: report the push cap (fr3-contact-check) without applying it.
 shadow = false
 # The force a stream may push with at the contact point if it is blocked.
-max_force_n = 15.0
+max_force_n = 10.0
 # Tool tip where it meets the fruit, flange frame (m). Measure yours.
 contact_point_m = [0.0, 0.0, 0.20]
 # Franka's external force estimate above this for 0.05 N s of excess, or above
@@ -184,7 +184,7 @@ max_point_speed_m_s = 0.0
 # and the run stops at level 1, or if the gel signal is lost. The gel is
 # re-zeroed after every gripper command.
 [gel]
-enabled = false
+enabled = true
 # Level 1: marker shift (px), twist (deg) or pressing (% the marker field grows).
 # fr3-gel-calibrate prints what your pushes reached; at about 7 N along the
 # gripper's closing direction the gel shifted ~10 px.
