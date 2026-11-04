@@ -247,7 +247,7 @@ Two independent layers, both off until enabled in `config.toml`:
 | Senses | Franka's force estimate and the stream's own push | the marker gel itself |
 | Teleop, policy runs | push cap, force guard that yields, Franka reflex | blocks driving into the load (teleop); stops the run at the limit or if the signal is lost |
 | Hand guiding | not applicable (your hand is part of the force) | the arm stiffens against further loading; at the limit it will not go further that way |
-| Caveat | counts lifted objects (1 kg reads ~10 N): contact tasks only | needs the marker gel and a calibration |
+| Caveat | counts lifted objects (1 kg reads ~10 N): contact tasks only | needs the marker gel; limits are in the gel's own units |
 
 The contact limits make a policy run unable to push the tool harder than the
 set force, and Franka's own reflex is the backstop if anything else fails.
@@ -257,11 +257,16 @@ a hand that pushes through it; only a mechanical limit could.
 Bring-up, with the user stop at hand:
 
 1. Rebuild Bamboo on the robot PC (`feature/contact-safety`) and restart it.
-2. Fit the marker gel and the tool, then calibrate the gel against Franka's
-   estimate: `fr3-gel-calibrate`. With the arm still and no loop running,
-   press the tool tip with a finger, 3 to 10 N, in several directions,
-   touching only the tool. Copy the two lines it prints into `[gel]`, set
-   `limit_n`, and `enabled = true`.
+2. Fit the marker gel and the tool. The guard's level is the gel's own
+   shift, twist and pressing against `[gel]`'s limits, so it works without
+   any calibration. For guide mode to block only the loading direction at
+   the limit (rather than hold), run `fr3-gel-calibrate`: with the arm still
+   and no loop running, press the tool where it meets the fruit, gently
+   sideways (a newton or two twists the gel a lot) and a few newtons along
+   the other directions, touching only the tool. A direction that barely
+   moves the gel is reported as going around it (through a hard opposite
+   finger), not refused. Copy the lines it prints into `[gel]`, check the
+   limits against what it says your pushes reached, and set `enabled = true`.
 3. `[contact]`: measure your tool tip (`contact_point_m`), set
    `enabled = true` and `shadow = true`, and teleop through a normal task
    while `fr3-contact-check` runs in a second terminal. In free motion the
@@ -270,7 +275,7 @@ Bring-up, with the user stop at hand:
    the scale should stop near `max_force_n`, and pushing on harder makes the
    guard yield. Then the same with a policy run.
 5. Hand guiding: press the tool into the scale by hand; the arm should
-   stiffen as the gel's level rises and stop advancing at `limit_n`.
+   stiffen as the gel's level rises and stop advancing at level 1.
 
 `fr3-collect` and `fr3-pi05-run` set the limits when they start and clear them
 when they exit; `--no-contact-limits` and `--no-gel-guard` turn either off for

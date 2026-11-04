@@ -1010,9 +1010,9 @@ def run(args: argparse.Namespace) -> int:
             print(f"Raw demonstration session: {collector.session_dir}")
 
         if args.gel is not None and not args.no_gel_guard and robot is not None and not (args.dry_run or args.check):
-            from fr3_demo.gel import GelCalibration, GelMonitor
+            from fr3_demo.gel import GelMonitor, describe_gel_guard, gel_guard_settings
 
-            calibration = GelCalibration.from_config(args.gel)
+            gel_limits, gel_directions = gel_guard_settings(args.gel)
             camera = tactile
             if camera is None:
                 from fr3_demo.tactile import GelSightCamera
@@ -1026,11 +1026,11 @@ def run(args: argparse.Namespace) -> int:
                 )
                 gel_camera.start()
                 camera = gel_camera
-            gel = GelMonitor(calibration)
+            gel = GelMonitor(gel_limits, gel_directions)
             camera.add_frame_observer(gel.on_frame)
             print("Zeroing the GelSight: keep the tool still and out of contact...")
             gel.wait_zeroed(10.0)
-            print(f"GelSight guard on: level 1 is an estimated {calibration.limit_n:.0f} N through the gel.")
+            print(describe_gel_guard(gel_limits, gel_directions))
 
         with LinuxJoystick(args.joystick) as joystick:
             q = _diagnostics(joystick, robot, nominal_q)

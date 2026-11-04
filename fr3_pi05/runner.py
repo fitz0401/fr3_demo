@@ -690,10 +690,10 @@ def run(args: argparse.Namespace) -> int:
         gripper = GripperWorker(robot, not args.no_gripper, args.gripper_threshold)
         gripper.wait_ready()
         if args.gel is not None and not args.no_gel_guard and args.execute:
-            from fr3_demo.gel import GelCalibration, GelMonitor, GelStreamGuard
+            from fr3_demo.gel import GelMonitor, GelStreamGuard, describe_gel_guard, gel_guard_settings
             from fr3_demo.tactile import GelSightCamera
 
-            calibration = GelCalibration.from_config(args.gel)
+            gel_limits, gel_directions = gel_guard_settings(args.gel)
             gel_camera = GelSightCamera(
                 device=args.tactile_device or None,
                 width=args.tactile_width,
@@ -701,14 +701,14 @@ def run(args: argparse.Namespace) -> int:
                 rotate_180=args.tactile_rotate_180,
             )
             gel_camera.start()
-            gel_monitor = GelMonitor(calibration)
+            gel_monitor = GelMonitor(gel_limits, gel_directions)
             gel_camera.add_frame_observer(gel_monitor.on_frame)
             print("Zeroing the GelSight: keep the tool still and out of contact...")
             gel_monitor.wait_zeroed(10.0)
             gel_guard = GelStreamGuard(gel_monitor)
             gripper.before_command = lambda: gel_monitor.suspend("the gripper is moving")
             gripper.after_command = gel_monitor.rezero
-            print(f"GelSight guard on: the run stops at an estimated {calibration.limit_n:.0f} N through the gel.")
+            print(describe_gel_guard(gel_limits, gel_directions) + " A policy run stops at level 1.")
         cameras = RealSensePair(
             args.external_camera_serial,
             args.wrist_camera_serial,

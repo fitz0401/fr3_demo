@@ -6,11 +6,13 @@ from unittest.mock import patch
 import numpy as np
 
 from fr3_demo.gel import (
-    GelCalibration,
+    GelDirections,
+    GelLimits,
     GelMonitor,
     GelReading,
     GelStreamGuard,
     fit_calibration,
+    gel_guard_settings,
     limit_twist,
 )
 from fr3_demo.guide import GuideHeartbeat
@@ -19,10 +21,13 @@ from fr3_demo.tactile import GelSightCamera, TactileFrame
 GRID = np.array([[x, y] for x in range(20, 300, 30) for y in range(20, 220, 30)], dtype=float)
 
 
-def _calibration(limit_n: float = 10.0) -> GelCalibration:
-    # 0.5 N per px: image x -> EE +x, image y -> EE -z; pressing -> EE +y.
-    shear = np.array([[0.5, 0.0], [0.0, 0.0], [0.0, -0.5]])
-    return GelCalibration(shear, np.array([0.0, 20.0, 0.0]), limit_n=limit_n, twist_limit_rad=0.1)
+def _limits() -> GelLimits:
+    return GelLimits(shift_px=20.0, twist_rad=0.1, press=0.02)
+
+
+def _directions() -> GelDirections:
+    # image x -> EE +x, image y -> EE -z; pressing -> EE +y.
+    return GelDirections(np.array([[0.5, 0.0], [0.0, 0.0], [0.0, -0.5]]), np.array([0.0, 20.0, 0.0]))
 
 
 def _estimate(shear=(0.0, 0.0), twist=0.0, spread=0.0, valid=True, reason=""):
@@ -57,34 +62,53 @@ def _frame(number: int) -> TactileFrame:
     )
 
 
-def _zeroed_monitor(tracker: FakeTracker, **kwargs) -> GelMonitor:
-    monitor = GelMonitor(_calibration(**kwargs), tracker=tracker, settle_frames=3)
+def _zeroed_monitor(tracker: FakeTracker, directions: GelDirections | None = None) -> GelMonitor:
+    monitor = GelMonitor(_limits(), directions or _directions(), tracker=tracker, settle_frames=3)
     for number in range(5):
         monitor.on_frame(_frame(number))
     assert monitor.zeroed
     return monitor
 
 
-class GelCalibrationTest(unittest.TestCase):
-    def test_config_without_a_fit_explains_how_to_get_one(self) -> None:
-        with self.assertRaisesRegex(ValueError, "fr3-gel-calibrate"):
-            GelCalibration.from_config({"enabled": True, "limit_n": 10.0})
+class GelSettingsTest(unittest.TestCase):
+    def test_limits_come_first_and_directions_are_optional(self) -> None:
+        limits, directions = gel_guard_settings({"enabled": True})
+        self.assertEqual(limits, GelLimits())
+        self.assertIsNone(directions)
+        limits, directions = gel_guard_settings(
+            {
+                "shift_limit_px": 12.0,
+                "twist_limit_deg": 3.0,
+                "press_limit_percent": 1.0,
+                "shear_to_force": [[1, 0], [0, 0], [0, 1]],
+            }
+        )
+        self.assertEqual(limits.shift_px, 12.0)
+        self.assertAlmostEqual(limits.twist_rad, np.radians(3.0))
+        self.assertAlmostEqual(limits.press, 0.01)
+        np.testing.assert_allclose(directions.twist_to_force, np.zeros(3))
         with self.assertRaises(ValueError):
-            GelCalibration(np.zeros((3, 2)), np.zeros(3), 10.0, 0.1)
+            GelDirections(np.zeros((3, 2)), np.zeros(3))
+        with self.assertRaises(ValueError):
+            GelLimits(shift_px=0.0)
 
-    def test_level_is_the_worse_of_force_and_twist(self) -> None:
-        calibration = _calibration(limit_n=10.0)
-        level, force = calibration.level(_estimate(shear=(8.0, 6.0)))  # 4 N along x, -3 N along z
-        np.testing.assert_allclose(force, [4.0, 0.0, -3.0])
-        self.assertAlmostEqual(level, 0.5)
-        level, _ = calibration.level(_estimate(twist=0.08))
-        self.assertAlmostEqual(level, 0.8)
+    def test_level_is_the_worst_of_shift_twist_and_pressing(self) -> None:
+        limits = _limits()
+        self.assertAlmostEqual(limits.level(_estimate(shear=(12.0, 16.0))), 1.0)  # a 20 px shift
+        self.assertAlmostEqual(limits.level(_estimate(twist=-0.05)), 0.5)
+        self.assertAlmostEqual(limits.level(_estimate(spread=0.01)), 0.5)
+        self.assertAlmostEqual(limits.level(_estimate(spread=-0.01)), 0.0)  # relieved, not pressed
+
+    def test_direction_is_the_fit_s_load_direction_whatever_its_size(self) -> None:
+        directions = _directions()
+        np.testing.assert_allclose(directions.direction(_estimate(shear=(8.0, 6.0))), [0.8, 0.0, -0.6])
+        np.testing.assert_allclose(directions.direction(_estimate(shear=(80.0, 60.0))), [0.8, 0.0, -0.6])
 
 
 class GelMonitorTest(unittest.TestCase):
     def test_zeroes_only_once_the_gel_has_settled(self) -> None:
         tracker = FakeTracker()
-        monitor = GelMonitor(_calibration(), tracker=tracker, settle_frames=3)
+        monitor = GelMonitor(_limits(), tracker=tracker, settle_frames=3)
         rng = np.random.default_rng(0)
         for number in range(6):  # still moving: markers jump about 2 px per frame
             tracker.markers = GRID + rng.normal(0.0, 2.0, GRID.shape)
@@ -101,16 +125,28 @@ class GelMonitorTest(unittest.TestCase):
     def test_reading_carries_level_and_loading_direction(self) -> None:
         tracker = FakeTracker()
         monitor = _zeroed_monitor(tracker)
-        tracker.estimate = _estimate(shear=(16.0, 0.0))  # 8 N along EE +x
+        tracker.estimate = _estimate(shear=(16.0, 0.0), twist=0.01)  # 16 of 20 px, along EE +x
         monitor.on_frame(_frame(10))
         reading = monitor.latest()
         self.assertTrue(reading.valid)
         self.assertAlmostEqual(reading.level, 0.8)
         np.testing.assert_allclose(reading.direction_ee, [1.0, 0.0, 0.0])
-        tracker.estimate = _estimate(shear=(0.4, 0.0))  # 0.2 N: too small to say which way
+        self.assertEqual(reading.shift_px, (16.0, 0.0))
+        self.assertEqual(reading.twist_rad, 0.01)
+        tracker.estimate = _estimate(shear=(0.4, 0.0))  # barely loaded: too little to say which way
         monitor.on_frame(_frame(11))
         self.assertIsNone(monitor.latest().direction_ee)
         self.assertGreater(monitor.latest().seq, reading.seq)
+
+    def test_without_directions_the_level_still_guards(self) -> None:
+        tracker = FakeTracker()
+        monitor = GelMonitor(_limits(), tracker=tracker, settle_frames=3)
+        for number in range(5):
+            monitor.on_frame(_frame(number))
+        tracker.estimate = _estimate(shear=(0.0, 30.0))
+        monitor.on_frame(_frame(10))
+        self.assertAlmostEqual(monitor.latest().level, 1.5)
+        self.assertIsNone(monitor.latest().direction_ee)
 
     def test_fails_closed(self) -> None:
         tracker = FakeTracker()
@@ -152,9 +188,9 @@ class GelStreamGuardTest(unittest.TestCase):
         tracker.estimate = _estimate(shear=(10.0, 0.0))
         monitor.on_frame(_frame(10))
         self.assertIsNone(guard.check())
-        tracker.estimate = _estimate(shear=(21.0, 0.0))  # 10.5 N
+        tracker.estimate = _estimate(shear=(21.0, 0.0))  # past the 20 px limit
         monitor.on_frame(_frame(11))
-        self.assertIn("level 1.05", guard.check())
+        self.assertIn("level 1.05 (shift 21.0 px", guard.check())
         tracker.estimate = _estimate(valid=False, reason="lost track")
         monitor.on_frame(_frame(12))
         self.assertIn("lost track", guard.check())
@@ -166,7 +202,7 @@ class GelStreamGuardTest(unittest.TestCase):
 
 class LimitTwistTest(unittest.TestCase):
     def _reading(self, level: float, valid: bool = True, zeroing: bool = False) -> GelReading:
-        return GelReading(1, time.monotonic(), valid, "", level, (0.0, 0.0, -level), (0.0, 0.0, -1.0), zeroing)
+        return GelReading(1, time.monotonic(), valid, "", level, (0.0, 0.0, -1.0), zeroing)
 
     def test_blocks_only_motion_that_loads_the_gel(self) -> None:
         rotation = np.eye(3)
@@ -209,7 +245,7 @@ class FitCalibrationTest(unittest.TestCase):
 
 class FakeGel:
     def __init__(self) -> None:
-        self.reading = GelReading(7, time.monotonic(), True, "", 0.6, (0.0, 3.0, 0.0), (0.0, 1.0, 0.0))
+        self.reading = GelReading(7, time.monotonic(), True, "", 0.6, (0.0, 1.0, 0.0))
 
     def latest(self) -> GelReading:
         return self.reading
@@ -236,7 +272,7 @@ class GelHeartbeatTest(unittest.TestCase):
         deadline = time.monotonic() + 2.0
         while len(client.updates) < 3 and time.monotonic() < deadline:
             time.sleep(0.005)
-        gel.reading = GelReading(8, time.monotonic(), False, "lost track", 0.0, (0.0, 0.0, 0.0), None)
+        gel.reading = GelReading(8, time.monotonic(), False, "lost track", 0.0, None)
         while not any(not update["valid"] for update in client.updates) and time.monotonic() < deadline:
             time.sleep(0.005)
         heartbeat.stop()
@@ -307,7 +343,7 @@ def _marker_image(shift: tuple[float, float] = (0.0, 0.0), seed: int = 0) -> np.
 
 class GelMonitorWithTrackerTest(unittest.TestCase):
     def test_a_sheared_gel_reads_its_load_and_direction(self) -> None:
-        monitor = GelMonitor(_calibration(limit_n=10.0), settle_frames=3)
+        monitor = GelMonitor(_limits(), _directions(), settle_frames=3)
         number = 0
         for _ in range(6):
             monitor.on_frame(TactileFrame(_marker_image(seed=number), time.monotonic(), number))
@@ -323,7 +359,9 @@ class GelMonitorWithTrackerTest(unittest.TestCase):
         np.testing.assert_allclose(reading.direction_ee, [1.0, 0.0, 0.0], atol=0.05)
 
 
-def _synthetic_run(seed: int = 0, lag_s: float = 0.06, directions: int = 3, tracked: float = 1.0) -> dict:
+def _synthetic_run(
+    seed: int = 0, lag_s: float = 0.06, directions: int = 3, tracked: float = 1.0, z_seen: bool = True
+) -> dict:
     """A calibration run: pushes held a second or two, a gel lagging Franka by lag_s."""
 
     rng = np.random.default_rng(seed)
@@ -337,7 +375,8 @@ def _synthetic_run(seed: int = 0, lag_s: float = 0.06, directions: int = 3, trac
     frame_time = np.arange(0.0, 40.0, 1.0 / 18.0)
     seen = np.stack([np.interp(frame_time - lag_s, force_time, force[:, axis]) for axis in range(3)], axis=1)
     # Image x follows EE x, image y follows EE -z; sideways (EE x) pushes also twist the gel.
-    shear = np.stack((2.0 * seen[:, 0], -1.6 * seen[:, 2]), axis=1) + rng.normal(0.0, 0.05, (len(frame_time), 2))
+    along_z = -1.6 * seen[:, 2] if z_seen else np.zeros(len(frame_time))  # or through a hard finger
+    shear = np.stack((2.0 * seen[:, 0], along_z), axis=1) + rng.normal(0.0, 0.05, (len(frame_time), 2))
     twist = 0.01 * seen[:, 0] + rng.normal(0.0, 0.0005, len(frame_time))
     spread = 0.004 * seen[:, 1] + rng.normal(0.0, 0.0002, len(frame_time))
     valid = rng.uniform(size=len(frame_time)) < tracked
@@ -364,9 +403,9 @@ class CalibrationRunTest(unittest.TestCase):
         self.assertGreater(fit["r_squared"], 0.95)
         self.assertTrue(np.all(fit["axis_r_squared"] > 0.9))
         # A sideways push shows as both shift and twist; the fit may use either, but must predict it.
-        calibration = GelCalibration(fit["shear_to_force"], fit["spread_to_force"], 10.0, 0.1, fit["twist_to_force"])
+        directions = GelDirections(fit["shear_to_force"], fit["spread_to_force"], fit["twist_to_force"])
         estimate = _estimate(shear=(10.0, 0.0), twist=0.05)  # 5 N along EE x
-        np.testing.assert_allclose(calibration.force(estimate), [5.0, 0.0, 0.0], atol=0.3)
+        np.testing.assert_allclose(directions.load(estimate), [5.0, 0.0, 0.0], atol=0.3)
 
     def test_report_accepts_a_good_run_and_explains_a_bad_one(self) -> None:
         from fr3_demo.gel import report_calibration
@@ -382,10 +421,17 @@ class CalibrationRunTest(unittest.TestCase):
         usable, _ = report_calibration(_synthetic_run(tracked=0.3))
         self.assertFalse(usable)
 
+    def test_force_that_goes_around_the_gel_is_reported_not_refused(self) -> None:
+        from fr3_demo.gel import report_calibration
+
+        usable, lines = report_calibration(_synthetic_run(z_seen=False))
+        self.assertTrue(usable)
+        self.assertEqual(len(lines), 3)
+
     def test_the_twist_term_is_optional_in_the_config(self) -> None:
-        old = GelCalibration.from_config({"shear_to_force": [[0.5, 0.0], [0.0, 0.0], [0.0, -0.5]]})
+        _, old = gel_guard_settings({"shear_to_force": [[0.5, 0.0], [0.0, 0.0], [0.0, -0.5]]})
         np.testing.assert_allclose(old.twist_to_force, np.zeros(3))
-        new = GelCalibration.from_config(
+        _, new = gel_guard_settings(
             {"shear_to_force": [[0.5, 0.0], [0.0, 0.0], [0.0, -0.5]], "twist_to_force": [100.0, 0.0, 0.0]}
         )
-        np.testing.assert_allclose(new.force(_estimate(twist=0.02)), [2.0, 0.0, 0.0])
+        np.testing.assert_allclose(new.load(_estimate(twist=0.02)), [2.0, 0.0, 0.0])

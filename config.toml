@@ -174,22 +174,28 @@ max_point_speed_m_s = 0.0
 
 # GelSight guard: watches the marker gel itself, so it also works while you
 # guide the arm by hand (when Franka's own estimate cannot tell your hand from
-# the fruit). Needs the marker gel and a calibration from fr3-gel-calibrate.
-# Hand guiding: as the load rises the arm stiffens against loading it further,
-# and at the limit it will not go further that way (backing off stays free).
-# Teleop: driving further into the load is blocked; it yields past 1.2x.
-# Policy runs: the stream yields and the run stops at the limit, or if the gel
-# signal is lost. After every gripper command the gel is re-zeroed.
+# the fruit). Needs the marker gel. Its level is the gel's own deformation
+# against the limits below: that is what tears the gel, whatever holds the
+# tool. Hand guiding: as the level rises the arm stiffens against loading it
+# further; at level 1 it stops moving further that way (backing off stays
+# free) when fr3-gel-calibrate has fitted the loading direction, and holds
+# otherwise (open the gripper, B, to unload). Teleop: driving further into
+# the load is blocked, and it yields past 1.2. Policy runs: the stream yields
+# and the run stops at level 1, or if the gel signal is lost. The gel is
+# re-zeroed after every gripper command.
 [gel]
 enabled = false
-# Estimated force through the gel at level 1 (N).
-limit_n = 10.0
-# Twist of the marker field at level 1 (rad).
-twist_limit_rad = 0.1
-# From fr3-gel-calibrate (EE-frame force per px of marker shift, and per unit
-# spread). Recalibrate after moving the sensor or changing [tactile] rotate_180.
+# Level 1: marker shift (px), twist (deg) or pressing (% the marker field grows).
+# fr3-gel-calibrate prints what your pushes reached; at about 7 N along the
+# gripper's closing direction the gel shifted ~10 px.
+shift_limit_px = 15.0
+twist_limit_deg = 6.0
+press_limit_percent = 2.0
+# Loading direction, from fr3-gel-calibrate (only its direction is used).
+# Recalibrate after moving the sensor or changing [tactile] rotate_180.
 # shear_to_force = [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
 # spread_to_force = [0.0, 0.0, 0.0]
+# twist_to_force = [0.0, 0.0, 0.0]
 
 [teleop]
 linear_speed = 0.08

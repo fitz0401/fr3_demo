@@ -1,13 +1,16 @@
-"""GelSight gel guard: marker shift -> the gel's load, its direction and a level.
+"""GelSight gel guard: the gel's own deformation -> a level, and which way it is loaded.
 
-The marker tracker (tactile_shear) measures how far the gel surface has moved
-since an unloaded reference. A calibration fitted by fr3-gel-calibrate maps
-that shift to the force the arm puts through the gel, in newtons and in the
-end-effector frame, robot on environment, as Franka reports its own estimate.
-That force's direction is the way the arm is pushing, so arm motion along it
-loads the gel further. The level is the force over the configured limit (or
-the twist over its limit, whichever is larger): guide mode stiffens against
-further loading as it rises, and streams yield at level 1.
+The marker tracker (tactile_shear) measures how far the gel surface has
+shifted, twisted and been pressed since an unloaded reference. That
+deformation is what tears the gel, so the level is it over configured limits,
+whatever holds the tool: guide mode stiffens against further loading as the
+level rises, and streams yield at level 1.
+
+Which way the arm is loading the gel (so guide mode can block only that way)
+comes from a fit by fr3-gel-calibrate against Franka's force estimate. With
+a hard finger opposite the gel, the gel feels only part of the load, a part
+that changes with every grasp, so only the direction of that fit is used,
+never its size. Without one, guide mode holds at the limit instead.
 
 The gel is pressed whenever the gripper closes, so the reference is retaken
 (re-zeroed) after each gripper command, once the image has settled. Everything
@@ -17,6 +20,7 @@ all give an invalid reading, never a small number.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -30,16 +34,40 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
-class GelCalibration:
-    """Maps tracker output to the force through the gel (N, EE frame, robot on environment)."""
+class GelLimits:
+    """The gel's deformation at level 1: what tears it, whatever holds the tool."""
+
+    shift_px: float = 15.0  # marker shift
+    twist_rad: float = math.radians(6.0)
+    press: float = 0.02  # spread (scale - 1) of the marker field when pressed
+
+    def __post_init__(self) -> None:
+        values = (self.shift_px, self.twist_rad, self.press)
+        if not all(math.isfinite(value) and value > 0 for value in values):
+            raise ValueError("gel limits must be positive")
+
+    def level(self, estimate: ShearEstimate) -> float:
+        shift = float(np.hypot(*estimate.shear_px))
+        return max(
+            shift / self.shift_px,
+            abs(float(estimate.twist_rad)) / self.twist_rad,
+            max(0.0, float(estimate.spread)) / self.press,
+        )
+
+
+@dataclass(frozen=True)
+class GelDirections:
+    """Which way the arm is loading the gel, from a fr3-gel-calibrate fit.
+
+    The fit maps the gel's shift, spread and twist to Franka's force estimate
+    (robot on environment, end-effector frame), so the result points the way
+    the arm pushes; motion along it loads the gel further. Its size is not
+    used: with a hard finger opposite the gel it changes with every grasp.
+    """
 
     shear_to_force: np.ndarray  # (3, 2): per px of marker shift along image x and y
-    spread_to_force: np.ndarray  # (3,): per unit of spread (pressing into the gel)
-    limit_n: float  # estimated load at level 1
-    twist_limit_rad: float  # twist of the marker field at level 1
-    # (3,): per rad of twist. A sideways push at a tool tip far from the grip
-    # turns the gel more than it shifts it.
-    twist_to_force: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    spread_to_force: np.ndarray  # (3,)
+    twist_to_force: np.ndarray = field(default_factory=lambda: np.zeros(3))  # (3,)
 
     def __post_init__(self) -> None:
         shear = np.asarray(self.shear_to_force, dtype=float)
@@ -52,32 +80,15 @@ class GelCalibration:
             or not (np.all(np.isfinite(shear)) and np.all(np.isfinite(spread)) and np.all(np.isfinite(twist)))
         ):
             raise ValueError(
-                "gel calibration needs a finite 3x2 shear_to_force and 3-vectors spread_to_force and twist_to_force"
+                "gel directions need a finite 3x2 shear_to_force and 3-vectors spread_to_force and twist_to_force"
             )
-        if not np.any(shear):
-            raise ValueError("gel calibration maps every shift to zero force")
-        if not (self.limit_n > 0 and self.twist_limit_rad > 0):
-            raise ValueError("gel limit_n and twist_limit_rad must be positive")
+        if not (np.any(shear) or np.any(twist)):
+            raise ValueError("gel directions map every shift and twist to nothing")
         object.__setattr__(self, "shear_to_force", shear)
         object.__setattr__(self, "spread_to_force", spread)
         object.__setattr__(self, "twist_to_force", twist)
 
-    @classmethod
-    def from_config(cls, gel: dict[str, Any]) -> GelCalibration:
-        if "shear_to_force" not in gel:
-            raise ValueError(
-                "[gel] has no calibration: run fr3-gel-calibrate with the marker gel and tool fitted, "
-                "then copy what it prints into config.toml"
-            )
-        return cls(
-            shear_to_force=np.asarray(gel["shear_to_force"], dtype=float),
-            spread_to_force=np.asarray(gel.get("spread_to_force", [0.0, 0.0, 0.0]), dtype=float),
-            limit_n=float(gel.get("limit_n", 10.0)),
-            twist_limit_rad=float(gel.get("twist_limit_rad", 0.1)),
-            twist_to_force=np.asarray(gel.get("twist_to_force", [0.0, 0.0, 0.0]), dtype=float),
-        )
-
-    def force(self, estimate: ShearEstimate) -> np.ndarray:
+    def load(self, estimate: ShearEstimate) -> np.ndarray:
         shear = np.asarray(estimate.shear_px, dtype=float)
         return (
             self.shear_to_force @ shear
@@ -85,10 +96,41 @@ class GelCalibration:
             + self.twist_to_force * float(estimate.twist_rad)
         )
 
-    def level(self, estimate: ShearEstimate) -> tuple[float, np.ndarray]:
-        force = self.force(estimate)
-        level = max(float(np.linalg.norm(force)) / self.limit_n, abs(float(estimate.twist_rad)) / self.twist_limit_rad)
-        return level, force
+    def direction(self, estimate: ShearEstimate) -> np.ndarray | None:
+        load = self.load(estimate)
+        size = float(np.linalg.norm(load))
+        return load / size if size > 0 and math.isfinite(size) else None
+
+
+def gel_guard_settings(gel: dict[str, Any]) -> tuple[GelLimits, GelDirections | None]:
+    """Limits and, when [gel] has a fr3-gel-calibrate fit, directions from the config section."""
+
+    limits = GelLimits(
+        shift_px=float(gel.get("shift_limit_px", 15.0)),
+        twist_rad=math.radians(float(gel.get("twist_limit_deg", 6.0))),
+        press=float(gel.get("press_limit_percent", 2.0)) / 100.0,
+    )
+    if "shear_to_force" not in gel:
+        return limits, None
+    directions = GelDirections(
+        shear_to_force=np.asarray(gel["shear_to_force"], dtype=float),
+        spread_to_force=np.asarray(gel.get("spread_to_force", [0.0, 0.0, 0.0]), dtype=float),
+        twist_to_force=np.asarray(gel.get("twist_to_force", [0.0, 0.0, 0.0]), dtype=float),
+    )
+    return limits, directions
+
+
+def describe_gel_guard(limits: GelLimits, directions: GelDirections | None) -> str:
+    text = (
+        f"GelSight guard on: level 1 is a marker shift of {limits.shift_px:.0f} px, a twist of "
+        f"{math.degrees(limits.twist_rad):.0f} deg or {100 * limits.press:.1f}% pressing."
+    )
+    if directions is None:
+        text += (
+            " No loading direction is calibrated, so guide mode holds the arm at the limit; "
+            "open the gripper (B) to unload the gel."
+        )
+    return text
 
 
 @dataclass(frozen=True)
@@ -100,9 +142,11 @@ class GelReading:
     valid: bool
     reason: str  # why it is invalid, or "" when valid
     level: float
-    force_ee: tuple[float, float, float]
     direction_ee: tuple[float, float, float] | None  # unit; arm motion along it loads the gel more
     zeroing: bool = False
+    shift_px: tuple[float, float] = (0.0, 0.0)  # the gel's deformation behind the level
+    twist_rad: float = 0.0
+    spread: float = 0.0
 
 
 def _median_motion(previous: np.ndarray | None, current: np.ndarray) -> float:
@@ -124,28 +168,31 @@ class GelMonitor:
 
     def __init__(
         self,
-        calibration: GelCalibration,
+        limits: GelLimits,
+        directions: GelDirections | None = None,
         tracker: MarkerShearTracker | None = None,
         settle_frames: int = 8,
         settle_px: float = 0.25,
-        min_direction_n: float = 0.5,
+        direction_level: float = 0.1,
     ) -> None:
         if tracker is None:
             from fr3_demo.tactile_shear import MarkerShearTracker
 
             tracker = MarkerShearTracker()
-        self.calibration = calibration
+        self.limits = limits
+        self.directions = directions
         self._tracker = tracker
         self.settle_frames = int(settle_frames)
         self.settle_px = float(settle_px)
-        self.min_direction_n = float(min_direction_n)
+        # Below this level the gel is barely loaded and its direction is noise.
+        self.direction_level = float(direction_level)
         self._lock = threading.Lock()
         self._seq = 0
         self._suspended: str | None = None
         self._zero_requested = True
         self._previous_markers: np.ndarray | None = None
         self._settled = 0
-        self._reading = GelReading(0, 0.0, False, "not zeroed yet", 0.0, (0.0, 0.0, 0.0), None, zeroing=True)
+        self._reading = GelReading(0, 0.0, False, "not zeroed yet", 0.0, None, zeroing=True)
 
     def suspend(self, reason: str) -> None:
         """Report invalid until rezero(), e.g. while the gripper moves and loads the gel."""
@@ -187,14 +234,14 @@ class GelMonitor:
         try:
             self._process(frame)
         except Exception as error:  # noqa: BLE001 - reported as an invalid reading, never raised into capture
-            self._publish(frame.captured_monotonic, False, f"gel processing failed: {error}", 0.0, None, None)
+            self._publish(frame.captured_monotonic, False, f"gel processing failed: {error}")
 
     def _process(self, frame: TactileFrame) -> None:
         with self._lock:
             suspended = self._suspended
             zeroing = self._zero_requested
         if suspended is not None:
-            self._publish(frame.captured_monotonic, False, suspended, 0.0, None, None)
+            self._publish(frame.captured_monotonic, False, suspended)
             return
         if zeroing:
             markers = self._tracker.detect(frame.image)
@@ -202,35 +249,34 @@ class GelMonitor:
             self._previous_markers = markers
             self._settled = self._settled + 1 if moved < self.settle_px else 0
             if self._settled < self.settle_frames:
-                self._publish(
-                    frame.captured_monotonic, False, "re-zeroing: waiting for the gel to settle", 0.0, None, None
-                )
+                self._publish(frame.captured_monotonic, False, "re-zeroing: waiting for the gel to settle")
                 return
             self._tracker.set_reference(frame.image)
             with self._lock:
                 self._zero_requested = False
-            self._publish(frame.captured_monotonic, True, "", 0.0, np.zeros(3), None)
+            self._publish(frame.captured_monotonic, True, "")
             return
         estimate = self._tracker.update(frame.image, frame.captured_monotonic, frame.frame_number)
         if not estimate.valid:
-            self._publish(frame.captured_monotonic, False, estimate.reason or "marker tracking failed", 0.0, None, None)
+            self._publish(frame.captured_monotonic, False, estimate.reason or "marker tracking failed")
             return
-        level, force = self.calibration.level(estimate)
-        magnitude = float(np.linalg.norm(force))
-        direction = force / magnitude if magnitude >= self.min_direction_n else None
-        if not np.isfinite(level):
-            self._publish(frame.captured_monotonic, False, "gel level is not finite", 0.0, None, None)
+        level = self.limits.level(estimate)
+        if not math.isfinite(level):
+            self._publish(frame.captured_monotonic, False, "gel level is not finite")
             return
-        self._publish(frame.captured_monotonic, True, "", level, force, direction)
+        direction = None
+        if self.directions is not None and level >= self.direction_level:
+            direction = self.directions.direction(estimate)
+        self._publish(frame.captured_monotonic, True, "", level, direction, estimate)
 
     def _publish(
         self,
         timestamp: float,
         valid: bool,
         reason: str,
-        level: float,
-        force: np.ndarray | None,
-        direction: np.ndarray | None,
+        level: float = 0.0,
+        direction: np.ndarray | None = None,
+        estimate: ShearEstimate | None = None,
     ) -> None:
         with self._lock:
             self._seq += 1
@@ -240,9 +286,11 @@ class GelMonitor:
                 valid=valid,
                 reason=reason,
                 level=float(level),
-                force_ee=tuple(float(value) for value in (force if force is not None else np.zeros(3))),
                 direction_ee=None if direction is None else tuple(float(value) for value in direction),
                 zeroing=self._zero_requested or self._suspended is not None,
+                shift_px=(0.0, 0.0) if estimate is None else tuple(float(value) for value in estimate.shear_px),
+                twist_rad=0.0 if estimate is None else float(estimate.twist_rad),
+                spread=0.0 if estimate is None else float(estimate.spread),
             )
 
     def latest(self, max_age: float = 0.2) -> GelReading:
@@ -284,8 +332,10 @@ class GelStreamGuard:
         if not reading.valid:
             return f"the GelSight signal is not trustworthy ({reading.reason})"
         if reading.level >= self.stop_level:
-            load = float(np.linalg.norm(reading.force_ee))
-            return f"the gel load reached level {reading.level:.2f} ({load:.1f} N estimated)"
+            return (
+                f"the gel reached level {reading.level:.2f} (shift {np.hypot(*reading.shift_px):.1f} px, "
+                f"twist {math.degrees(reading.twist_rad):.1f} deg, pressed {100 * reading.spread:.1f}%)"
+            )
         return None
 
 
@@ -318,6 +368,9 @@ def limit_twist(twist: np.ndarray, reading: GelReading, rotation: np.ndarray, sl
 AXES = ("x", "y", "z")
 # Ridge weight on standardised features in the calibration fit.
 RIDGE = 1e-3
+# A push axis that, pushed as hard as in the run, deformed the gel less than
+# this share of its limit is carried by something else (a hard opposite finger).
+AROUND_THE_GEL_LEVEL = 0.2
 
 
 def fit_calibration(
@@ -396,9 +449,34 @@ def align_calibration(run: dict[str, np.ndarray], max_lag_s: float = 0.2) -> tup
     return best
 
 
-def report_calibration(run: dict[str, np.ndarray]) -> tuple[bool, list[str]]:
-    """Print how a recorded run fits and why it does not, if it does not; return (usable, lines to paste)."""
+def axis_sensitivity(run: dict[str, np.ndarray], limits: GelLimits, lag: float = 0.0) -> np.ndarray:
+    """How much one newton along each EE axis moves the gel, in level units (deformation over limits)."""
 
+    valid = np.asarray(run["valid"], dtype=bool)
+    frame_time = np.asarray(run["frame_time"], dtype=float)[valid] + lag
+    force_time = np.asarray(run["force_time"], dtype=float)
+    force = np.stack([np.interp(frame_time, force_time, run["force_ee"][:, axis]) for axis in range(3)], axis=1)
+    deformation = np.column_stack(
+        (
+            np.asarray(run["shear_px"], dtype=float)[valid] / limits.shift_px,
+            np.asarray(run["twist_rad"], dtype=float)[valid] / limits.twist_rad,
+            np.asarray(run["spread"], dtype=float)[valid] / limits.press,
+        )
+    )
+    response, *_ = np.linalg.lstsq(np.column_stack((force, np.ones(len(force)))), deformation, rcond=None)
+    return np.linalg.norm(response[:3], axis=1)
+
+
+def report_calibration(run: dict[str, np.ndarray], limits: GelLimits | None = None) -> tuple[bool, list[str]]:
+    """Print how a recorded run fits and why it does not, if it does not; return (usable, lines to paste).
+
+    Each end-effector axis that was pushed is either seen by the gel, and then
+    must fit, or barely moves the gel at all: then its force goes around the
+    gel (through a hard opposite finger, say), which the gel can neither
+    measure nor be torn by, and it is reported, not refused.
+    """
+
+    limits = limits or GelLimits()
     valid = np.asarray(run["valid"], dtype=bool)
     reasons = [str(reason) for reason, ok in zip(run["reason"], valid) if not ok]
     lost = [reason for reason in reasons if reason.startswith("lost track")]
@@ -409,38 +487,60 @@ def report_calibration(run: dict[str, np.ndarray]) -> tuple[bool, list[str]]:
     else:
         print()
     lag, fit = align_calibration(run)
+    # How far pushing each axis as hard as it was pushed deformed the gel, in level units.
+    produced = axis_sensitivity(run, limits, lag) * fit["axis_range_n"]
+    shift = np.hypot(*np.asarray(run["shear_px"], dtype=float)[valid].T)
     twist = np.abs(np.asarray(run["twist_rad"], dtype=float)[valid])
+    press = np.asarray(run["spread"], dtype=float)[valid]
     print(
-        f"Fit: R^2 {fit['r_squared']:.2f}, error {fit['rms_error_n']:.2f} N rms, pushes up to "
-        f"{fit['peak_force_n']:.1f} N; gel lags Franka by {-lag * 1e3:.0f} ms; twist up to "
-        f"{np.degrees(twist.max()):.1f} deg; offset {np.linalg.norm(fit['offset_n']):.2f} N."
+        f"Fit: R^2 {fit['r_squared']:.2f}, pushes up to {fit['peak_force_n']:.1f} N; gel lags Franka by "
+        f"{-lag * 1e3:.0f} ms; offset {np.linalg.norm(fit['offset_n']):.2f} N."
     )
-    for axis, (name, r2, span) in enumerate(zip(AXES, fit["axis_r_squared"], fit["axis_range_n"])):
-        pushed = "pushed" if span >= 3.0 else "barely pushed"
-        print(f"  EE {name}: force range {span:4.1f} N ({pushed}), fit R^2 {r2:.2f}")
+    print(
+        f"At those pushes the gel shifted up to {shift.max():.1f} px, twisted up to {np.degrees(twist.max()):.1f} deg "
+        f"and pressed up to {100 * max(0.0, press.max()):.1f}% (limits: {limits.shift_px:.0f} px, "
+        f"{np.degrees(limits.twist_rad):.0f} deg, {100 * limits.press:.1f}%)."
+    )
+    unseen, inconsistent, unpushed = [], [], []
+    for axis, name in enumerate(AXES):
+        span, r2, moved = fit["axis_range_n"][axis], fit["axis_r_squared"][axis], produced[axis]
+        if span < 3.0:
+            verdict = "barely pushed"
+            unpushed.append(name)
+        elif moved < AROUND_THE_GEL_LEVEL:
+            verdict = "goes around the gel"
+            unseen.append(name)
+        elif r2 < 0.6:
+            verdict = "seen, but inconsistently"
+            inconsistent.append(name)
+        else:
+            verdict = "seen by the gel"
+        print(
+            f"  EE {name}: force range {span:4.1f} N, moved the gel {moved:4.0%} of its limit, fit R^2 {r2:.2f}: "
+            f"{verdict}"
+        )
+    if unseen:
+        print(
+            f"  Force along EE {', '.join(unseen)} hardly moves the gel: it goes through the other finger. The gel "
+            "is not strained by it, so the guard does not need it, but it cannot measure it either."
+        )
     problems = []
     if valid.mean() < 0.5:
         problems.append(
             "the markers were lost for much of the run"
-            + (
-                " (tracking was lost: push more slowly, and if the tool pivoted or slipped in the grip, re-grasp it)"
-                if lost
-                else ""
-            )
+            + (" (push more slowly, and if the tool pivoted or slipped in the grip, re-grasp it)" if lost else "")
         )
     if fit["peak_force_n"] < 3.0:
         problems.append("push harder (at least 3 N)")
-    if int(np.sum(fit["axis_range_n"] >= 3.0)) < 2:
-        problems.append("push in at least two directions, a few newtons each")
-    if fit["r_squared"] < 0.75:
-        weak = [
-            AXES[axis] for axis in range(3) if fit["axis_range_n"][axis] >= 3.0 and fit["axis_r_squared"][axis] < 0.6
-        ]
-        detail = f" (EE {', '.join(weak)} pushes do not show on the gel consistently)" if weak else ""
+    if unpushed:
+        problems.append(f"push along EE {', '.join(unpushed)} too, a few newtons each")
+    if inconsistent:
         problems.append(
-            f"the gel does not follow the force{detail}: push slowly, hold each push, touch only the tool; "
-            "if the tool pivots in the grip under sideways pushes, push closer to the grip"
+            f"EE {', '.join(inconsistent)} pushes move the gel inconsistently: push slowly, hold each push, "
+            "touch only the tool, and if it pivots in the grip, push closer to the grip"
         )
+    if not any(name not in unseen + unpushed + inconsistent for name in AXES):
+        problems.append("no direction moved the gel consistently")
     if problems:
         print("Not good enough to use: " + "; ".join(problems) + ".")
         return False, []
@@ -481,7 +581,7 @@ def calibrate_main(argv: list[str] | None = None) -> int:
     if args.analyze is not None:
         with np.load(args.analyze) as saved:
             run = {key: saved[key] for key in saved.files}
-        usable, lines = report_calibration(run)
+        usable, lines = report_calibration(run, gel_guard_settings(load_config(args.config).get("gel", {}))[0])
     else:
         config = load_config(args.config)
         run = _record_calibration(args, config, queue)
@@ -490,11 +590,11 @@ def calibrate_main(argv: list[str] | None = None) -> int:
         saved_path = folder / f"gel_calibration_{time.strftime('%Y%m%d_%H%M%S')}.npz"
         np.savez_compressed(saved_path, **run)
         print(f"Saved this run to {saved_path} (re-fit it with: fr3-gel-calibrate --analyze {saved_path})")
-        usable, lines = report_calibration(run)
+        usable, lines = report_calibration(run, gel_guard_settings(config.get("gel", {}))[0])
     if not usable:
         print("Run it again.")
         return 1
-    print("\nCopy into [gel] in config.toml (keep your limit_n):")
+    print("\nCopy into [gel] in config.toml, for the direction guide mode blocks at the limit:")
     for line in lines:
         print(line)
     return 0
