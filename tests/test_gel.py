@@ -321,3 +321,71 @@ class GelMonitorWithTrackerTest(unittest.TestCase):
         self.assertTrue(reading.valid, reading.reason)
         self.assertAlmostEqual(reading.level, 0.8, delta=0.05)
         np.testing.assert_allclose(reading.direction_ee, [1.0, 0.0, 0.0], atol=0.05)
+
+
+def _synthetic_run(seed: int = 0, lag_s: float = 0.06, directions: int = 3, tracked: float = 1.0) -> dict:
+    """A calibration run: pushes held a second or two, a gel lagging Franka by lag_s."""
+
+    rng = np.random.default_rng(seed)
+    force_time = np.arange(0.0, 40.0, 0.005)
+    force = np.zeros((len(force_time), 3))
+    for start in np.arange(1.0, 38.0, 2.5):
+        axis = rng.integers(0, directions)
+        amplitude = rng.uniform(3.0, 9.0) * rng.choice([-1.0, 1.0])
+        ramp = np.clip((force_time - start) / 0.4, 0.0, 1.0) * np.clip((start + 1.8 - force_time) / 0.4, 0.0, 1.0)
+        force[:, axis] += amplitude * ramp
+    frame_time = np.arange(0.0, 40.0, 1.0 / 18.0)
+    seen = np.stack([np.interp(frame_time - lag_s, force_time, force[:, axis]) for axis in range(3)], axis=1)
+    # Image x follows EE x, image y follows EE -z; sideways (EE x) pushes also twist the gel.
+    shear = np.stack((2.0 * seen[:, 0], -1.6 * seen[:, 2]), axis=1) + rng.normal(0.0, 0.05, (len(frame_time), 2))
+    twist = 0.01 * seen[:, 0] + rng.normal(0.0, 0.0005, len(frame_time))
+    spread = 0.004 * seen[:, 1] + rng.normal(0.0, 0.0002, len(frame_time))
+    valid = rng.uniform(size=len(frame_time)) < tracked
+    return {
+        "frame_time": frame_time,
+        "valid": valid,
+        "reason": np.where(valid, "", "lost track (markers moved 9.0 px in one frame); unload the gel or re-zero"),
+        "shear_px": shear,
+        "twist_rad": twist,
+        "spread": spread,
+        "force_time": force_time,
+        "force_ee": force + rng.normal(0.0, 0.2, force.shape),
+        "tare_n": np.zeros(3),
+    }
+
+
+class CalibrationRunTest(unittest.TestCase):
+    def test_the_fit_uses_twist_and_reports_each_axis(self) -> None:
+        run = _synthetic_run()
+        from fr3_demo.gel import align_calibration
+
+        lag, fit = align_calibration(run)
+        self.assertAlmostEqual(lag, -0.06, delta=0.011)  # the gel lags Franka by 60 ms
+        self.assertGreater(fit["r_squared"], 0.95)
+        self.assertTrue(np.all(fit["axis_r_squared"] > 0.9))
+        # A sideways push shows as both shift and twist; the fit may use either, but must predict it.
+        calibration = GelCalibration(fit["shear_to_force"], fit["spread_to_force"], 10.0, 0.1, fit["twist_to_force"])
+        estimate = _estimate(shear=(10.0, 0.0), twist=0.05)  # 5 N along EE x
+        np.testing.assert_allclose(calibration.force(estimate), [5.0, 0.0, 0.0], atol=0.3)
+
+    def test_report_accepts_a_good_run_and_explains_a_bad_one(self) -> None:
+        from fr3_demo.gel import report_calibration
+
+        usable, lines = report_calibration(_synthetic_run())
+        self.assertTrue(usable)
+        self.assertEqual(
+            [line.split(" = ")[0] for line in lines], ["shear_to_force", "spread_to_force", "twist_to_force"]
+        )
+        usable, lines = report_calibration(_synthetic_run(directions=1))
+        self.assertFalse(usable)
+        self.assertEqual(lines, [])
+        usable, _ = report_calibration(_synthetic_run(tracked=0.3))
+        self.assertFalse(usable)
+
+    def test_the_twist_term_is_optional_in_the_config(self) -> None:
+        old = GelCalibration.from_config({"shear_to_force": [[0.5, 0.0], [0.0, 0.0], [0.0, -0.5]]})
+        np.testing.assert_allclose(old.twist_to_force, np.zeros(3))
+        new = GelCalibration.from_config(
+            {"shear_to_force": [[0.5, 0.0], [0.0, 0.0], [0.0, -0.5]], "twist_to_force": [100.0, 0.0, 0.0]}
+        )
+        np.testing.assert_allclose(new.force(_estimate(twist=0.02)), [2.0, 0.0, 0.0])

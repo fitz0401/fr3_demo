@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -37,22 +37,30 @@ class GelCalibration:
     spread_to_force: np.ndarray  # (3,): per unit of spread (pressing into the gel)
     limit_n: float  # estimated load at level 1
     twist_limit_rad: float  # twist of the marker field at level 1
+    # (3,): per rad of twist. A sideways push at a tool tip far from the grip
+    # turns the gel more than it shifts it.
+    twist_to_force: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
     def __post_init__(self) -> None:
         shear = np.asarray(self.shear_to_force, dtype=float)
         spread = np.asarray(self.spread_to_force, dtype=float)
+        twist = np.asarray(self.twist_to_force, dtype=float)
         if (
             shear.shape != (3, 2)
             or spread.shape != (3,)
-            or not (np.all(np.isfinite(shear)) and np.all(np.isfinite(spread)))
+            or twist.shape != (3,)
+            or not (np.all(np.isfinite(shear)) and np.all(np.isfinite(spread)) and np.all(np.isfinite(twist)))
         ):
-            raise ValueError("gel calibration needs a finite 3x2 shear_to_force and a 3-vector spread_to_force")
+            raise ValueError(
+                "gel calibration needs a finite 3x2 shear_to_force and 3-vectors spread_to_force and twist_to_force"
+            )
         if not np.any(shear):
             raise ValueError("gel calibration maps every shift to zero force")
         if not (self.limit_n > 0 and self.twist_limit_rad > 0):
             raise ValueError("gel limit_n and twist_limit_rad must be positive")
         object.__setattr__(self, "shear_to_force", shear)
         object.__setattr__(self, "spread_to_force", spread)
+        object.__setattr__(self, "twist_to_force", twist)
 
     @classmethod
     def from_config(cls, gel: dict[str, Any]) -> GelCalibration:
@@ -66,11 +74,16 @@ class GelCalibration:
             spread_to_force=np.asarray(gel.get("spread_to_force", [0.0, 0.0, 0.0]), dtype=float),
             limit_n=float(gel.get("limit_n", 10.0)),
             twist_limit_rad=float(gel.get("twist_limit_rad", 0.1)),
+            twist_to_force=np.asarray(gel.get("twist_to_force", [0.0, 0.0, 0.0]), dtype=float),
         )
 
     def force(self, estimate: ShearEstimate) -> np.ndarray:
         shear = np.asarray(estimate.shear_px, dtype=float)
-        return self.shear_to_force @ shear + self.spread_to_force * float(estimate.spread)
+        return (
+            self.shear_to_force @ shear
+            + self.spread_to_force * float(estimate.spread)
+            + self.twist_to_force * float(estimate.twist_rad)
+        )
 
     def level(self, estimate: ShearEstimate) -> tuple[float, np.ndarray]:
         force = self.force(estimate)
@@ -302,37 +315,145 @@ def limit_twist(twist: np.ndarray, reading: GelReading, rotation: np.ndarray, sl
     return command
 
 
-def fit_calibration(shear_px: np.ndarray, spread: np.ndarray, force_ee: np.ndarray) -> dict[str, Any]:
-    """Least-squares map from marker shift (px) and spread to the force through the gel.
+AXES = ("x", "y", "z")
+# Ridge weight on standardised features in the calibration fit.
+RIDGE = 1e-3
+
+
+def fit_calibration(
+    shear_px: np.ndarray, spread: np.ndarray, force_ee: np.ndarray, twist: np.ndarray | None = None
+) -> dict[str, Any]:
+    """Least-squares map from marker shift (px), spread and twist to the force through the gel.
 
     ``force_ee`` is Franka's external force estimate (robot on environment)
     in the end-effector frame, tared, while only the tool is touched, so it
-    is exactly the force through the gel. Returns the matrices and how well
-    they fit.
+    is the force through the gel. A constant offset is fitted too, so drift
+    in the estimate or a load left at zeroing does not spoil the fit; it is
+    reported, not kept. Returns the maps and how well they fit, overall and
+    per end-effector axis.
     """
 
     shear = np.asarray(shear_px, dtype=float).reshape(-1, 2)
     press = np.asarray(spread, dtype=float).reshape(-1, 1)
+    turn = np.zeros((len(shear), 1)) if twist is None else np.asarray(twist, dtype=float).reshape(-1, 1)
     force = np.asarray(force_ee, dtype=float).reshape(-1, 3)
-    if not (len(shear) == len(press) == len(force)) or len(force) < 20:
+    if not (len(shear) == len(press) == len(turn) == len(force)) or len(force) < 20:
         raise ValueError("calibration needs at least 20 matched samples")
-    features = np.hstack((shear, press))
-    solution, *_ = np.linalg.lstsq(features, force, rcond=None)
-    predicted = features @ solution
-    residual = force - predicted
-    total = float(np.sum((force - force.mean(axis=0)) ** 2))
-    r_squared = 1.0 - float(np.sum(residual**2)) / total if total > 0 else 0.0
-    singular = np.linalg.svd(force - force.mean(axis=0), compute_uv=False)
+    features = np.hstack((shear, press, turn, np.ones((len(force), 1))))
+    # A light ridge on the scaled features: a sideways push shows as both
+    # shift and twist, and without it the fit splits that between them
+    # arbitrarily, leaking force into the other axes. The offset is free.
+    scale = np.std(features[:, :4], axis=0)
+    penalty = np.zeros((4, 5))
+    penalty[:, :4] = np.diag(np.sqrt(RIDGE * len(force)) * np.where(scale > 0, scale, 1.0))
+    solution, *_ = np.linalg.lstsq(np.vstack((features, penalty)), np.vstack((force, np.zeros((4, 3)))), rcond=None)
+    residual = force - features @ solution
+    centred = force - force.mean(axis=0)
+    total = float(np.sum(centred**2))
+    axis_total = np.sum(centred**2, axis=0)
+    axis_error = np.sum(residual**2, axis=0)
+    singular = np.linalg.svd(centred, compute_uv=False)
     return {
         "shear_to_force": solution[:2].T,  # (3, 2)
         "spread_to_force": solution[2],  # (3,)
-        "r_squared": r_squared,
+        "twist_to_force": solution[3],  # (3,)
+        "offset_n": solution[4],  # (3,), reported only
+        "r_squared": 1.0 - float(np.sum(axis_error)) / total if total > 0 else 0.0,
+        "axis_r_squared": np.where(axis_total > 0, 1.0 - axis_error / np.maximum(axis_total, 1e-12), 0.0),
+        "axis_range_n": np.percentile(force, 98, axis=0) - np.percentile(force, 2, axis=0),
         "rms_error_n": float(np.sqrt(np.mean(np.sum(residual**2, axis=1)))),
         "peak_force_n": float(np.max(np.linalg.norm(force, axis=1))),
         # Spread of the pushes: the second singular value says whether more
-        # than one direction was pushed, which the in-plane fit needs.
+        # than one direction was pushed.
         "push_directions": singular / np.sqrt(len(force)),
     }
+
+
+def align_calibration(run: dict[str, np.ndarray], max_lag_s: float = 0.2) -> tuple[float, dict[str, Any]]:
+    """Fit a recorded run at the gel-to-Franka delay that fits best; return the delay and the fit."""
+
+    valid = np.asarray(run["valid"], dtype=bool)
+    frame_time = np.asarray(run["frame_time"], dtype=float)[valid]
+    force_time = np.asarray(run["force_time"], dtype=float)
+    force = np.asarray(run["force_ee"], dtype=float)
+    best: tuple[float, dict[str, Any]] | None = None
+    for lag in np.arange(-max_lag_s, max_lag_s + 1e-9, 0.01):
+        sampled = frame_time + lag
+        inside = (sampled >= force_time[0]) & (sampled <= force_time[-1])
+        if inside.sum() < 20:
+            continue
+        matched = np.stack([np.interp(sampled[inside], force_time, force[:, axis]) for axis in range(3)], axis=1)
+        fit = fit_calibration(
+            np.asarray(run["shear_px"])[valid][inside],
+            np.asarray(run["spread"])[valid][inside],
+            matched,
+            np.asarray(run["twist_rad"])[valid][inside],
+        )
+        if best is None or fit["r_squared"] > best[1]["r_squared"]:
+            best = (float(lag), fit)
+    if best is None:
+        raise ValueError("calibration needs at least 20 tracked frames inside the force recording")
+    return best
+
+
+def report_calibration(run: dict[str, np.ndarray]) -> tuple[bool, list[str]]:
+    """Print how a recorded run fits and why it does not, if it does not; return (usable, lines to paste)."""
+
+    valid = np.asarray(run["valid"], dtype=bool)
+    reasons = [str(reason) for reason, ok in zip(run["reason"], valid) if not ok]
+    lost = [reason for reason in reasons if reason.startswith("lost track")]
+    print(f"\n{len(valid)} gel frames, {valid.mean():.0%} tracked.", end=" ")
+    if reasons:
+        common = max(set(reasons), key=reasons.count)
+        print(f"Most common reason when not: {common!r}.")
+    else:
+        print()
+    lag, fit = align_calibration(run)
+    twist = np.abs(np.asarray(run["twist_rad"], dtype=float)[valid])
+    print(
+        f"Fit: R^2 {fit['r_squared']:.2f}, error {fit['rms_error_n']:.2f} N rms, pushes up to "
+        f"{fit['peak_force_n']:.1f} N; gel lags Franka by {-lag * 1e3:.0f} ms; twist up to "
+        f"{np.degrees(twist.max()):.1f} deg; offset {np.linalg.norm(fit['offset_n']):.2f} N."
+    )
+    for axis, (name, r2, span) in enumerate(zip(AXES, fit["axis_r_squared"], fit["axis_range_n"])):
+        pushed = "pushed" if span >= 3.0 else "barely pushed"
+        print(f"  EE {name}: force range {span:4.1f} N ({pushed}), fit R^2 {r2:.2f}")
+    problems = []
+    if valid.mean() < 0.5:
+        problems.append(
+            "the markers were lost for much of the run"
+            + (
+                " (tracking was lost: push more slowly, and if the tool pivoted or slipped in the grip, re-grasp it)"
+                if lost
+                else ""
+            )
+        )
+    if fit["peak_force_n"] < 3.0:
+        problems.append("push harder (at least 3 N)")
+    if int(np.sum(fit["axis_range_n"] >= 3.0)) < 2:
+        problems.append("push in at least two directions, a few newtons each")
+    if fit["r_squared"] < 0.75:
+        weak = [
+            AXES[axis] for axis in range(3) if fit["axis_range_n"][axis] >= 3.0 and fit["axis_r_squared"][axis] < 0.6
+        ]
+        detail = f" (EE {', '.join(weak)} pushes do not show on the gel consistently)" if weak else ""
+        problems.append(
+            f"the gel does not follow the force{detail}: push slowly, hold each push, touch only the tool; "
+            "if the tool pivots in the grip under sideways pushes, push closer to the grip"
+        )
+    if problems:
+        print("Not good enough to use: " + "; ".join(problems) + ".")
+        return False, []
+
+    def row(values: np.ndarray) -> str:
+        return "[" + ", ".join(f"{value:.5f}" for value in values) + "]"
+
+    lines = [
+        "shear_to_force = [" + ", ".join(row(values) for values in fit["shear_to_force"]) + "]",
+        "spread_to_force = " + row(fit["spread_to_force"]),
+        "twist_to_force = " + row(fit["twist_to_force"]),
+    ]
+    return True, lines
 
 
 def calibrate_main(argv: list[str] | None = None) -> int:
@@ -340,7 +461,8 @@ def calibrate_main(argv: list[str] | None = None) -> int:
 
     The arm must stand still in Execution mode with no control loop running,
     and only the tool may be touched: then Franka's external force estimate is
-    exactly the force through the gel.
+    exactly the force through the gel. Every run is saved, and --analyze
+    re-fits a saved run without recording again.
     """
 
     import argparse
@@ -348,26 +470,60 @@ def calibrate_main(argv: list[str] | None = None) -> int:
     from pathlib import Path
 
     from fr3_demo.settings import default_config_path, load_config
-    from fr3_demo.tactile import GelSightCamera
-    from fr3_demo.tactile_shear import MarkerShearTracker
 
     parser = argparse.ArgumentParser(description=calibrate_main.__doc__)
     parser.add_argument("--config", type=Path, default=default_config_path())
-    parser.add_argument("--seconds", type=float, default=30.0, help="how long to record pushes")
+    parser.add_argument("--seconds", type=float, default=40.0, help="how long to record pushes")
     parser.add_argument("--server-ip")
     parser.add_argument("--control-port", type=int)
+    parser.add_argument("--analyze", type=Path, help="re-fit a saved run instead of recording one")
     args = parser.parse_args(argv)
-    config = load_config(args.config)
+    if args.analyze is not None:
+        with np.load(args.analyze) as saved:
+            run = {key: saved[key] for key in saved.files}
+        usable, lines = report_calibration(run)
+    else:
+        config = load_config(args.config)
+        run = _record_calibration(args, config, queue)
+        folder = args.config.resolve().parent / "data" / "gel_calibration"
+        folder.mkdir(parents=True, exist_ok=True)
+        saved_path = folder / f"gel_calibration_{time.strftime('%Y%m%d_%H%M%S')}.npz"
+        np.savez_compressed(saved_path, **run)
+        print(f"Saved this run to {saved_path} (re-fit it with: fr3-gel-calibrate --analyze {saved_path})")
+        usable, lines = report_calibration(run)
+    if not usable:
+        print("Run it again.")
+        return 1
+    print("\nCopy into [gel] in config.toml (keep your limit_n):")
+    for line in lines:
+        print(line)
+    return 0
+
+
+def _record_calibration(args: Any, config: dict[str, Any], queue: Any) -> dict[str, np.ndarray]:
+    from fr3_demo.tactile import GelSightCamera
+    from fr3_demo.tactile_shear import MarkerShearTracker
+
     robot_config = config.get("robot", {})
     tactile_config = config.get("tactile", {})
     from bamboo import BambooFrankaClient
 
-    client = BambooFrankaClient(
-        server_ip=args.server_ip or robot_config.get("server_ip", "172.16.0.20"),
-        control_port=args.control_port or int(robot_config.get("control_port", 5555)),
-        enable_gripper=False,
-    )
+    def connect() -> Any:
+        return BambooFrankaClient(
+            server_ip=args.server_ip or robot_config.get("server_ip", "172.16.0.20"),
+            control_port=args.control_port or int(robot_config.get("control_port", 5555)),
+            enable_gripper=False,
+        )
+
+    def force_ee(sample: dict[str, Any]) -> np.ndarray:
+        rotation = np.asarray(sample["ee_pose"], dtype=float)[:3, :3]
+        return rotation.T @ np.asarray(sample["ext_wrench"][:3], dtype=float)
+
+    client = connect()
     camera = None
+    sampling = threading.Event()
+    force_samples: list[tuple[float, np.ndarray]] = []
+    sampler: threading.Thread | None = None
     try:
         state = client.get_joint_states()
         if "ext_wrench" not in state:
@@ -385,11 +541,6 @@ def calibrate_main(argv: list[str] | None = None) -> int:
         camera.start()
         tracker = MarkerShearTracker()
 
-        def force_ee() -> np.ndarray:
-            sample = client.get_joint_states()
-            rotation = np.asarray(sample["ee_pose"], dtype=float)[:3, :3]
-            return rotation.T @ np.asarray(sample["ext_wrench"][:3], dtype=float)
-
         print("Zeroing: grip the tool as you will use it, and touch nothing for a moment...")
         previous, settled = None, 0
         while settled < 10:
@@ -398,53 +549,73 @@ def calibrate_main(argv: list[str] | None = None) -> int:
             settled = settled + 1 if _median_motion(previous, markers) < 0.25 else 0
             previous = markers
         count = tracker.set_reference(image)
-        tare = np.mean([force_ee() for _ in range(50)], axis=0)
+        tare = np.mean([force_ee(client.get_joint_states()) for _ in range(50)], axis=0)
         print(f"Zeroed on {count} markers; Franka's force at rest {np.linalg.norm(tare):.2f} N (tared).")
+
+        def sample_forces() -> None:
+            # Franka's estimate at ~200 Hz on its own connection, so each gel
+            # frame can be matched to the force at its own time.
+            own = connect()
+            try:
+                while sampling.is_set():
+                    before = time.monotonic()
+                    sample = own.get_joint_states()
+                    force_samples.append((0.5 * (before + time.monotonic()), force_ee(sample) - tare))
+                    time.sleep(0.004)
+            finally:
+                own.close()
+
+        sampling.set()
+        sampler = threading.Thread(target=sample_forces, name="gel-calibration-force", daemon=True)
+        sampler.start()
         print(
-            f"\nFor the next {args.seconds:.0f} s, press the tool tip with a finger, about 3 to 10 N, slowly, "
-            "in several directions: along the tool toward the gripper, and sideways both ways. Hold each push "
-            "for a second or two. Touch only the tool, never the gripper or the arm.\n"
+            f"\nFor the next {args.seconds:.0f} s, press the tool where it will meet the fruit, about 3 to 10 N, "
+            "slowly, in several directions: along the tool toward the gripper, sideways both ways, and into and "
+            "away from its face. Hold each push for a second or two, then let go fully. Touch only the tool, "
+            "never the gripper or the arm.\n"
         )
-        shear, spread, forces = [], [], []
+        rows: list[tuple] = []
         deadline = time.monotonic() + args.seconds
         while time.monotonic() < deadline:
             frame = frames.get(timeout=2.0)
             estimate = tracker.update(frame.image, frame.captured_monotonic, frame.frame_number)
-            force = force_ee() - tare
-            if estimate.valid:
-                shear.append(estimate.shear_px)
-                spread.append(estimate.spread)
-                forces.append(force)
+            rows.append(
+                (
+                    frame.captured_monotonic,
+                    estimate.valid,
+                    estimate.reason,
+                    estimate.shear_px,
+                    estimate.twist_rad,
+                    estimate.spread,
+                )
+            )
+            force = force_samples[-1][1] if force_samples else np.zeros(3)
+            shift = np.hypot(*estimate.shear_px) if estimate.valid else float("nan")
+            twist = np.degrees(estimate.twist_rad) if estimate.valid else float("nan")
             print(
-                f"\r  force {np.linalg.norm(force):5.1f} N | marker shift {np.hypot(*estimate.shear_px):5.1f} px | "
-                f"{'tracking' if estimate.valid else estimate.reason:30.30s} | {len(forces)} samples",
+                f"\r  force {np.linalg.norm(force):5.1f} N | marker shift {shift:5.1f} px | twist {twist:5.1f} deg | "
+                f"{'tracking' if estimate.valid else estimate.reason:28.28s}",
                 end="",
                 flush=True,
             )
         print()
-        result = fit_calibration(np.asarray(shear), np.asarray(spread), np.asarray(forces))
     finally:
+        sampling.clear()
+        if sampler is not None:
+            sampler.join(timeout=2.0)
         if camera is not None:
             camera.close()
         client.close()
-
-    directions = result["push_directions"]
-    print(
-        f"\nFit: R^2 {result['r_squared']:.2f}, error {result['rms_error_n']:.2f} N rms, "
-        f"pushes up to {result['peak_force_n']:.1f} N, spread of directions {np.round(directions, 1)} N."
-    )
-    problems = []
-    if result["peak_force_n"] < 3.0:
-        problems.append("push harder (at least 3 N)")
-    if directions[1] < 1.0:
-        problems.append("push in more than one direction")
-    if result["r_squared"] < 0.8:
-        problems.append("the fit is poor: push slowly, hold each push, and touch only the tool")
-    if problems:
-        print("Not good enough to use: " + "; ".join(problems) + ". Run it again.")
-        return 1
-    print("\nCopy into [gel] in config.toml (keep your limit_n):")
-    matrix = ", ".join("[" + ", ".join(f"{value:.5f}" for value in row) + "]" for row in result["shear_to_force"])
-    print(f"shear_to_force = [{matrix}]")
-    print("spread_to_force = [" + ", ".join(f"{value:.3f}" for value in result["spread_to_force"]) + "]")
-    return 0
+    if not force_samples:
+        raise RuntimeError("Franka's force estimate was never read")
+    return {
+        "frame_time": np.array([row[0] for row in rows], dtype=float),
+        "valid": np.array([row[1] for row in rows], dtype=bool),
+        "reason": np.array([row[2] for row in rows], dtype=str),
+        "shear_px": np.array([row[3] for row in rows], dtype=float).reshape(-1, 2),
+        "twist_rad": np.array([row[4] for row in rows], dtype=float),
+        "spread": np.array([row[5] for row in rows], dtype=float),
+        "force_time": np.array([sample[0] for sample in force_samples], dtype=float),
+        "force_ee": np.array([sample[1] for sample in force_samples], dtype=float).reshape(-1, 3),
+        "tare_n": tare,
+    }

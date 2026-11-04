@@ -69,7 +69,7 @@ _SCHEMA: dict[str, set[str]] = {
         "heartbeat_hz",
     },
     "payload": {"mass_kg", "center_of_mass_m"},
-    "gel": {"enabled", "limit_n", "twist_limit_rad", "shear_to_force", "spread_to_force"},
+    "gel": {"enabled", "limit_n", "twist_limit_rad", "shear_to_force", "spread_to_force", "twist_to_force"},
     "contact": {
         "enabled",
         "shadow",
