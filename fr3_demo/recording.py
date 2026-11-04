@@ -130,6 +130,9 @@ def _percentiles(values: list[float]) -> dict[str, float | int]:
     }
 
 
+# Longest wait at an episode's start for a tactile frame recent enough to seed it.
+TACTILE_SEED_WAIT_S = 0.5
+
 @dataclass(frozen=True)
 class RobotSample:
     qpos: np.ndarray
@@ -950,15 +953,33 @@ class DemoCollector:
                 # buffer. The first grid row is emitted one alignment delay
                 # after this, which is only ~1.5 tactile periods, so without a
                 # seed row 0 can race the first capture and abort the episode.
-                seed = self.tactile.latest(max_age=self.tactile_max_age)
+                seed = self._fresh_tactile_frame()
                 if seed is None:
                     self._writer.abort("tactile sensor has no recent frame")
                     self._writer = None
-                    raise RuntimeError("Tactile buffer is not ready")
+                    raise RuntimeError(
+                        f"Tactile buffer is not ready: the sensor delivered no frame within {TACTILE_SEED_WAIT_S:.1f} s"
+                    )
                 self._writer.add_tactile_frame(seed)
                 with self._tactile_lock:
                     self._tactile_target = self._writer
             return self._writer.path
+
+    def _fresh_tactile_frame(self) -> Any | None:
+        """The sensor's newest frame once it is within tactile_max_age, or None after a short wait.
+
+        The GelSight runs at ~18 Hz and stamps each frame mid-capture, so its
+        newest frame is often a little past tactile_max_age at a random moment
+        (39% of the time at 60 ms, measured): wait for the next one, which is
+        at most a frame period away, rather than refuse the episode.
+        """
+
+        deadline = time.monotonic() + TACTILE_SEED_WAIT_S
+        while True:
+            frame = self.tactile.latest(max_age=self.tactile_max_age)
+            if frame is not None or time.monotonic() >= deadline:
+                return frame
+            time.sleep(0.005)
 
     def _tactile_settings(self) -> dict[str, Any] | None:
         if self.tactile is None:

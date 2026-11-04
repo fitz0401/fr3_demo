@@ -2,6 +2,7 @@
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -323,3 +324,37 @@ class TactileConversionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TactileSeedTest(unittest.TestCase):
+    """An episode starts on the sensor's next frame instead of failing between frames."""
+
+    class _Sensor:
+        def __init__(self, misses: int) -> None:
+            self.misses = misses
+            self.calls = 0
+
+        def latest(self, max_age: float):
+            self.calls += 1
+            return None if self.calls <= self.misses else "frame"
+
+    def _collector(self, sensor):
+        from fr3_demo.recording import DemoCollector
+
+        collector = object.__new__(DemoCollector)
+        collector.tactile = sensor
+        collector.tactile_max_age = 0.06
+        return collector
+
+    def test_waits_for_the_next_frame(self) -> None:
+        sensor = self._Sensor(misses=5)
+        self.assertEqual(self._collector(sensor)._fresh_tactile_frame(), "frame")
+        self.assertEqual(sensor.calls, 6)
+
+    def test_gives_up_when_the_sensor_is_silent(self) -> None:
+        from fr3_demo import recording
+
+        with patch.object(recording, "TACTILE_SEED_WAIT_S", 0.05):
+            started = time.monotonic()
+            self.assertIsNone(self._collector(self._Sensor(misses=10**9))._fresh_tactile_frame())
+        self.assertLess(time.monotonic() - started, 0.5)
