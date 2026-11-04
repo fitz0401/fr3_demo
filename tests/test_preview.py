@@ -6,7 +6,8 @@ from unittest.mock import patch
 
 import numpy as np
 
-from fr3_demo.preview import PREVIEW_TOPICS, CameraPreview, image_message, rviz_environment
+from fr3_demo.gel import GelReading
+from fr3_demo.preview import PREVIEW_TOPICS, CameraPreview, image_message, rviz_environment, tactile_view
 
 
 class FakeCamera:
@@ -233,6 +234,68 @@ class CameraPreviewTest(unittest.TestCase):
     def test_rate_must_be_positive(self) -> None:
         with self.assertRaises(ValueError):
             CameraPreview(FakePair(), rate_hz=0.0)
+
+
+class FakeTactile:
+    def __init__(self) -> None:
+        self.observers: list = []
+
+    def add_frame_observer(self, observer) -> None:
+        self.observers.append(observer)
+
+    def deliver(self, image: np.ndarray) -> None:
+        for observer in self.observers:
+            observer(SimpleNamespace(image=image))
+
+
+def _reading(level: float, *, valid: bool = True, zeroing: bool = False) -> GelReading:
+    return GelReading(1, 0.0, valid, "" if valid else "lost track", level, None, zeroing, (3.0, 4.0), 0.02, 0.003)
+
+
+class TactilePreviewTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.gel_image = np.full((240, 320, 3), 120, dtype=np.uint8)
+
+    def test_without_the_gel_guard_the_image_is_shown_as_recorded(self) -> None:
+        self.assertIs(tactile_view(self.gel_image, None), self.gel_image)
+
+    def test_the_guard_s_reading_is_drawn_along_the_bottom_in_its_colour(self) -> None:
+        for level, channel in ((0.3, 1), (0.8, 0), (1.1, 0)):
+            view = tactile_view(self.gel_image, _reading(level))
+            with self.subTest(level=level):
+                self.assertEqual(view.shape, self.gel_image.shape)
+                np.testing.assert_array_equal(view[:150], self.gel_image[:150])  # the gel stays visible
+                bar = view[-1, : int(min(level, 1.0) * 320) - 1]
+                self.assertTrue(np.all(bar[:, channel] > 200))
+        np.testing.assert_array_equal(self.gel_image, 120)  # drawn on a copy
+        red = tactile_view(self.gel_image, _reading(1.1))[-1, 10]
+        amber = tactile_view(self.gel_image, _reading(0.8))[-1, 10]
+        self.assertGreater(int(amber[1]) - int(red[1]), 50)
+
+    def test_an_untrustworthy_or_zeroing_gel_says_so(self) -> None:
+        for reading in (_reading(0.0, valid=False), _reading(0.0, zeroing=True)):
+            view = tactile_view(self.gel_image, reading)
+            with self.subTest(zeroing=reading.zeroing):
+                self.assertFalse(np.array_equal(view, self.gel_image))
+
+    def test_the_preview_shows_the_session_s_gel_frames_while_they_are_fresh(self) -> None:
+        preview = CameraPreview(FakePair(), launch_viewer=False, max_age=0.5)
+        self.assertIsNone(preview._tactile_image())
+        tactile, gel = FakeTactile(), SimpleNamespace(latest=lambda: _reading(0.3))
+        preview.show_tactile(tactile, gel)
+        tactile.deliver(self.gel_image)
+        view = preview._tactile_image()
+        self.assertEqual(view.shape, self.gel_image.shape)
+        self.assertFalse(np.array_equal(view, self.gel_image))  # the level is drawn on it
+        with patch("fr3_demo.preview.time.monotonic", return_value=preview._tactile_at + 1.0):
+            self.assertIsNone(preview._tactile_image())  # stale frames are not shown as live
+
+    def test_without_the_guard_it_shows_the_plain_gel(self) -> None:
+        preview = CameraPreview(FakePair(), launch_viewer=False)
+        tactile = FakeTactile()
+        preview.show_tactile(tactile)
+        tactile.deliver(self.gel_image)
+        self.assertIs(preview._tactile_image(), self.gel_image)
 
 
 if __name__ == "__main__":

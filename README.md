@@ -139,6 +139,11 @@ the cameras a second time. A preview failure does not stop recording.
 - `--preview-publish-only` publishes the topics without launching RViz, for
   viewing from another machine.
 - `--preview-rate-hz` changes only the preview rate.
+- With the GelSight in use (`--record-tactile` or `[gel]` on), the GelSight
+  panel shows its live image, from the stream the session already reads.
+  With the gel guard on, the guard's level is drawn along the bottom: green
+  below half the limit, amber up to it, red at or past it, with the shift
+  (px), twist (deg) and pressing (%) behind it.
 
 If ROS 2 is not sourced, collection still runs and logs
 `Camera preview disabled: ROS 2 is not sourced`.

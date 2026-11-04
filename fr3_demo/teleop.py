@@ -1365,6 +1365,11 @@ def run(args: argparse.Namespace) -> int:
             gel.wait_zeroed(10.0)
             print(describe_gel_guard(gel_limits, gel_directions))
 
+        if preview is not None and (tactile is not None or gel_camera is not None):
+            preview.show_tactile(tactile if tactile is not None else gel_camera, gel)
+            guard_note = " with the gel guard's level on it." if gel is not None else "."
+            print(f"GelSight preview publishing on /fr3_demo/tactile_image{guard_note}")
+
         with LinuxJoystick(args.joystick) as joystick:
             q = _diagnostics(joystick, robot, nominal_q)
             if args.check:

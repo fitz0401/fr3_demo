@@ -21,6 +21,8 @@ PREVIEW_TOPICS: dict[str, tuple[str, str]] = {
     "wrist_image": ("/fr3_demo/wrist_image", "wrist_camera"),
     "exterior_image_2_left": ("/fr3_demo/exterior_image_2_left", "exterior_camera_2"),
 }
+# The GelSight panel there subscribes to this one.
+TACTILE_TOPIC: tuple[str, str] = ("/fr3_demo/tactile_image", "gelsight")
 
 
 def rviz_environment() -> dict[str, str]:
@@ -67,6 +69,43 @@ def image_message(image_type: Any, node: Any, image: np.ndarray, frame_id: str) 
     return message
 
 
+def tactile_view(image: np.ndarray, reading: Any | None) -> np.ndarray:
+    """The gel image, with the gel guard's reading written along its bottom when there is one.
+
+    Green below half the limit, amber up to it, red at or past it; the bar
+    under the text fills as the level rises.
+    """
+
+    if reading is None:
+        return image
+    import cv2
+
+    view = np.ascontiguousarray(image, dtype=np.uint8).copy()
+    height, width = view.shape[:2]
+    if reading.zeroing:
+        text, color, level = "gel: zeroing", (255, 190, 0), 0.0
+    elif not reading.valid:
+        text, color, level = f"gel: {reading.reason}", (255, 60, 60), 0.0
+    else:
+        level = float(reading.level)
+        shift = float(np.hypot(*reading.shift_px))
+        text = (
+            f"gel {level:.0%} | {shift:.1f} px {np.degrees(reading.twist_rad):.1f} deg "
+            f"{100 * max(0.0, reading.spread):.1f}%"
+        )
+        color = (60, 220, 60) if level < 0.5 else (255, 170, 0) if level < 1.0 else (255, 60, 60)
+    font, thickness = cv2.FONT_HERSHEY_SIMPLEX, 1
+    scale = 0.45
+    while scale > 0.25 and cv2.getTextSize(text, font, scale, thickness)[0][0] > width - 8:
+        scale -= 0.02
+    band = int(cv2.getTextSize(text, font, scale, thickness)[0][1]) + 12
+    view[height - band :] = (view[height - band :] * 0.35).astype(np.uint8)
+    cv2.putText(view, text, (4, height - 8), font, scale, color, thickness, cv2.LINE_AA)
+    if level > 0.0:
+        view[height - 3 :, : int(min(level, 1.0) * width)] = color
+    return view
+
+
 class CameraPreview:
     """Republish a recorder's live frames so RViz can show them during collection.
 
@@ -110,6 +149,10 @@ class CameraPreview:
         self._slot_lock = threading.Lock()
         self._submitted: dict[str, np.ndarray] | None = None
         self._submitted_at = 0.0
+        self._tactile: np.ndarray | None = None
+        self._tactile_at = 0.0
+        self._gel: Any | None = None
+        self._tactile_publisher: Any | None = None
 
     def start(self) -> CameraPreview:
         try:
@@ -131,6 +174,7 @@ class CameraPreview:
                 key: self._node.create_publisher(Image, topic, qos_profile_sensor_data)
                 for key, (topic, _) in PREVIEW_TOPICS.items()
             }
+            self._tactile_publisher = self._node.create_publisher(Image, TACTILE_TOPIC[0], qos_profile_sensor_data)
             if self._launch_viewer:
                 self._rviz = start_rviz()
             self._thread = threading.Thread(target=self._loop, name="collect-preview", daemon=True)
@@ -151,6 +195,35 @@ class CameraPreview:
         with self._slot_lock:
             self._submitted = images
             self._submitted_at = time.monotonic()
+
+    def show_tactile(self, camera: Any, gel: Any | None = None) -> None:
+        """Also show the GelSight, with the gel guard's reading on it when ``gel`` (a GelMonitor) is given.
+
+        The frames come from the sensor the session already streams, through
+        an observer that only keeps a reference, so this costs capture and
+        recording nothing.
+        """
+
+        self._gel = gel
+        camera.add_frame_observer(self._on_tactile_frame)
+
+    def _on_tactile_frame(self, frame: Any) -> None:
+        with self._slot_lock:
+            self._tactile = frame.image
+            self._tactile_at = time.monotonic()
+
+    def _tactile_image(self) -> np.ndarray | None:
+        """The newest gel image while it is fresh, annotated; None otherwise."""
+
+        with self._slot_lock:
+            image, age = self._tactile, time.monotonic() - self._tactile_at
+        if image is None:
+            return None
+        if age > self._max_age:
+            self._report_once("tactile_image", RuntimeError("no fresh frame"))
+            return None
+        self._reported.discard("tactile_image")
+        return tactile_view(image, None if self._gel is None else self._gel.latest())
 
     def _report_once(self, key: str, error: BaseException) -> None:
         if key not in self._reported:
@@ -205,6 +278,13 @@ class CameraPreview:
                     self._publishers[key].publish(image_message(self._image_type, self._node, image, frame_id))
                 except Exception as error:  # noqa: BLE001 - preview loss must not stop recording
                     self._report_once(f"{key} (publish)", error)
+            try:
+                tactile = self._tactile_image()
+                if tactile is not None and self._tactile_publisher is not None:
+                    message = image_message(self._image_type, self._node, tactile, TACTILE_TOPIC[1])
+                    self._tactile_publisher.publish(message)
+            except Exception as error:  # noqa: BLE001 - preview loss must not stop recording
+                self._report_once("tactile_image (publish)", error)
             remaining = self._period - (time.monotonic() - started)
             if remaining > 0:
                 self._stop.wait(remaining)
