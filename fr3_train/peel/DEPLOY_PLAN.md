@@ -25,13 +25,30 @@
 Leonardo：`/leonardo_scratch/large/userexternal/ydu00001/openpi/deploy/pi05_peel_{splice,mix,moddrop,informed,konly2,ronly2}_s0_9999`
 （每个约 6 GB：params、norm stats、`force_model.json`、`golden.npz`、`BUNDLE.json`）。
 
-在笔记本上刷新 CINECA 证书后 `ssh -A` 到 GPU 机，然后在 GPU 机上：
+和 bc2f 一样用"方法一"（2026-10-20 验证可行；经自己电脑 tar 管道中转的方法不行）：
 
 ```bash
-for arm in splice ronly2 informed moddrop mix konly2; do
-  rsync -a ydu00001@data.leonardo.cineca.it:/leonardo_scratch/large/userexternal/ydu00001/openpi/deploy/pi05_peel_${arm}_s0_9999 /mnt/data/yurui/models/
-done
+# 自己电脑上：证书有效期约 12 小时，过期就重新登录
+step ssh login '<CINECA 邮箱>' --provisioner cineca-hpc
+ssh -A <用户名>@<GPU 机>
 ```
+
+```bash
+# GPU 机上
+ssh-add -l    # 必须能看到 CINECA 证书；看不到说明 -A 转发没生效，回到上一步
+ssh -o ConnectTimeout=15 ydu00001@data.leonardo.cineca.it ls /leonardo_scratch/large/userexternal/ydu00001/openpi/deploy | grep peel
+              # 几秒内应列出 6 个 pi05_peel_* 目录；超时就把主机名换成 login.leonardo.cineca.it
+for arm in splice ronly2 informed moddrop mix konly2; do
+  rsync -a --info=progress2 \
+    ydu00001@data.leonardo.cineca.it:/leonardo_scratch/large/userexternal/ydu00001/openpi/deploy/pi05_peel_${arm}_s0_9999 \
+    /mnt/data/yurui/models/
+done
+du -sb --apparent-size /mnt/data/yurui/models/pi05_peel_*_s0_9999
+```
+
+`--info=progress2` 不能省：每个包约 6.4 GB，不加它 rsync 在拷贝期间没有任何输出，看起来像卡住。断了重跑同一条命令即可续传。
+大小应为（字节）：informed 6441566058、konly2 6441575888、mix 6441567335、moddrop 6441560326、ronly2 6441567362、
+splice 6441566068（文件数 18–20 个不等，是权重分片差异，正常）。
 
 ## 3. GPU 机自检（每个包一次，不动机器人）
 
