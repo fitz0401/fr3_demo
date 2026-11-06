@@ -43,7 +43,11 @@ LOG = logging.getLogger("fr3_pi05")
 WINE_ACTION_HORIZON = 16
 # Checkpoints trained on fr3_demo recordings at 15 Hz with the 0/45/75 proprio history, 16-step chunks executed
 # open loop, and the arm held still while the gripper moves (both the wine and the blue-cup demonstrations do).
-HISTORY_CHECKPOINTS = ("wine_hybrid", "bc2f_force")
+HISTORY_CHECKPOINTS = ("wine_hybrid", "bc2f_force", "peel_force")
+# Profiles whose server rebuilds the force window from the raw ~1 kHz arm stream.
+RAW_FORCE_CHECKPOINTS = ("bc2f_force", "peel_force")
+# Profiles that read the GelSight marker summary (fr3_demo.gel.GelMonitor) as observation/tactile.
+TACTILE_CHECKPOINTS = ("peel_force",)
 
 
 class WineHistorySampler:
@@ -207,7 +211,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--transport", choices=("zmq", "websocket"), default="zmq")
     parser.add_argument(
         "--checkpoint",
-        choices=("pi05_droid", "custom_droid", "wine_hybrid", "bc2f_force"),
+        choices=("pi05_droid", "custom_droid", "wine_hybrid", "bc2f_force", "peel_force"),
         default="pi05_droid",
     )
     parser.add_argument("--policy-host", default="10.38.32.253")
@@ -370,6 +374,14 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         # These are checkpoint contract values, not rollout tuning parameters.
         args.open_loop_horizon = WINE_ACTION_HORIZON
         args.prefetch_actions = 0
+    if args.checkpoint in TACTILE_CHECKPOINTS:
+        # The peeler is clamped in the gripper for the whole run: never open it at start or command it (the policy's
+        # gripper output is always "closed"; the server pins the gripper input to its training constant).
+        if not args.no_gripper:
+            print(f"{args.checkpoint}: the clamped tool stays as it is (--no-gripper implied)")
+        args.no_gripper = True
+        if args.gel is None and args.tactile_device is None and not args.offline:
+            parser.error(f"{args.checkpoint} reads the GelSight: configure [gel] / [tactile] in config.toml")
     if args.execute and args.check:
         parser.error("--check never executes; remove either --check or --execute")
     if args.offline and not args.check:
@@ -430,8 +442,10 @@ def _build_camera_observation(
     gripper_position: float | np.ndarray,
     prompt: str,
     raw_force: tuple[np.ndarray, float] | None = None,
+    tactile: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """``raw_force`` = (raw arm samples [N, 15], time_sec of the state sent as the current joints), bc2f_force only."""
+    """``raw_force`` = (raw arm samples [N, 15], time_sec of the state sent as the current joints), bc2f_force and
+    peel_force; ``tactile`` = the GelSight marker summary (4 values), peel_force only."""
 
     exterior2 = frames.get("exterior_image_2_left")
     return build_droid_observation(
@@ -443,7 +457,23 @@ def _build_camera_observation(
         exterior2_image=None if exterior2 is None else exterior2.image,
         raw_force=None if raw_force is None else raw_force[0],
         robot_timestamp=None if raw_force is None else raw_force[1],
+        tactile=tactile,
     )
+
+
+def _tactile_reader(gel_monitor: Any) -> Callable[[], np.ndarray]:
+    """The observation's tactile values from the live gel monitor.
+
+    Training saw the marker tracker valid in every frame (fr3_peel_mix: tracked fraction 1.0), so an invalid or stale
+    reading is not sent as zeros (that would read as "no contact"): it ends the rollout instead."""
+
+    def read() -> np.ndarray:
+        reading = gel_monitor.latest()
+        if not reading.valid:
+            raise SafetyViolation(f"GelSight reading unusable for the policy: {reading.reason or 'invalid'}")
+        return np.array([*reading.shift_px, reading.twist_rad, reading.spread], dtype=np.float32)
+
+    return read
 
 
 def _raw_force_at(sampler: RawForceSampler | None, state: dict[str, Any]) -> tuple[np.ndarray, float] | None:
@@ -463,6 +493,7 @@ def _make_observation(
     max_camera_age: float,
     history: ProprioHistory | None = None,
     raw_force_sampler: RawForceSampler | None = None,
+    tactile_reader: Callable[[], np.ndarray] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], np.ndarray, dict[str, Any]]:
     frames = cameras.snapshot(max_camera_age)
     state, q = _state(robot)
@@ -474,7 +505,12 @@ def _make_observation(
             history.append(q, gripper.position)
         observation_joints, observation_gripper = history.observation()
     observation = _build_camera_observation(
-        frames, observation_joints, observation_gripper, prompt, _raw_force_at(raw_force_sampler, state)
+        frames,
+        observation_joints,
+        observation_gripper,
+        prompt,
+        _raw_force_at(raw_force_sampler, state),
+        None if tactile_reader is None else tactile_reader(),
     )
     return observation, frames, q, state
 
@@ -510,9 +546,48 @@ def _validate_bc2f_contract(metadata: dict[str, Any]) -> None:
     print(f"bc2f_force server: model {metadata.get('bundle_model')} step {metadata.get('bundle_step')}")
 
 
+def _validate_peel_contract(metadata: dict[str, Any]) -> None:
+    expected = {
+        "model": "pi05_peel",
+        "loader": "peel",
+        "action_horizon": WINE_ACTION_HORIZON,
+        "state_history_lags": [45, 75],
+        "num_state_frames": 3,
+        "joint_observation_shape": [3, 7],
+        "gripper_observation_shape": [3],
+        "image_observation_shape": [180, 320, 3],
+        "proprio_history_offsets": list(WINE_HISTORY_OFFSETS),
+        "uses_exterior2": True,
+        "requires_raw_force": True,
+        "requires_tactile": True,
+        "tactile_dims": 4,
+    }
+    mismatches = [
+        f"{key}={metadata.get(key)!r} (expected {value!r})"
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "peel_force server does not advertise the required contract: "
+            + "; ".join(mismatches)
+            + ". Start it with start_checkpoint.sh peel_force <bundle> from this fr3_demo revision."
+        )
+    tasks = metadata.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        raise RuntimeError("peel_force server returned an invalid task allowlist")
+    print(
+        f"peel_force server: model {metadata.get('bundle_model')} step {metadata.get('bundle_step')}, "
+        f"gripper input pinned to {metadata.get('gripper_input_pinned_to')}"
+    )
+
+
 def _validate_policy_contract(checkpoint: str, metadata: dict[str, Any]) -> None:
     if checkpoint == "bc2f_force":
         _validate_bc2f_contract(metadata)
+        return
+    if checkpoint == "peel_force":
+        _validate_peel_contract(metadata)
         return
     if checkpoint != "wine_hybrid":
         return
@@ -629,6 +704,9 @@ def _log_inference(trial_log: RolloutLogger, result: InferenceResult) -> None:
             valid_fraction=float(force.get("valid_fraction", float("nan"))),
             staleness_ms=round(float(force.get("staleness_ms", float("nan"))), 2),
         )
+    tactile = result.info.get("tactile")
+    if isinstance(tactile, dict) and "tactile" in tactile:
+        trial_log.event("tactile", values=np.round(np.asarray(tactile["tactile"], dtype=float), 4).tolist())
 
 
 def _announce_execution(args: argparse.Namespace) -> None:
@@ -753,6 +831,7 @@ def run(args: argparse.Namespace) -> int:
     contact_limits_set = False
     gel_camera: Any | None = None
     gel_guard: Any | None = None
+    tactile_reader: Callable[[], np.ndarray] | None = None
     stopped = threading.Event()
 
     def request_stop(*_: object) -> None:
@@ -789,11 +868,13 @@ def run(args: argparse.Namespace) -> int:
 
         gripper = GripperWorker(robot, not args.no_gripper, args.gripper_threshold)
         gripper.wait_ready()
-        if args.gel is not None and not args.no_gel_guard and args.execute:
-            from fr3_demo.gel import GelMonitor, GelStreamGuard, describe_gel_guard, gel_guard_settings
+        guard_gel = args.gel is not None and not args.no_gel_guard and args.execute
+        read_gel = args.checkpoint in TACTILE_CHECKPOINTS
+        if guard_gel or read_gel:
+            from fr3_demo.gel import GelLimits, GelMonitor, GelStreamGuard, describe_gel_guard, gel_guard_settings
             from fr3_demo.tactile import GelSightCamera
 
-            gel_limits, gel_directions = gel_guard_settings(args.gel)
+            gel_limits, gel_directions = gel_guard_settings(args.gel) if args.gel is not None else (GelLimits(), None)
             gel_camera = GelSightCamera(
                 device=args.tactile_device or None,
                 width=args.tactile_width,
@@ -805,10 +886,16 @@ def run(args: argparse.Namespace) -> int:
             gel_camera.add_frame_observer(gel_monitor.on_frame)
             print("Zeroing the GelSight: keep the tool still and out of contact...")
             gel_monitor.wait_zeroed(10.0)
-            gel_guard = GelStreamGuard(gel_monitor)
-            gripper.before_command = lambda: gel_monitor.suspend("the gripper is moving")
-            gripper.after_command = gel_monitor.rezero
-            print(describe_gel_guard(gel_limits, gel_directions) + " A policy run stops at level 1.")
+            if guard_gel:
+                gel_guard = GelStreamGuard(gel_monitor)
+                gripper.before_command = lambda: gel_monitor.suspend("the gripper is moving")
+                gripper.after_command = gel_monitor.rezero
+                print(describe_gel_guard(gel_limits, gel_directions) + " A policy run stops at level 1.")
+            if read_gel:
+                # The reference just taken (unloaded, tool still) is what training's tactile_deformation is relative
+                # to: the episode's first gel frame.
+                tactile_reader = _tactile_reader(gel_monitor)
+                print("GelSight marker summary feeds the policy (observation/tactile).")
         cameras = RealSensePair(
             args.external_camera_serial,
             args.wrist_camera_serial,
@@ -867,7 +954,7 @@ def run(args: argparse.Namespace) -> int:
 
             rviz = RvizBridge(launch_rviz=not args.rviz_publish_only)
 
-        if args.checkpoint == "bc2f_force":
+        if args.checkpoint in RAW_FORCE_CHECKPOINTS:
             from bamboo import BambooFrankaClient
 
             raw_force_sampler = RawForceSampler(
@@ -888,6 +975,7 @@ def run(args: argparse.Namespace) -> int:
             args.max_camera_age,
             history_sampler.history if history_sampler is not None else None,
             raw_force_sampler,
+            tactile_reader,
         )
         _validate_exterior2_contract(policy.metadata, observation)
         policy.submit(observation)
@@ -1097,6 +1185,7 @@ def run(args: argparse.Namespace) -> int:
                                 observation_gripper,
                                 prompt,
                                 _raw_force_at(raw_force_sampler, state),
+                                None if tactile_reader is None else tactile_reader(),
                             )
                             _validate_exterior2_contract(policy.metadata, observation)
                             policy.submit(observation)
@@ -1114,6 +1203,7 @@ def run(args: argparse.Namespace) -> int:
                             observation_gripper,
                             prompt,
                             _raw_force_at(raw_force_sampler, state),
+                            None if tactile_reader is None else tactile_reader(),
                         )
                         _validate_exterior2_contract(policy.metadata, observation)
                         policy.submit(observation)

@@ -160,6 +160,7 @@ def load_policy(
     use_exterior2: bool = False,
     bluecup_loader_path: str | None = None,
     bc2f_loader_path: str | None = None,
+    peel_loader_path: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Load OpenPI lazily so protocol tests do not need the GPU stack."""
 
@@ -278,18 +279,21 @@ def load_policy(
             "fault_keys": ["fault/absent_cameras", "fault/black_cameras", "fault/force"],
             "fault_force_modes": list(module.FORCE_MODES),
         }
-    if loader == "bc2f":
+    if loader in ("bc2f", "peel"):
+        # The peeling checkpoints (fr3_train/serve_peel.py, 2026-11-06) share the bc2f contract (raw 1 kHz arm
+        # stream, 3 cameras, 3 proprio frames) and add the GelSight marker summary as observation/tactile.
+        explicit = bc2f_loader_path if loader == "bc2f" else peel_loader_path
         loader_path = (
-            Path(bc2f_loader_path)
-            if bc2f_loader_path is not None
-            else Path(__file__).resolve().parents[2] / "fr3_train" / "serve_bc2f.py"
+            Path(explicit)
+            if explicit is not None
+            else Path(__file__).resolve().parents[2] / "fr3_train" / f"serve_{loader}.py"
         )
         if not loader_path.is_file():
-            raise RuntimeError(f"bc2f checkpoint loader is missing: {loader_path}")
-        module_name = "fr3_pi05_deployed_bc2f"
+            raise RuntimeError(f"{loader} checkpoint loader is missing: {loader_path}")
+        module_name = f"fr3_pi05_deployed_{loader}"
         spec = importlib.util.spec_from_file_location(module_name, loader_path)
         if spec is None or spec.loader is None:
-            raise RuntimeError(f"Cannot import bc2f checkpoint loader: {loader_path}")
+            raise RuntimeError(f"Cannot import {loader} checkpoint loader: {loader_path}")
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
@@ -301,9 +305,19 @@ def load_policy(
         policy = module.build_policy(checkpoint, resolved_asset_id)
         history_lags = list(module.STATE_HISTORY_LAGS)
         num_frames = int(module.NUM_STATE_FRAMES)
+        extra = {}
+        if loader == "peel":
+            extra = {
+                "requires_tactile": True,
+                "tactile_dims": int(module.TACTILE_DIMS),
+                "tactile_names": ["shift_x_px", "shift_y_px", "twist_rad", "spread"],
+                # The clamped peeler: the server feeds this training constant whatever gripper reading arrives.
+                "gripper_input_pinned_to": float(policy.held_gripper),
+            }
         return policy, {
-            "model": "pi05_bc2f",
-            # Which of the released weights is loaded (vanilla / moddrop / moddrop_prop); trial logs record it.
+            **extra,
+            "model": f"pi05_{loader}",
+            # Which of the released weights is loaded (e.g. vanilla / moddrop for bc2f, splice / informed for peel).
             "bundle_model": bundle.get("model", Path(checkpoint).name),
             "bundle_step": bundle.get("step"),
             "action_horizon": 16,
@@ -344,6 +358,7 @@ def warm_up(
     use_exterior2: bool = False,
     joint_torque: bool = False,
     raw_force: bool = False,
+    tactile: bool = False,
 ) -> float:
     """Compile one inference before exposing the network endpoint."""
 
@@ -375,6 +390,8 @@ def warm_up(
             [stamps[:, None], np.tile(current_joints, (len(stamps), 1)), np.tile(torque, (len(stamps), 1))], axis=1
         )
         observation["observation/robot_timestamp"] = 100.0
+    if tactile:
+        observation["observation/tactile"] = np.zeros(4, dtype=np.float32)  # unloaded gel
     started = time.monotonic()
     result = policy.infer(observation)
     actions = np.asarray(result.get("actions")) if isinstance(result, dict) else np.empty(0)
@@ -418,12 +435,13 @@ def main() -> int:
     parser.add_argument("--bind-host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--config-name", default="pi05_droid")
-    parser.add_argument("--loader", choices=("official", "custom_droid", "wine", "bluecup", "bc2f"), default="official")
+    parser.add_argument("--loader", choices=("official", "custom_droid", "wine", "bluecup", "bc2f", "peel"), default="official")
     parser.add_argument("--checkpoint", required=True, help="existing local checkpoint directory; never downloaded here")
     parser.add_argument("--default-prompt")
     parser.add_argument("--wine-loader-path")
     parser.add_argument("--bluecup-loader-path")
     parser.add_argument("--bc2f-loader-path")
+    parser.add_argument("--peel-loader-path")
     parser.add_argument("--asset-id", help="checkpoint normalization asset ID, for example owner/dataset")
     parser.add_argument("--tasks-json", help="optional JSON array restricting accepted language instructions")
     parser.add_argument(
@@ -477,6 +495,7 @@ def main() -> int:
         args.use_exterior2,
         args.bluecup_loader_path,
         args.bc2f_loader_path,
+        args.peel_loader_path,
     )
     metadata = dict(getattr(policy, "metadata", {}) or {})
     metadata.update(loader_metadata)
@@ -494,6 +513,7 @@ def main() -> int:
             bool(loader_metadata.get("uses_exterior2", False)),
             bool(loader_metadata.get("requires_joint_torque", False)),
             bool(loader_metadata.get("requires_raw_force", False)),
+            bool(loader_metadata.get("requires_tactile", False)),
         )
         metadata["warmup_ms"] = warmup_ms
         LOG.info("policy warm-up complete in %.1f ms", warmup_ms)

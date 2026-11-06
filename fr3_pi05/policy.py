@@ -100,6 +100,7 @@ def build_droid_observation(
     fault: dict[str, Any] | None = None,
     raw_force: np.ndarray | None = None,
     robot_timestamp: float | None = None,
+    tactile: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Build the exact observation dictionary expected by ``pi05_droid``.
 
@@ -109,6 +110,8 @@ def build_droid_observation(
     ``raw_force`` ([N, 15] = Bamboo time_sec, q, tau_J of every polled arm sample, fr3_pi05/raw_force.py) and
     ``robot_timestamp`` (time_sec of the state sent as the current joints) are required together by the
     bc2f_force checkpoints (fr3_train/serve_bc2f.py).
+    ``tactile`` (4 values: GelSight marker shift x, y px, twist rad, spread since the run's unloaded reference, from
+    fr3_demo.gel.GelMonitor) is required by the peel_force checkpoints (fr3_train/serve_peel.py), with raw_force.
     """
 
     joints = np.asarray(joint_position, dtype=np.float32)
@@ -154,6 +157,11 @@ def build_droid_observation(
             raise ValueError("robot_timestamp must be finite")
         observation["observation/raw_force"] = raw
         observation["observation/robot_timestamp"] = stamp
+    if tactile is not None:
+        values = np.asarray(tactile, dtype=np.float32).reshape(-1)
+        if values.shape != (4,) or not np.all(np.isfinite(values)):
+            raise ValueError("tactile must be 4 finite values: shift x, shift y (px), twist (rad), spread")
+        observation["observation/tactile"] = values
     return observation
 
 
@@ -250,7 +258,7 @@ class InferenceResult:
     info: dict[str, Any] = field(default_factory=dict)
 
 
-RESPONSE_INFO_KEYS = ("force", "server_timing", "policy_timing")
+RESPONSE_INFO_KEYS = ("force", "tactile", "server_timing", "policy_timing")
 
 
 class InferenceWorker:

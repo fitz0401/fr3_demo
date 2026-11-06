@@ -10,7 +10,7 @@ PORT=${PORT:-8000}
 CONNECT_ENDPOINT=${CONNECT_ENDPOINT:-}
 
 if [ -z "$OPENPI_DIR" ] || [ -z "$FR3_DEMO_DIR" ] || [ -z "$CHECKPOINT" ]; then
-  echo "Usage: CUDA_VISIBLE_DEVICES=<A6000-index> PORT=<port> $0 /path/to/openpi /path/to/fr3_demo /local/checkpoint [pi05_droid|custom_droid|wine_hybrid|bluecup_force|bc2f_force]" >&2
+  echo "Usage: CUDA_VISIBLE_DEVICES=<A6000-index> PORT=<port> $0 /path/to/openpi /path/to/fr3_demo /local/checkpoint [pi05_droid|custom_droid|wine_hybrid|bluecup_force|bc2f_force|peel_force]" >&2
   exit 2
 fi
 if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
@@ -40,6 +40,7 @@ PROPRIO_HISTORY_OFFSETS=(0)
 WINE_LOADER_PATH=
 BLUECUP_LOADER_PATH=
 BC2F_LOADER_PATH=
+PEEL_LOADER_PATH=
 ACTION_EXPERT_VARIANT=${ACTION_EXPERT_VARIANT:-auto}
 TASKS_JSON=${TASKS_JSON:-}
 if [ -z "${USE_EXTERNAL2+x}" ]; then
@@ -96,12 +97,20 @@ case "$MODEL_PROFILE" in
     PROPRIO_HISTORY_OFFSETS=(0 45 75)
     BC2F_LOADER_PATH=$FR3_DEMO_DIR/fr3_train/serve_bc2f.py
     ;;
+  peel_force)
+    # Peeling checkpoints (fr3_train/peel/DEPLOY_PLAN.md): the bc2f contract plus the GelSight marker summary
+    # (observation/tactile); the force window uses the bundle's force_model.json (peeler payload).
+    LOADER=peel
+    CONFIG_NAME=pi05_droid
+    PROPRIO_HISTORY_OFFSETS=(0 45 75)
+    PEEL_LOADER_PATH=$FR3_DEMO_DIR/fr3_train/serve_peel.py
+    ;;
   *)
-    echo "Unknown model profile: $MODEL_PROFILE (expected pi05_droid, custom_droid, wine_hybrid, bluecup_force, or bc2f_force)" >&2
+    echo "Unknown model profile: $MODEL_PROFILE (expected pi05_droid, custom_droid, wine_hybrid, bluecup_force, bc2f_force or peel_force)" >&2
     exit 2
     ;;
 esac
-if { [ "$LOADER" = wine ] || [ "$LOADER" = bluecup ] || [ "$LOADER" = bc2f ]; } && [ -z "$CUSTOM_ASSET_ID" ]; then
+if { [ "$LOADER" = wine ] || [ "$LOADER" = bluecup ] || [ "$LOADER" = bc2f ] || [ "$LOADER" = peel ]; } && [ -z "$CUSTOM_ASSET_ID" ]; then
   mapfile -t NORM_FILES < <(find "$CHECKPOINT/assets" -type f -name norm_stats.json 2>/dev/null | sort)
   if [ "${#NORM_FILES[@]}" -ne 1 ]; then
     echo "Expected exactly one normalization file under $CHECKPOINT/assets; found ${#NORM_FILES[@]}." >&2
@@ -133,11 +142,16 @@ if [ "$LOADER" = bc2f ] && [ ! -f "$BC2F_LOADER_PATH" ]; then
   echo "Pull the fr3_demo branch containing fr3_train/serve_bc2f.py before launching." >&2
   exit 2
 fi
-if [ "$LOADER" = bc2f ] && [ ! -f "$CHECKPOINT/force_model.json" ]; then
+if [ "$LOADER" = peel ] && [ ! -f "$PEEL_LOADER_PATH" ]; then
+  echo "peel loader is missing: $PEEL_LOADER_PATH" >&2
+  echo "Pull the fr3_demo branch containing fr3_train/serve_peel.py (deploy/peel-v1) before launching." >&2
+  exit 2
+fi
+if { [ "$LOADER" = bc2f ] || [ "$LOADER" = peel ]; } && [ ! -f "$CHECKPOINT/force_model.json" ]; then
   echo "$CHECKPOINT/force_model.json is missing: copy the whole bundle directory from Leonardo." >&2
   exit 2
 fi
-if [ "$LOADER" = wine ] || [ "$LOADER" = bluecup ] || [ "$LOADER" = bc2f ]; then
+if [ "$LOADER" = wine ] || [ "$LOADER" = bluecup ] || [ "$LOADER" = bc2f ] || [ "$LOADER" = peel ]; then
   EXPECTED_OPENPI_REV=15a9616a00943ada6c20a0f158e3adb39df2ccac
   ACTUAL_OPENPI_REV=$(git -C "$OPENPI_DIR" rev-parse HEAD 2>/dev/null || true)
   if [ "$ACTUAL_OPENPI_REV" != "$EXPECTED_OPENPI_REV" ]; then
@@ -180,6 +194,12 @@ EXTRA_ARGS=()
 if [ -n "$BC2F_LOADER_PATH" ]; then
   EXTRA_ARGS+=(
     --bc2f-loader-path "$BC2F_LOADER_PATH"
+    --asset-id "$CUSTOM_ASSET_ID"
+  )
+fi
+if [ -n "$PEEL_LOADER_PATH" ]; then
+  EXTRA_ARGS+=(
+    --peel-loader-path "$PEEL_LOADER_PATH"
     --asset-id "$CUSTOM_ASSET_ID"
   )
 fi
