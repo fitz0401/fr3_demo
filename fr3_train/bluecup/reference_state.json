@@ -1,0 +1,48 @@
+{
+ "dataset": "fitz0401/franka_pour_lillet_blue_cup_force",
+ "episode": 0,
+ "start_frame": 0,
+ "pour_frame": 932,
+ "start": {
+  "joint_position": [
+   -0.0469,
+   -0.7275,
+   -0.0282,
+   -2.2843,
+   0.002,
+   1.5749,
+   0.0346
+  ],
+  "gripper_position": 1.0,
+  "joint_torque_tau_J_Nm": [
+   0.003,
+   -6.631,
+   -0.248,
+   23.96,
+   0.642,
+   2.426,
+   -0.082
+  ]
+ },
+ "pour": {
+  "joint_position": [
+   -0.1857,
+   0.3969,
+   0.0725,
+   -2.161,
+   2.2674,
+   2.0148,
+   -0.9346
+  ],
+  "gripper_position": 0.7841,
+  "joint_torque_tau_J_Nm": [
+   0.619,
+   -46.633,
+   1.296,
+   24.701,
+   0.283,
+   -3.729,
+   -0.556
+  ]
+ }
+}

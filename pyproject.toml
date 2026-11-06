@@ -55,6 +55,7 @@ fr3-contact-check = "fr3_demo.contact:main"
 fr3-gel-calibrate = "fr3_demo.gel:calibrate_main"
 fr3-pi05-check = "fr3_pi05.runner:check_main"
 fr3-pi05-run = "fr3_pi05.runner:main"
+fr3-pi05-trials = "fr3_pi05.trials:main"
 
 [tool.setuptools.packages.find]
 include = ["fr3_demo*", "fr3_pi05*"]

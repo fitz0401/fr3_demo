@@ -317,6 +317,51 @@ def build_policy(checkpoint, action_expert_variant, asset_id, use_exterior2=Fals
         with self.assertRaisesRegex(RuntimeError, "expected 16"):
             warm_up(policy, "pour the wine", (0, 45, 75), action_horizon=16)
 
+    def test_bluecup_loader_advertises_force_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            loader_path = root / "serve_bluecup.py"
+            loader_path.write_text(
+                """
+STATE_HISTORY_LAGS = (45, 75)
+NUM_STATE_FRAMES = 3
+TASKS = ("pour lillet into the blue cup",)
+DEFAULT_ASSET_ID = "fitz0401/franka_pour_lillet_blue_cup_force"
+CAMERA_SLOTS = {"exterior_image_1_left": "base_0_rgb", "wrist_image_left": "left_wrist_0_rgb", "exterior_image_2_left": "right_wrist_0_rgb"}
+FORCE_MODES = ("present", "absent", "dead_undeclared")
+def build_policy(checkpoint, asset_id):
+    return {"checkpoint": checkpoint, "asset_id": asset_id}
+""",
+                encoding="utf-8",
+            )
+            checkpoint = root / "pi05_bluecup_alloc_fixed_14500"
+            checkpoint.mkdir()
+            (checkpoint / "BUNDLE.json").write_text('{"model": "pi05_bluecup_alloc_fixed", "step": 14500}', encoding="utf-8")
+            policy, metadata = load_policy(
+                "bluecup", "unused", str(checkpoint), None, bluecup_loader_path=str(loader_path)
+            )
+
+        self.assertEqual(policy["asset_id"], "fitz0401/franka_pour_lillet_blue_cup_force")
+        self.assertEqual(metadata["model"], "pi05_bluecup")
+        self.assertEqual(metadata["bundle_model"], "pi05_bluecup_alloc_fixed")
+        self.assertEqual(metadata["bundle_step"], 14500)
+        self.assertEqual(metadata["proprio_history_offsets"], [0, 45, 75])
+        self.assertEqual(metadata["tasks"], ["pour lillet into the blue cup"])
+        self.assertTrue(metadata["uses_exterior2"])
+        self.assertTrue(metadata["requires_joint_torque"])
+        self.assertIn("fault/force", metadata["fault_keys"])
+
+    def test_server_warmup_sends_joint_torque_when_required(self) -> None:
+        class FakePolicy:
+            def infer(self, observation):
+                self.observation = observation
+                return {"actions": np.zeros((16, 8), dtype=np.float32)}
+
+        policy = FakePolicy()
+        warm_up(policy, "pour lillet into the blue cup", (0, 45, 75), 16, True, True)
+        self.assertEqual(policy.observation["observation/joint_torque"].shape, (7,))
+        self.assertIn("observation/exterior_image_2_left", policy.observation)
+
     def test_server_warmup_includes_exterior2_when_enabled(self) -> None:
         class FakePolicy:
             def infer(self, observation):

@@ -11,6 +11,8 @@ Profiles:
   pi05_droid   official DROID contract (port 8000)
   custom_droid custom DROID contract   (port 8001)
   wine_hybrid  FR3 wine contract       (port 8002)
+  bluecup_force FR3 blue-cup force/dropout contract (port 8003)
+  bc2f_force   FR3 blue-cup scope-v5 contract: raw 1 kHz force stream (port 8004)
 
 Optional environment overrides:
   CUDA_VISIBLE_DEVICES, FR3_GPU_INDEX, OPENPI_DIR, FR3_DEMO_DIR, PORT,
@@ -29,13 +31,27 @@ fi
 
 if [ "$#" -eq 1 ]; then
   case "$1" in
-    pi05_droid|custom_droid|wine_hybrid)
+    pi05_droid|custom_droid|wine_hybrid|bluecup_force|bc2f_force)
       PROFILE=$1
       CHECKPOINT=
       ;;
     *)
-      PROFILE=wine_hybrid
+      # A bare checkpoint path. Infer the contract from its name instead of
+      # assuming wine: a checkpoint served under the wrong contract loads
+      # without complaint and returns garbage actions, so never guess.
       CHECKPOINT=$1
+      case $(basename -- "$1" | tr '[:upper:]' '[:lower:]' | tr '-' '_') in
+        *bc2f*) PROFILE=bc2f_force ;;
+        *bluecup*) PROFILE=bluecup_force ;;
+        *wine*) PROFILE=wine_hybrid ;;
+        *)
+          echo "Cannot tell which contract this checkpoint belongs to: $1" >&2
+          echo "Pass the profile explicitly, for example:" >&2
+          echo "  start_checkpoint.sh bc2f_force $1" >&2
+          exit 2
+          ;;
+      esac
+      echo "Inferred profile=$PROFILE from the checkpoint name." >&2
       ;;
   esac
 else
@@ -60,6 +76,20 @@ case "$PROFILE" in
     PORT=${PORT:-8002}
     OPENPI_DIR=${OPENPI_DIR:-$HOME/openpi_wine}
     CHECKPOINT=${CHECKPOINT:-/mnt/data/yurui/models/pi05_wine_hybrid_17500}
+    ;;
+  bluecup_force)
+    PORT=${PORT:-8003}
+    # Same checkout as wine: OpenPI 15a9616 + fr3_train/deploy.patch.
+    OPENPI_DIR=${OPENPI_DIR:-$HOME/openpi_wine}
+    # One of pi05_bluecup_{flag_10500,moddrop_14999,alloc_fixed_14500}; restart to switch models.
+    CHECKPOINT=${CHECKPOINT:-/mnt/data/yurui/models/pi05_bluecup_alloc_fixed_14500}
+    ;;
+  bc2f_force)
+    PORT=${PORT:-8004}
+    # Same checkout as wine: OpenPI 15a9616 + fr3_train/deploy.patch.
+    OPENPI_DIR=${OPENPI_DIR:-$HOME/openpi_wine}
+    # One of pi05_bc2f_{vanilla,moddrop,moddrop_prop}_s0_14999; restart to switch models.
+    CHECKPOINT=${CHECKPOINT:-/mnt/data/yurui/models/pi05_bc2f_moddrop_s0_14999}
     ;;
   *)
     echo "Unknown profile: $PROFILE" >&2
