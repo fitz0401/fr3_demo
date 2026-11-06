@@ -347,6 +347,159 @@ def measure_rate(
     }
 
 
+USB_DEVICE_ROOT = Path("/sys/bus/usb/devices")
+
+
+def usb_devices(root: Path = USB_DEVICE_ROOT) -> dict[str, tuple[str, int]]:
+    """Every connected USB device with a product name: {port path: (product, device number)}.
+
+    Linux gives a device the next number on its bus each time it connects, so
+    a number that changes means the device dropped and came back.
+    """
+
+    devices = {}
+    for entry in root.glob("[0-9]*-*"):
+        if ":" in entry.name:
+            continue  # an interface, not a device
+        try:
+            devices[entry.name] = ((entry / "product").read_text().strip(), int((entry / "devnum").read_text()))
+        except (OSError, ValueError):
+            continue
+    return devices
+
+
+def usb_changes(
+    before: dict[str, tuple[str, int]], after: dict[str, tuple[str, int]]
+) -> list[tuple[str, str, str, int]]:
+    """(event, port, product, number) for each device that left or arrived, a reconnect counting as both."""
+
+    events = []
+    for port, (product, number) in before.items():
+        if after.get(port) != (product, number):
+            events.append(("dropped", port, product, number))
+    for port, (product, number) in after.items():
+        if before.get(port) != (product, number):
+            events.append(("back", port, product, number))
+    return events
+
+
+def describe_arm(history: list[tuple[float, np.ndarray, float | None]], now: float) -> dict[str, Any]:
+    """What the arm and gripper were doing up to ``now``, from (time, joint positions, gripper width) samples."""
+
+    recent = [(t, q, w) for t, q, w in history if now - 2.0 <= t <= now]
+    if len(recent) < 2:
+        return {"arm": "no arm state (is Bamboo running?)"}
+    times = np.array([t for t, _, _ in recent])
+    joints = np.stack([q for _, q, _ in recent])
+    last_second = times >= now - 1.0
+    moved = np.ptp(joints[last_second], axis=0) if last_second.sum() >= 2 else np.zeros(joints.shape[1])
+    speed = np.abs(np.diff(joints, axis=0) / np.maximum(np.diff(times), 1e-3)[:, None])[-5:].max(axis=0)
+    widths = [w for _, _, w in recent if w is not None]
+    return {
+        "joints_rad": np.round(joints[-1], 3).tolist(),
+        "joint_speed_rad_s": np.round(speed, 3).tolist(),
+        "moved_last_second_rad": np.round(moved, 3).tolist(),
+        "arm_moving": bool(speed.max() > 0.02),
+        "fastest_joint": int(np.argmax(speed)) + 1,
+        "gripper_width_m": None if not widths else round(widths[-1], 4),
+        "gripper_moved_last_2_s": None if len(widths) < 2 else bool(np.ptp(widths) > 0.002),
+    }
+
+
+def watch_usb(args: Any) -> int:
+    """Log every USB device that drops while the arm moves, with what the arm and gripper were doing.
+
+    Reads only: the camera stays free for fr3-collect, which can run at the same
+    time, and nothing is commanded.
+    """
+
+    import json
+
+    from fr3_demo.settings import default_config_path, load_config
+
+    robot = load_config(default_config_path()).get("robot", {})
+    arm = gripper = None
+    try:
+        from bamboo import BambooFrankaClient
+
+        server = args.server_ip or robot.get("server_ip", "172.16.0.20")
+        control_port = int(robot.get("control_port", 5555))
+        arm = BambooFrankaClient(server_ip=server, control_port=control_port, enable_gripper=False)
+        arm.get_joint_states()
+        try:
+            gripper = BambooFrankaClient(
+                server_ip=server,
+                control_port=control_port,
+                gripper_port=args.gripper_port,
+                gripper_type="robotiq",
+                enable_gripper=True,
+            )
+        except Exception as error:  # noqa: BLE001 - the gripper is optional context
+            print(f"Gripper state unavailable ({error}); logging the arm only.")
+    except Exception as error:  # noqa: BLE001 - USB events are still worth logging without the arm
+        print(f"Bamboo unavailable ({error}); logging USB events only.")
+        arm = None
+    devices = usb_devices()
+    watched = {port: info for port, info in devices.items() if DEVICE_NAME.lower() in info[0].lower()}
+    print("Watching USB" + (" and the arm" if arm else "") + " (Ctrl-C to stop). Connected now:")
+    for port, (product, number) in sorted(devices.items()):
+        print(f"  usb {port} #{number}: {product}" + ("  <-- GelSight" if port in watched else ""))
+    log_dir = Path(args.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"usb_watch_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
+    history: list[tuple[float, np.ndarray, float | None]] = []
+    width: float | None = None
+    next_gripper = 0.0
+    started = time.monotonic()
+    drops = 0
+    try:
+        with log_path.open("a", encoding="utf-8") as log:
+            while args.seconds <= 0 or time.monotonic() - started < args.seconds:
+                now = time.monotonic()
+                if arm is not None:
+                    try:
+                        if gripper is not None and now >= next_gripper:
+                            width = float(gripper.get_gripper_state()["state"]["width"])
+                            next_gripper = now + 0.1
+                        history.append((now, np.asarray(arm.get_joint_states()["qpos"], dtype=float), width))
+                        history = [item for item in history if now - item[0] <= 5.0]
+                    except Exception as error:  # noqa: BLE001 - keep watching USB
+                        print(f"{time.strftime('%H:%M:%S')}  arm state failed: {error}")
+                current = usb_devices()
+                for event, port, product, number in usb_changes(devices, current):
+                    stamp = time.strftime("%H:%M:%S") + f".{int((time.time() % 1) * 1000):03d}"
+                    context = describe_arm(history, now)
+                    record = {"time": stamp, "event": event, "port": port, "product": product, "number": number}
+                    record.update(context)
+                    log.write(json.dumps(record) + "\n")
+                    log.flush()
+                    print(f"{stamp}  {product} {event} (usb {port} #{number})")
+                    if event == "dropped":
+                        drops += 1
+                        if "joints_rad" in context:
+                            print(
+                                f"    arm {'moving' if context['arm_moving'] else 'still'} (fastest: joint "
+                                f"{context['fastest_joint']}, {max(context['joint_speed_rad_s']):.2f} rad/s); "
+                                f"joints {context['joints_rad']}; gripper "
+                                + (
+                                    "unknown"
+                                    if context["gripper_width_m"] is None
+                                    else f"{context['gripper_width_m'] * 1000:.0f} mm"
+                                    + (", moved in the last 2 s" if context["gripper_moved_last_2_s"] else "")
+                                )
+                            )
+                devices = current
+                time.sleep(max(0.0, 0.02 - (time.monotonic() - now)))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for client in (arm, gripper):
+            if client is not None:
+                client.close()
+    print(f"\n{drops} drop(s) logged to {log_path}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Report what the tactile sensor delivers, without recording anything."""
 
@@ -357,7 +510,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seconds", type=float, default=10.0, help="measurement window")
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--height", type=int, default=240)
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help=(
+            "log every USB device that drops, with what the arm and gripper were doing; leaves the camera free, "
+            "so it runs next to fr3-collect (with --seconds 0, until Ctrl-C)"
+        ),
+    )
+    parser.add_argument("--server-ip", default="", help="Bamboo machine for --watch (default: from the config)")
+    parser.add_argument("--gripper-port", type=int, default=5559)
+    parser.add_argument("--log-dir", default="data/usb_watch", help="where --watch saves its log")
     args = parser.parse_args(argv)
+    if args.watch:
+        return watch_usb(args)
 
     for index, name in _video_nodes():
         marker = " <-- tactile" if DEVICE_NAME.lower() in name.lower() else ""

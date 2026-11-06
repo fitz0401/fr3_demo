@@ -358,3 +358,52 @@ class TactileSeedTest(unittest.TestCase):
             started = time.monotonic()
             self.assertIsNone(self._collector(self._Sensor(misses=10**9))._fresh_tactile_frame())
         self.assertLess(time.monotonic() - started, 0.5)
+
+
+class UsbWatchTest(unittest.TestCase):
+    def _device(self, root: Path, port: str, product: str, number: int) -> None:
+        folder = root / port
+        folder.mkdir(parents=True)
+        (folder / "product").write_text(product + "\n")
+        (folder / "devnum").write_text(f"{number}\n")
+
+    def test_devices_are_listed_by_port_with_their_connection_number(self) -> None:
+        from fr3_demo.tactile import usb_devices
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._device(root, "3-3", "GelSight Mini R0B", 50)
+            self._device(root, "3-1", "RealSense D456", 27)
+            (root / "3-3:1.0").mkdir()  # an interface, not a device
+            (root / "usb3").mkdir()  # a root hub
+            self.assertEqual(usb_devices(root), {"3-3": ("GelSight Mini R0B", 50), "3-1": ("RealSense D456", 27)})
+
+    def test_a_drop_and_a_reconnect_are_both_reported(self) -> None:
+        from fr3_demo.tactile import usb_changes
+
+        before = {"3-3": ("GelSight", 50), "3-1": ("RealSense", 27)}
+        self.assertEqual(usb_changes(before, {"3-1": ("RealSense", 27)}), [("dropped", "3-3", "GelSight", 50)])
+        self.assertEqual(usb_changes({"3-1": ("RealSense", 27)}, before), [("back", "3-3", "GelSight", 50)])
+        # Gone and back between two polls: a new connection number gives it away.
+        self.assertEqual(
+            usb_changes(before, {"3-3": ("GelSight", 51), "3-1": ("RealSense", 27)}),
+            [("dropped", "3-3", "GelSight", 50), ("back", "3-3", "GelSight", 51)],
+        )
+        self.assertEqual(usb_changes(before, dict(before)), [])
+
+    def test_the_arm_and_gripper_context_of_a_drop(self) -> None:
+        from fr3_demo.tactile import describe_arm
+
+        history = []
+        for step in range(101):
+            t = step * 0.02
+            q = np.zeros(7)
+            q[6] = 0.4 * t  # the wrist turning at 0.4 rad/s
+            history.append((t, q, 0.08 if t < 1.5 else 0.06))
+        context = describe_arm(history, 2.0)
+        self.assertTrue(context["arm_moving"])
+        self.assertEqual(context["fastest_joint"], 7)
+        self.assertAlmostEqual(context["joint_speed_rad_s"][6], 0.4, places=2)
+        self.assertAlmostEqual(context["moved_last_second_rad"][6], 0.4, places=2)
+        self.assertTrue(context["gripper_moved_last_2_s"])
+        self.assertIn("no arm state", describe_arm([], 2.0)["arm"])
