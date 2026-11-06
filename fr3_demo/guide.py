@@ -164,11 +164,21 @@ def hold_message(state: dict[str, Any], gel_reason: str | None = None) -> str | 
     reason = state.get("guide_hold_reason", "none")
     if reason in SILENT_HOLDS:
         return None
+    # The guard measures the gel from its last zero (session start, or after a
+    # gripper button), so a tool fitted, moved or pulled out by hand counts too.
+    regrip = " If you fitted or moved the tool by hand, re-grip it (B, then A): the gel re-zeroes on the new grasp."
     advice = {
         "watchdog": "guide updates stopped arriving",
-        "gel_invalid": "the gel signal is not trustworthy"
-        + (f" ({gel_reason}); B opens the gripper, which unloads the gel and re-zeroes it" if gel_reason else ""),
+        # A hold latches: by the time it is reported the gel may read fine again.
+        "gel_invalid": (
+            f"the gel signal is not trustworthy ({gel_reason}); B opens the gripper, which unloads the gel and "
+            "re-zeroes it"
+            if gel_reason
+            else "the gel signal was briefly not trustworthy: its markers could not be followed from the last zero "
+            "(the tool moved in the grip, or the gel changed very fast)"
+        ),
         "gel_limit": "the gel reached its load limit; back off",
         "joint_limit": "a joint is at its limit; move it back in range",
     }.get(reason, reason)
-    return f"Arm holding: {advice}. Press RB to resume."
+    extra = regrip if reason == "gel_limit" or (reason == "gel_invalid" and not gel_reason) else ""
+    return f"Arm holding: {advice}. Press RB to resume.{extra}"
