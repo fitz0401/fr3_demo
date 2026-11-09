@@ -253,15 +253,17 @@ While you guide the arm, Franka's force estimate mixes your hand with the
 contact. With `--replay`, each demonstration is replayed by the robot alone
 after you record it, and the replay is recorded too:
 
-1. **X** starts recording; guide the demonstration; **X** stops it. End with
-   the tool clear of the fruit: the arm next moves straight (in joint space)
-   home.
+1. **X** starts recording, always at home: if the arm is elsewhere (the
+   first demonstration of a session, say), it homes first, hands off, and
+   recording starts once it is there. Guide the demonstration; **X** stops
+   it. End with the tool clear of the fruit: the arm next moves straight (in
+   joint space) home.
 2. Hands off: guide mode stops and the arm homes, then holds there. Arrange
    the scene for the replay (turn the lemon to fresh skin, say), keeping
    clear of the tool.
-3. **X** replays it: the arm moves to where the demonstration started and
-   replays it while a new episode records, then homes. **B** skips the
-   replay instead.
+3. **X** replays it: the arm settles onto where the demonstration started
+   (within 0.003 rad, about 1 mm at the blade) and replays it while a new
+   episode records, then homes. **B** skips the replay instead.
 4. Guide mode comes back on; the next **X** starts the next demonstration.
 
 Nobody touches the arm during a replay, so Franka's force estimate is the

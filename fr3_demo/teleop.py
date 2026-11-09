@@ -355,12 +355,13 @@ def stream_home(
     minimum_timeout: float,
     rate_hz: float,
     stop_requested: Callable[[], bool] | None = None,
+    tolerance: float = 0.01,
 ) -> np.ndarray:
-    """Move to a joint target using Bamboo's bounded streaming controller."""
+    """Move to a joint target using Bamboo's bounded streaming controller, settling within ``tolerance`` rad."""
 
     target = np.asarray(target, dtype=float)
     period = 1.0 / rate_hz
-    position_tolerance = 0.01
+    position_tolerance = tolerance
     velocity_tolerance = 0.03
     gain = 1.2
     started = time.monotonic()
@@ -404,6 +405,11 @@ GUIDE_HOME_PAUSE_S = 1.0
 GUIDE_RESTART_WAIT_S = 10.0
 # The same after a replay, which may leave the blade caught in the fruit.
 REPLAY_RESTART_WAIT_S = 30.0
+# With --replay every demonstration starts at home; within this the arm counts as there.
+AT_HOME_RAD = 0.02
+# A replay settles this close onto its demonstration's start before recording, so it does not
+# begin with a correction (about 1 mm at the blade, against 3 mm at the homing tolerance).
+START_POSE_TOLERANCE_RAD = 0.003
 
 
 def home_from_guide(
@@ -455,6 +461,43 @@ def home_from_guide(
     heartbeat = restart_guide(robot, args, new_heartbeat, stop_requested)
     print(("Homing complete; " if homed else "") + "guide mode is back on: the arm floats again.")
     return heartbeat
+
+
+def at_home(robot: BambooRobot) -> bool:
+    q = np.asarray(robot.state()["qpos"], dtype=float)
+    return float(np.max(np.abs(q - HOME_JOINTS))) <= AT_HOME_RAD
+
+
+def home_before_recording(
+    robot: BambooRobot,
+    args: argparse.Namespace,
+    heartbeat: GuideHeartbeat | None,
+    new_heartbeat: Callable[[], GuideHeartbeat],
+    stop_requested: Callable[[], bool],
+    gel_guard: Any | None = None,
+) -> tuple[GuideHeartbeat | None, bool]:
+    """Home the arm from guide mode unless it is home already; return the heartbeat and whether it is home.
+
+    With --replay every demonstration starts at home, so its replay does too.
+    """
+
+    if at_home(robot):
+        return heartbeat, True
+    print("\nEvery demonstration starts at home: homing first. Recording starts once the arm is there.")
+    heartbeat = home_from_guide(robot, args, heartbeat, new_heartbeat, stop_requested, gel_guard)
+    return heartbeat, heartbeat is not None and at_home(robot)
+
+
+def _press_counts(snapshot: JoystickSnapshot, mapping: Mapping) -> tuple[int, int, int, int, int]:
+    """The press counts the main loop compares against: close, open, home, record, resume."""
+
+    return (
+        snapshot.press_counts[mapping.close_button],
+        snapshot.press_counts[mapping.open_button],
+        snapshot.press_counts[mapping.home_button],
+        snapshot.press_counts[mapping.record_button],
+        snapshot.press_counts[mapping.yaw_up_button],
+    )
 
 
 def restart_guide(
@@ -565,6 +608,7 @@ def _guarded_move(
     target: np.ndarray,
     interrupted: Callable[[], bool],
     why_interrupted: Callable[[], str],
+    tolerance: float = 0.01,
 ) -> str | None:
     """Stream to a joint pose at homing speed; None once there, else why it stopped on the way."""
 
@@ -576,6 +620,7 @@ def _guarded_move(
             args.home_timeout,
             args.stream_rate,
             stop_requested=interrupted,
+            tolerance=tolerance,
         )
     except InterruptedError:
         return why_interrupted()
@@ -685,7 +730,9 @@ def replay_from_guide(
         if reason is None:
             homed = False
             print("Moving to the demonstration's start...")
-            reason = _guarded_move(robot, args, path.start, interrupted, why_interrupted)
+            reason = _guarded_move(
+                robot, args, path.start, interrupted, why_interrupted, tolerance=START_POSE_TOLERANCE_RAD
+            )
         if reason is not None:
             print(f"Replay skipped: {reason}.")
         else:
@@ -1460,7 +1507,8 @@ def run(args: argparse.Namespace) -> int:
                 if not guiding_active:
                     raise RuntimeError("--replay needs Bamboo's guide mode; with the Pilot buttons it cannot replay")
                 print(
-                    "Replay: stopping a recording with X homes the arm and waits there while you arrange the "
+                    "Replay: every demonstration starts at home (X homes the arm first if needed). "
+                    "Stopping a recording with X homes the arm and waits there while you arrange the "
                     "scene; X then replays the demonstration "
                     + (f"{args.replay_depth_mm:.1f} mm deeper " if args.replay_depth_mm > 0 else "")
                     + "under the contact limits"
@@ -1591,13 +1639,37 @@ def run(args: argparse.Namespace) -> int:
                             if replay_controls.quit and not stop:
                                 request_stop()
                             # The presses that steered the replay are spent.
-                            spent = joystick.snapshot()
-                            last_close_count = spent.press_counts[mapping.close_button]
-                            last_open_count = spent.press_counts[mapping.open_button]
-                            last_home_count = spent.press_counts[mapping.home_button]
-                            last_record_count = spent.press_counts[mapping.record_button]
-                            last_resume_count = spent.press_counts[mapping.yaw_up_button]
+                            (
+                                last_close_count,
+                                last_open_count,
+                                last_home_count,
+                                last_record_count,
+                                last_resume_count,
+                            ) = _press_counts(joystick.snapshot(), mapping)
                     else:
+                        if args.replay and guiding_active and robot is not None:
+                            guiding_active = False
+                            heartbeat, ready = home_before_recording(
+                                robot,
+                                args,
+                                heartbeat,
+                                lambda: GuideHeartbeat(robot.new_arm_client, args.guide_heartbeat_hz, gel=gel),
+                                lambda: stop,
+                                None if gel is None else GelStreamGuard(gel),
+                            )
+                            guiding_active = heartbeat is not None
+                            last_hold_message = None
+                            (
+                                last_close_count,
+                                last_open_count,
+                                last_home_count,
+                                last_record_count,
+                                last_resume_count,
+                            ) = _press_counts(joystick.snapshot(), mapping)
+                            if not ready:
+                                if guiding_active:
+                                    print("Not recording: the arm did not get home. Press X to try again.")
+                                continue
                         if args.weigh:
                             print("\nWeigh the bottle and the cup before this demonstration:")
                             pending_weights.clear()

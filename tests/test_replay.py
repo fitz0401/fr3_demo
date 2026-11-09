@@ -499,6 +499,11 @@ class ReplayFromGuideTest(unittest.TestCase):
         np.testing.assert_array_equal(targets[0], HOME_JOINTS)
         np.testing.assert_array_equal(targets[1], START)
         np.testing.assert_array_equal(targets[2], HOME_JOINTS)
+        # It settles closely onto the demonstration's own start before recording.
+        from fr3_demo.teleop import START_POSE_TOLERANCE_RAD
+
+        tolerances = [call.kwargs["tolerance"] for call in parts["home"].call_args_list]
+        self.assertEqual(tolerances, [0.01, START_POSE_TOLERANCE_RAD, 0.01])
         parts["wait"].assert_called_once()
         parts["collector"].start_episode.assert_called_once_with(
             action_source=REPLAY_ACTION_SOURCE, extra_metadata={"replay_of": "episode_000000"}
@@ -567,6 +572,45 @@ class ReplayFromGuideTest(unittest.TestCase):
         robot.stop_stream.assert_called_once_with()
         robot.clear_contact_limits.assert_called_once_with()
         robot.start_guide.assert_not_called()
+
+
+class HomeBeforeRecordingTest(unittest.TestCase):
+    def _robot(self, *poses):
+        robot = MagicMock()
+        robot.state.side_effect = [{"qpos": pose} for pose in poses]
+        return robot
+
+    def _home(self, robot, homed=None):
+        from fr3_demo import teleop
+
+        old = MagicMock()
+        with patch.object(teleop, "home_from_guide", return_value=homed or MagicMock()) as home:
+            result = teleop.home_before_recording(robot, _replay_args(), old, MagicMock, lambda: False)
+        return result, home, old
+
+    def test_an_arm_already_home_records_where_it_is(self) -> None:
+        (heartbeat, ready), home, old = self._home(self._robot(HOME_JOINTS + 0.01))
+        home.assert_not_called()
+        self.assertIs(heartbeat, old)
+        self.assertTrue(ready)
+
+    def test_an_arm_elsewhere_is_homed_first(self) -> None:
+        homed = MagicMock()
+        (heartbeat, ready), home, _ = self._home(self._robot(HOME_JOINTS + 0.3, HOME_JOINTS), homed)
+        home.assert_called_once()
+        self.assertIs(heartbeat, homed)
+        self.assertTrue(ready)
+
+    def test_homing_that_stops_short_does_not_record(self) -> None:
+        (_, ready), _, _ = self._home(self._robot(HOME_JOINTS + 0.3, HOME_JOINTS + 0.2))
+        self.assertFalse(ready)
+        from fr3_demo import teleop
+
+        robot = self._robot(HOME_JOINTS + 0.3)
+        with patch.object(teleop, "home_from_guide", return_value=None):  # the session is ending
+            self.assertEqual(
+                teleop.home_before_recording(robot, _replay_args(), MagicMock(), MagicMock, lambda: True), (None, False)
+            )
 
 
 class WaitForGoTest(unittest.TestCase):
