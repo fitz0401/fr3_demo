@@ -22,6 +22,8 @@ from typing import Any
 
 import numpy as np
 
+from fr3_demo.kinematics import forward_kinematics, geometric_jacobian
+
 # The replay records the velocities it commanded, as teleop does.
 REPLAY_ACTION_SOURCE = "replay_joint_velocity_command"
 # Pull back onto the demonstrated path, in 1/s of joint error.
@@ -34,6 +36,26 @@ SETTLE_TOLERANCE_RAD = 0.005
 SETTLE_TIMEOUT_S = 2.0
 # A demo whose gripper opened or closed by more than this (of its full travel) cannot be replayed.
 GRIPPER_MOTION = 0.05
+# A depth offset eases in over the replay's first seconds and out over its last.
+DEPTH_RAMP_S = 1.0
+# How often along the path the offset's joint change is worked out; it is interpolated in between.
+DEPTH_SAMPLE_S = 0.05
+
+
+def contact_point_offset_joints(q: np.ndarray, offset_m: np.ndarray, contact_point_m: np.ndarray) -> np.ndarray:
+    """The joint change that moves the contact point by ``offset_m`` (base frame) without turning the tool.
+
+    ``contact_point_m`` is in the flange frame, as in [contact]. Damped least
+    squares, so it stays bounded near a singularity.
+    """
+
+    pose = forward_kinematics(q)
+    jacobian = geometric_jacobian(q)
+    r = pose[:3, :3] @ np.asarray(contact_point_m, dtype=float)
+    skew = np.array([[0.0, -r[2], r[1]], [r[2], 0.0, -r[0]], [-r[1], r[0], 0.0]])
+    point = np.vstack((jacobian[:3] - skew @ jacobian[3:], jacobian[3:]))
+    target = np.concatenate((np.asarray(offset_m, dtype=float), np.zeros(3)))
+    return point.T @ np.linalg.solve(point @ point.T + 1e-4 * np.eye(6), target)
 
 
 @dataclass(frozen=True)
@@ -63,6 +85,31 @@ class ReplayPath:
         position = np.array([np.interp(elapsed, self.times, self.positions[:, joint]) for joint in range(7)])
         velocity = np.array([np.interp(elapsed, self.times, self.velocities[:, joint]) for joint in range(7)])
         return position, velocity
+
+    def deepened(
+        self, offset_m: np.ndarray, contact_point_m: np.ndarray, ramp_s: float = DEPTH_RAMP_S
+    ) -> ReplayPath:
+        """The same demonstration with the contact point moved by ``offset_m`` (base frame).
+
+        The offset eases in from the start pose and out to the end pose, both
+        of which stay where the demonstration had them, and the tool keeps its
+        demonstrated orientation throughout.
+        """
+
+        offset = np.asarray(offset_m, dtype=float)
+        if not np.any(offset) or len(self.times) < 2:
+            return self
+        duration = self.duration
+        stride = max(1, round(DEPTH_SAMPLE_S * PATH_RATE_HZ))
+        coarse = np.unique(np.append(np.arange(0, len(self.times), stride), len(self.times) - 1))
+        changes = np.stack(
+            [contact_point_offset_joints(self.positions[index], offset, contact_point_m) for index in coarse]
+        )
+        change = np.column_stack([np.interp(self.times, self.times[coarse], changes[:, joint]) for joint in range(7)])
+        edge = np.minimum(self.times, duration - self.times)
+        share = np.clip(edge / ramp_s, 0.0, 1.0) if ramp_s > 0 else np.ones_like(edge)
+        share = 0.5 - 0.5 * np.cos(np.pi * share)  # eases in and out with no jump in velocity
+        return ReplayPath.from_samples(self.source, self.times, self.positions + share[:, None] * change)
 
     @classmethod
     def from_episode(cls, episode: Path) -> ReplayPath:

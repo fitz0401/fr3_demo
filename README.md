@@ -251,14 +251,18 @@ fr3-collect --hand-guide --replay --record-tactile
 
 While you guide the arm, Franka's force estimate mixes your hand with the
 contact. With `--replay`, each demonstration is replayed by the robot alone
-right after you record it, and the replay is recorded too:
+after you record it, and the replay is recorded too:
 
 1. **X** starts recording; guide the demonstration; **X** stops it. End with
    the tool clear of the fruit: the arm next moves straight (in joint space)
-   to where the demonstration started.
-2. Hands off: guide mode stops, the arm streams to the demonstration's start
-   pose and replays it while a new episode records, then homes.
-3. Guide mode comes back on; the next **X** starts the next demonstration.
+   home.
+2. Hands off: guide mode stops and the arm homes, then holds there. Arrange
+   the scene for the replay (turn the lemon to fresh skin, say), keeping
+   clear of the tool.
+3. **X** replays it: the arm moves to where the demonstration started and
+   replays it while a new episode records, then homes. **B** skips the
+   replay instead.
+4. Guide mode comes back on; the next **X** starts the next demonstration.
 
 Nobody touches the arm during a replay, so Franka's force estimate is the
 force of the task itself; it is recorded as `external_wrench` and
@@ -266,7 +270,15 @@ force of the task itself; it is recorded as `external_wrench` and
 camera views too. The replay follows the joint path the arm actually took.
 Where the blade meets resistance the arm is pushed off that path, so the
 replay presses until the blade is where yours was, up to `[contact]
-max_force_n`. It runs under the streaming limits a policy has
+max_force_n`. Because a replay still came out shallower than the
+demonstration, it replays the path `--replay-depth-mm` deeper (1.5 mm by
+default, 0 to 3; 0 replays it as recorded), along `--replay-depth-direction`
+in the robot base frame (default: straight down). The whole tool moves, without
+turning, so the offset does not depend on where exactly the blade is; it eases
+in over the first second and out over the last, so the start and end poses
+are the demonstration's own. The push cap, the gel guard and Franka's contact
+guard bound the force exactly as before, and the replay's metadata records
+the offset. It runs under the streaming limits a policy has
 (`[teleop] max_joint_speed` and `max_joint_acceleration`), so the fast parts
 of a demonstration come out a little smoother.
 
@@ -278,8 +290,8 @@ reaches its limit, when Bamboo's contact guard trips, or when the arm is
 pushed more than `--replay-max-path-error` (0.08 rad) off the path; these
 yield, so the arm goes soft and the load falls. After any stop, guide mode
 comes back where the arm is: free the blade by hand, then **Menu** homes.
-To reset the scene first (a fresh fruit), add `--replay-wait`: the arm then
-waits at the start pose for **X** (**B** skips that replay).
+While the arm waits at home, anything that loads the gel makes it go soft and
+skips that replay, so keep clear of the tool while you arrange the scene.
 
 The replay is an ordinary episode whose actions are the joint velocities the
 robot was commanded (`action_source: replay_joint_velocity_command`). Its

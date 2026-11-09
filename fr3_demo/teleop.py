@@ -23,7 +23,7 @@ from fr3_demo.gel import GelStreamGuard, limit_twist
 from fr3_demo.guide import GuideHeartbeat, choose_guide_mode, describe_guide_failure, hold_message
 from fr3_demo.joystick import JoystickSnapshot, LinuxJoystick, axis, button, shaped_axis
 from fr3_demo.kinematics import WorkspaceBounds, forward_kinematics, resolved_rate_step
-from fr3_demo.replay import PATH_GAIN, REPLAY_ACTION_SOURCE, ReplayPath, link_replay, run_replay
+from fr3_demo.replay import DEPTH_RAMP_S, PATH_GAIN, REPLAY_ACTION_SOURCE, ReplayPath, link_replay, run_replay
 from fr3_demo.settings import default_config_path, load_config, teleop_defaults
 
 LOG = logging.getLogger("fr3_teleop")
@@ -542,6 +542,13 @@ class ReplayControls:
         return "you pressed X or B" if any(self.pressed()) else None
 
 
+def replay_depth_offset(args: argparse.Namespace) -> np.ndarray:
+    """How far the replay moves the contact point beyond the demonstration, in m (base frame)."""
+
+    direction = np.asarray(args.replay_depth_direction, dtype=float)
+    return direction / np.linalg.norm(direction) * args.replay_depth_mm / 1000.0
+
+
 def _end_stream(robot: BambooRobot) -> str | None:
     """Stop the stream; a stream Bamboo already ended reports why instead."""
 
@@ -584,9 +591,13 @@ def _wait_for_go(
     controls: ReplayControls,
     gel_guard: Any | None,
 ) -> str | None:
-    """Hold the start pose until X; None to replay, else why not."""
+    """Hold the arm where it is until X; None to replay, else why not (B skips, Back quits)."""
 
-    print("At the start pose: press X to replay, B to skip it.", flush=True)
+    print(
+        "Home. Arrange the scene for the replay (turn the fruit, say), keeping clear of the tool, "
+        "then press X to replay it; B skips it.",
+        flush=True,
+    )
     controls.mark()
     period = 1.0 / args.stream_rate
     while True:
@@ -602,7 +613,9 @@ def _wait_for_go(
             return "you skipped it with B"
         reason = None if gel_guard is None else gel_guard.check()
         if reason is not None:
-            return reason
+            # Something loaded the gel while the arm held still: go soft rather than hold against it.
+            robot.yield_stream(reason)
+            return f"{reason} while waiting; keep clear of the tool"
         robot.stream_velocity(np.zeros(7))  # keeps the stream's watchdog fed
         remaining = period - (time.monotonic() - started)
         if remaining > 0:
@@ -623,9 +636,11 @@ def replay_from_guide(
 ) -> GuideHeartbeat | None:
     """Replay the demonstration just recorded, record that replay, home, and float the arm again.
 
-    Guide mode stops and one stream, under [contact], takes the arm to the
-    demonstration's start, replays it while the collector records a new
-    episode linked to the demonstration, and homes. The replay stops early
+    Guide mode stops and one stream, under [contact], homes the arm and holds
+    it there while the operator arranges the scene, until X (B skips). Then
+    it takes the arm to the demonstration's start, replays it (deeper by
+    --replay-depth-mm) while the collector records a new episode linked to
+    the demonstration, and homes. The replay stops early
     when the operator asks, when the gel guard objects, when the arm is pushed
     off the path, or when Bamboo's contact guard ends the stream; a stopped
     replay is kept but marked, and is not followed by homing: guide mode
@@ -635,6 +650,9 @@ def replay_from_guide(
 
     try:
         path = ReplayPath.from_episode(demo)
+        offset = replay_depth_offset(args)
+        if np.any(offset):
+            path = path.deepened(offset, args.contact_limits["contact_point"])
     except (OSError, KeyError, ValueError) as error:
         print(f"\nNot replaying {demo.name}: {error}.")
         return heartbeat
@@ -642,7 +660,8 @@ def replay_from_guide(
         heartbeat.stop()
     robot.stop_guide()
     print(
-        f"\nReplaying {demo.name} ({path.duration:.1f} s): hands off the arm. X or B stops the replay, Back quits.",
+        f"\nHoming, then replaying {demo.name} ({path.duration:.1f} s) once you press X: hands off the arm. "
+        "While it moves, X or B stops it and Back quits.",
         flush=True,
     )
     time.sleep(GUIDE_HOME_PAUSE_S)
@@ -659,10 +678,14 @@ def replay_from_guide(
     try:
         robot.apply_contact_limits(args.contact_limits)
         robot.start_stream(args.watchdog_ms, args.max_joint_speed, args.max_joint_acceleration)
-        print("Moving to the demonstration's start...")
-        reason = _guarded_move(robot, args, path.start, interrupted, why_interrupted)
-        if reason is None and args.replay_wait:
+        reason = _guarded_move(robot, args, HOME_JOINTS, interrupted, why_interrupted)
+        homed = reason is None
+        if reason is None:
             reason = _wait_for_go(robot, args, controls, gel_guard)
+        if reason is None:
+            homed = False
+            print("Moving to the demonstration's start...")
+            reason = _guarded_move(robot, args, path.start, interrupted, why_interrupted)
         if reason is not None:
             print(f"Replay skipped: {reason}.")
         else:
@@ -742,6 +765,8 @@ def _record_replay(
         outcome,
         {
             "path_gain": PATH_GAIN,
+            "depth_offset_m": np.round(replay_depth_offset(args), 6).tolist(),
+            "depth_ramp_s": DEPTH_RAMP_S,
             "max_path_error_limit_rad": args.replay_max_path_error,
             "max_joint_speed": args.max_joint_speed,
             "contact_limits": args.contact_limits,
@@ -907,14 +932,27 @@ def _create_parser() -> argparse.ArgumentParser:
         "--replay",
         action="store_true",
         help=(
-            "with --hand-guide: stopping a recording with X replays it on the arm right away (from its start pose, "
-            "under [contact] and the gel guard), records the replay as its own episode, then homes"
+            "with --hand-guide: stopping a recording with X homes the arm and waits for X (B skips); then the arm "
+            "replays the demonstration from its start pose, under [contact] and the gel guard, records the replay "
+            "as its own episode, and homes"
         ),
     )
     parser.add_argument(
-        "--replay-wait",
-        action="store_true",
-        help="with --replay, wait at the demonstration's start pose for X before replaying (B skips)",
+        "--replay-depth-mm",
+        type=float,
+        default=1.5,
+        help=(
+            "replay the contact point this much deeper than demonstrated, in mm (0 to 3; 0 replays the path as "
+            "recorded); the push cap and the gel guard still bound the force (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--replay-depth-direction",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=(0.0, 0.0, -1.0),
+        help="which way is deeper, in the robot base frame (default: straight down)",
     )
     parser.add_argument(
         "--replay-max-path-error",
@@ -1130,9 +1168,12 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         )
     if args.hand_guide and not args.collect:
         parser.error("--hand-guide records demonstrations, so it requires --collect (use fr3-collect --hand-guide)")
-    replay_tuned = args.replay_wait or args.replay_max_path_error != parser.get_default("replay_max_path_error")
+    replay_tuned = any(
+        getattr(args, name) != parser.get_default(name)
+        for name in ("replay_max_path_error", "replay_depth_mm", "replay_depth_direction")
+    )
     if replay_tuned and not args.replay:
-        parser.error("--replay-wait and --replay-max-path-error only apply with --replay")
+        parser.error("--replay-max-path-error and --replay-depth-* only apply with --replay")
     if args.replay:
         if not args.hand_guide:
             parser.error("--replay replays hand-guided demonstrations, so it requires --hand-guide")
@@ -1151,6 +1192,10 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             )
         if not 0.0 < args.replay_max_path_error <= 0.2:
             parser.error("--replay-max-path-error must be in (0, 0.2] rad")
+        if not 0.0 <= args.replay_depth_mm <= 3.0:
+            parser.error("--replay-depth-mm must be between 0 and 3")
+        if not np.linalg.norm(args.replay_depth_direction) > 0.0:
+            parser.error("--replay-depth-direction cannot be zero")
     if not 50 <= args.guide_watchdog_ms <= 500:
         parser.error("--guide-watchdog-ms must be between 50 and 500")
     if args.guide_max_joint_velocity <= 0:
@@ -1415,10 +1460,13 @@ def run(args: argparse.Namespace) -> int:
                 if not guiding_active:
                     raise RuntimeError("--replay needs Bamboo's guide mode; with the Pilot buttons it cannot replay")
                 print(
-                    "Replay: stopping a recording with X replays it on the arm from its start pose, under the "
-                    "contact limits" + (" and the gel guard" if gel is not None else "") + ", records the replay "
-                    "as its own episode, and homes. X or B stops a replay, Back quits."
-                    + (" The arm waits at the start pose for X." if args.replay_wait else "")
+                    "Replay: stopping a recording with X homes the arm and waits there while you arrange the "
+                    "scene; X then replays the demonstration "
+                    + (f"{args.replay_depth_mm:.1f} mm deeper " if args.replay_depth_mm > 0 else "")
+                    + "under the contact limits"
+                    + (" and the gel guard" if gel is not None else "")
+                    + ", records the replay as its own episode, and homes. B skips a replay; while the arm moves, "
+                    "X or B stops it and Back quits."
                 )
 
             def pause_stream() -> None:
