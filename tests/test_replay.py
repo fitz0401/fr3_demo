@@ -634,6 +634,22 @@ class WaitForGoTest(unittest.TestCase):
         reason, _, _ = self._wait([(False, True)])
         self.assertIn("skipped", reason)
 
+    def test_a_tool_turned_in_the_grip_gets_a_heads_up(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+
+        from fr3_demo import teleop
+        from fr3_demo.gel import GelReading
+
+        rest = GelReading(1, 0.0, True, "", 0.4, None, False, (1.0, 0.5), np.radians(3.2), 0.001)
+        guard = MagicMock(**{"check.return_value": None, "monitor.latest.return_value": rest})
+        controls = MagicMock(**{"ending.return_value": None, "pressed.return_value": (True, False)})
+        printed = io.StringIO()
+        with redirect_stdout(printed), patch.object(teleop.time, "sleep"):
+            self.assertIsNone(teleop._wait_for_go(MagicMock(), _replay_args(), controls, guard))
+        self.assertIn("Heads-up", printed.getvalue())
+        self.assertIn("re-grip", printed.getvalue())
+
     def test_a_gel_loaded_while_waiting_makes_the_arm_go_soft(self) -> None:
         reason, robot, _ = self._wait([(False, False)], gel_reason="the gel reached level 1.10")
         robot.yield_stream.assert_called_once_with("the gel reached level 1.10")

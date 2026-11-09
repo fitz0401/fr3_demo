@@ -295,6 +295,25 @@ comes back where the arm is: free the blade by hand, then **Menu** homes.
 While the arm waits at home, anything that loads the gel makes it go soft and
 skips that replay, so keep clear of the tool while you arrange the scene.
 
+**Re-grip when the tool has turned in the grip.** The gel guard measures from
+its last zero, taken when the session starts and after every gripper button.
+Peeling slowly turns a round handle in the grip, and the turn stays in the gel
+at rest (a few degrees of twist after a few cycles), so later strokes start
+that much nearer the limit; this is what stopped a replay at the twist limit.
+`fr3-collect` checks the gel at rest:
+
+- When you press **X** to record and the gel rests above 30% of its limit with
+  nothing touching the tool, recording waits and says why. Re-grip: hold the
+  tool, press **B** (the gripper opens), then **A** (it closes, and the gel
+  re-zeroes on the new grasp), then press **X**.
+- While the arm waits at home to replay, the same check gives a heads-up that
+  the replay starts with less room; re-grip before the next demonstration.
+- A replay the gel guard stopped reminds you to re-grip too.
+
+The GelSight panel shows the same reading at any time: at home with nothing
+touching the tool it should be near 0%. Flat faces on the handle where the
+fingers grip (a printed sleeve, say) keep it from turning in the first place.
+
 The replay is an ordinary episode whose actions are the joint velocities the
 robot was commanded (`action_source: replay_joint_velocity_command`). Its
 metadata names its demonstration (`replay_of`) and says how the replay went

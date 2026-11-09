@@ -19,7 +19,7 @@ import numpy as np
 from bamboo import BambooFrankaClient
 
 from fr3_demo.contact import describe_contact_limits
-from fr3_demo.gel import GelStreamGuard, limit_twist
+from fr3_demo.gel import REGRIP_HOW, REGRIP_LEVEL, GelStreamGuard, limit_twist, regrip_advice
 from fr3_demo.guide import GuideHeartbeat, choose_guide_mode, describe_guide_failure, hold_message
 from fr3_demo.joystick import JoystickSnapshot, LinuxJoystick, axis, button, shaped_axis
 from fr3_demo.kinematics import WorkspaceBounds, forward_kinematics, resolved_rate_step
@@ -643,6 +643,12 @@ def _wait_for_go(
         "then press X to replay it; B skips it.",
         flush=True,
     )
+    advice = None if gel_guard is None else regrip_advice(gel_guard.monitor.latest())
+    if advice is not None:
+        print(
+            f"Heads-up: {advice}, so this replay has less room before the gel guard stops it. "
+            f"Before the next demonstration, re-grip the tool in guide mode: {REGRIP_HOW}."
+        )
     controls.mark()
     period = 1.0 / args.stream_rate
     while True:
@@ -833,6 +839,8 @@ def _record_replay(
     print(f"   {replay.name} is kept, marked as stopped (replay.completed = false in its metadata).")
     if not outcome.by_operator:
         print("   Guide mode comes back where the arm is: free the blade by hand, then Menu homes.")
+        if "gel" in str(outcome.reason).lower():
+            print(f"   If the tool has turned in the grip, re-grip it before the next demonstration: {REGRIP_HOW}.")
     return False
 
 
@@ -1482,7 +1490,9 @@ def run(args: argparse.Namespace) -> int:
                     heartbeat.start()
                     gel_note = (
                         "As the gel's load nears its limit the arm stiffens against loading it further; "
-                        "backing off stays free."
+                        "backing off stays free. If the tool turns or slips in the grip, the gel stays loaded at "
+                        f"rest: above {REGRIP_LEVEL:.0%} of its limit, recording waits until you re-grip it "
+                        "(B, then A)."
                         if gel is not None
                         else "Nothing here limits the force on the gel ([gel] is off)."
                     )
@@ -1669,6 +1679,12 @@ def run(args: argparse.Namespace) -> int:
                             if not ready:
                                 if guiding_active:
                                     print("Not recording: the arm did not get home. Press X to try again.")
+                                continue
+                        if gel is not None and guiding_active:
+                            advice = regrip_advice(gel.latest())
+                            if advice is not None:
+                                rumbler.error()
+                                print(f"\nNot recording yet: {advice}.\nRe-grip it: {REGRIP_HOW}. Then press X.")
                                 continue
                         if args.weigh:
                             print("\nWeigh the bottle and the cup before this demonstration:")

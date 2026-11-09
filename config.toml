@@ -193,7 +193,10 @@ enabled = true
 # fr3-gel-calibrate prints what your pushes reached; at about 7 N along the
 # gripper's closing direction the gel shifted ~10 px.
 shift_limit_px = 15.0
-twist_limit_deg = 6.0
+# Peeling with a round handle twists the gel: demonstrations alone reach about
+# 5.4 deg from where they start, and the tool's resting twist wanders a few
+# degrees between cycles (session 20261109_114512 peaked at 6.0 deg).
+twist_limit_deg = 8.0
 press_limit_percent = 2.0
 # Loading direction, from fr3-gel-calibrate (only its direction is used).
 # Recalibrate after moving the sensor or changing [tactile] rotate_180.

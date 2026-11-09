@@ -303,6 +303,25 @@ class GelMonitor:
         return reading
 
 
+# At rest (at home, nothing touching the tool) the gel should read near zero.
+# A tool that has turned or slipped in the grip leaves it loaded, and every
+# later push starts that much nearer the limit: above this share of it, re-grip.
+REGRIP_LEVEL = 0.3
+REGRIP_HOW = "hold the tool, press B (the gripper opens), then A (it closes, and the gel re-zeroes on the new grasp)"
+
+
+def regrip_advice(reading: GelReading, level: float = REGRIP_LEVEL) -> str | None:
+    """Why to re-grip the tool, when the gel at rest reads past ``level`` of its limit; None otherwise."""
+
+    if not reading.valid or reading.zeroing or reading.level < level:
+        return None
+    return (
+        f"the gel is resting at {reading.level:.0%} of its limit with nothing touching the tool "
+        f"(twist {math.degrees(reading.twist_rad):+.1f} deg, shift {np.hypot(*reading.shift_px):.1f} px, "
+        f"pressed {100 * reading.spread:.1f}%): the tool has turned or slipped in the grip since the gel was zeroed"
+    )
+
+
 class GelStreamGuard:
     """When a stream (teleop or a policy) must yield because of the gel.
 
