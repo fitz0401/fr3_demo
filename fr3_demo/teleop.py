@@ -844,6 +844,37 @@ def _record_replay(
     return False
 
 
+def describe_collection_failure(session_dir: Path, error: BaseException) -> str:
+    """Say, the moment collection fails, what failed and which episodes are kept or lost.
+
+    An episode being recorded cannot be completed once a stream it needs stops
+    (the GelSight, a camera): its checks fail, so it stays an incomplete
+    .inprogress folder that conversion never takes. Episodes finished before
+    are complete and untouched.
+    """
+
+    saved = sorted(path.name for path in session_dir.glob("episode_*") if not path.name.endswith(".inprogress"))
+    lost = sorted(path.name for path in session_dir.glob("episode_*.inprogress"))
+    lines = [f"\n⛔ Collection stopped: {error}"]
+    if "tactile" in str(error).lower():
+        lines.append(
+            "   The GelSight stopped sending frames: its USB connection most likely dropped. Check the cable, "
+            "and that fr3-tactile-check lists it again before restarting."
+        )
+    for name in lost:
+        lines.append(
+            f"   {name} was being recorded: it cannot be completed, is kept only as an incomplete folder, "
+            "and is never converted."
+        )
+    lines.append(
+        f"   Saved and complete: {len(saved)} episode(s)"
+        + (f", {saved[0]} to {saved[-1]}" if saved else "")
+        + f", in {session_dir}."
+    )
+    lines.append("   The session stops now.")
+    return "\n".join(lines)
+
+
 def _pose_error(model: np.ndarray, measured: np.ndarray) -> tuple[float, float]:
     position_error = float(np.linalg.norm(model[:3, 3] - measured[:3, 3]))
     difference = model[:3, :3].T @ measured[:3, :3]
@@ -1887,6 +1918,16 @@ def run(args: argparse.Namespace) -> int:
             if collector is not None:
                 print(f"Add language with: fr3-annotate --data-dir {collector.session_dir}")
             return 0
+    except Exception as error:
+        # Say it now, not after shutdown: what stopped, and what is kept.
+        if collector is not None:
+            print(describe_collection_failure(collector.session_dir, error), flush=True)
+            if rumbler is not None:
+                try:
+                    rumbler.error()
+                except Exception as rumble_error:  # noqa: BLE001 - a missing rumble must not hide the failure
+                    LOG.debug("Could not rumble: %s", rumble_error)
+        raise
     finally:
         print("\nShutting down (Ctrl-C again to force quit)...", flush=True)
         faulthandler.dump_traceback_later(SHUTDOWN_TIMEOUT_S, exit=True)

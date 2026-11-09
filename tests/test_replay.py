@@ -744,3 +744,29 @@ class ReplayFlagTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CollectionFailureTest(unittest.TestCase):
+    def test_it_says_what_stopped_and_which_episodes_are_kept_or_lost(self) -> None:
+        from fr3_demo.teleop import describe_collection_failure
+
+        with tempfile.TemporaryDirectory() as temporary:
+            session = Path(temporary)
+            for name in ("episode_000000", "episode_000001", "episode_000002.inprogress"):
+                (session / name).mkdir()
+            error = RuntimeError("Tactile capture failed: Tactile sensor stopped delivering frames")
+            message = describe_collection_failure(session, error)
+        self.assertIn("Tactile capture failed", message)
+        self.assertIn("USB connection most likely dropped", message)
+        self.assertIn("episode_000002.inprogress was being recorded", message)
+        self.assertIn("never converted", message)
+        self.assertIn("2 episode(s), episode_000000 to episode_000001", message)
+
+    def test_a_failure_between_episodes_loses_nothing(self) -> None:
+        from fr3_demo.teleop import describe_collection_failure
+
+        with tempfile.TemporaryDirectory() as temporary:
+            message = describe_collection_failure(Path(temporary), RuntimeError("Joystick disconnected"))
+        self.assertNotIn("being recorded", message)
+        self.assertNotIn("GelSight", message)
+        self.assertIn("0 episode(s)", message)
