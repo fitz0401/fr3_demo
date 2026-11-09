@@ -263,7 +263,10 @@ after you record it, and the replay is recorded too:
    clear of the tool.
 3. **X** replays it: the arm settles onto where the demonstration started
    (within 0.003 rad, about 1 mm at the blade) and replays it while a new
-   episode records, then homes. **B** skips the replay instead.
+   episode records, then homes. **Menu** skips the replay instead. **B** and
+   **A** open and close the gripper here, as in guide mode, to re-grip the
+   tool (the gel re-zeroes after it); **X** replays only once the gel reads
+   trustworthy.
 4. Guide mode comes back on; the next **X** starts the next demonstration.
 
 Nobody touches the arm during a replay, so Franka's force estimate is the
@@ -294,6 +297,15 @@ yield, so the arm goes soft and the load falls. After any stop, guide mode
 comes back where the arm is: free the blade by hand, then **Menu** homes.
 While the arm waits at home, anything that loads the gel makes it go soft and
 skips that replay, so keep clear of the tool while you arrange the scene.
+
+**When the gel loses its markers** ("the gel signal is not trustworthy (lost
+track …)"): a tool let go at the end of a stroke can spring back in the grip
+faster than the marker tracker follows. That says nothing about the data
+already recorded, but the tracker cannot find the markers again until the gel
+is re-zeroed, so re-grip the tool: at home while the arm waits to replay
+(**B**, then **A**, then **X**), or in guide mode. Homing does not stop for
+it; only a gel that reads loaded does. Re-gripping between a demonstration
+and its replay is fine: the replay records its own grasp, gel and force.
 
 **Re-grip when the tool has turned in the grip.** The gel guard measures from
 its last zero, taken when the session starts and after every gripper button.

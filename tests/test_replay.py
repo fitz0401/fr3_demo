@@ -19,7 +19,7 @@ from fr3_demo.replay import (
     replay_command,
     run_replay,
 )
-from fr3_demo.teleop import HOME_JOINTS, Mapping, ReplayControls, _create_parser, _validate_args
+from fr3_demo.teleop import HOME_JOINTS, Mapping, ReplayControls, ReplayPresses, _create_parser, _validate_args
 
 START = np.array([0.0, -0.7, 0.0, -2.3, 0.0, 1.6, 0.8])
 
@@ -384,10 +384,13 @@ class ExternalForceRecordingTest(unittest.TestCase):
         self.assertEqual(metadata["replay_of"], "episode_000000")
 
 
-def _snapshot(x: int = 0, b: int = 0, back: bool = False, connected: bool = True) -> JoystickSnapshot:
+def _snapshot(
+    x: int = 0, b: int = 0, back: bool = False, connected: bool = True, a: int = 0, menu: int = 0
+) -> JoystickSnapshot:
     mapping = Mapping()
     counts = [0] * 12
     counts[mapping.record_button], counts[mapping.open_button] = x, b
+    counts[mapping.close_button], counts[mapping.home_button] = a, menu
     buttons = [False] * 12
     buttons[mapping.quit_button] = back
     return JoystickSnapshot((0.0,) * 6, tuple(buttons), tuple(counts), connected, "pad", 0.0)
@@ -399,8 +402,8 @@ class ReplayControlsTest(unittest.TestCase):
         joystick.snapshot.return_value = _snapshot(x=1)
         controls = ReplayControls(joystick, Mapping(), lambda: False)
         self.assertIsNone(controls.stop_reason())
-        joystick.snapshot.return_value = _snapshot(x=1, b=1)
-        self.assertEqual(controls.pressed(), (False, True))
+        joystick.snapshot.return_value = _snapshot(x=1, b=1, menu=1)
+        self.assertEqual(controls.presses(), ReplayPresses(x=False, b=True, a=False, menu=True))
         self.assertIsNotNone(controls.stop_reason())
         self.assertFalse(controls.quit)
         controls.mark()
@@ -444,7 +447,9 @@ def _replay_args(**overrides) -> argparse.Namespace:
 
 
 class ReplayFromGuideTest(unittest.TestCase):
-    def _run(self, robot, args, *, outcome=None, homing=None, path_error=None, controls=None, wait=None):
+    def _run(
+        self, robot, args, *, outcome=None, homing=None, path_error=None, controls=None, wait=None, gel_guard=None
+    ):
         from fr3_demo import teleop
 
         path = MagicMock(duration=4.0, start=START)
@@ -463,7 +468,15 @@ class ReplayFromGuideTest(unittest.TestCase):
             patch.object(teleop.time, "sleep"),
         ):
             result = teleop.replay_from_guide(
-                robot, args, Path("/tmp/session/episode_000000"), collector, old, lambda: new, controls, lambda: False
+                robot,
+                args,
+                Path("/tmp/session/episode_000000"),
+                collector,
+                old,
+                lambda: new,
+                controls,
+                lambda: False,
+                gel_guard,
             )
         return result, {
             "old": old,
@@ -547,9 +560,52 @@ class ReplayFromGuideTest(unittest.TestCase):
         robot.stop_stream.assert_called_once_with()
         self.assertIs(result, parts["new"])
 
-    def test_b_at_home_skips_the_replay(self) -> None:
+    def test_homing_carries_on_when_the_gel_only_lost_its_markers(self) -> None:
+        from fr3_demo import teleop
+
+        def homing(*_args, stop_requested, **_kwargs):
+            if stop_requested():
+                raise InterruptedError("Homing interrupted")
+
+        for overload, replayed in ((None, True), ("the gel reached level 1.05", False)):
+            guard = MagicMock()
+            regripped = []
+            # Untrustworthy (lost track) until the operator re-grips at home.
+            guard.check.side_effect = lambda regripped=regripped: (
+                None if regripped else "the GelSight signal is not trustworthy"
+            )
+            guard.overload.return_value = overload
+            collector = MagicMock()
+            path = MagicMock(duration=4.0, start=START)
+            path.deepened.return_value = path
+            controls = MagicMock(quit=False, **{"stop_reason.return_value": None})
+            with (
+                patch.object(teleop.ReplayPath, "from_episode", return_value=path),
+                patch.object(teleop, "stream_home", side_effect=homing),
+                patch.object(teleop, "run_replay", return_value=ReplayOutcome(True, None, 4.0, 0.004)),
+                patch.object(teleop, "link_replay"),
+                patch.object(
+                    teleop, "_wait_for_go", side_effect=lambda *_a, regripped=regripped, **_k: regripped.append(1)
+                ),
+                patch.object(teleop.time, "sleep"),
+            ):
+                teleop.replay_from_guide(
+                    MagicMock(),
+                    _replay_args(),
+                    Path("/tmp/s/episode_000000"),
+                    collector,
+                    MagicMock(),
+                    MagicMock,
+                    controls,
+                    lambda: False,
+                    guard,
+                )
+            with self.subTest(overload=overload):
+                self.assertEqual(collector.start_episode.called, replayed)
+
+    def test_menu_at_home_skips_the_replay(self) -> None:
         robot = MagicMock()
-        result, parts = self._run(robot, _replay_args(), wait="you skipped it with B")
+        result, parts = self._run(robot, _replay_args(), wait="you skipped it with Menu")
         parts["wait"].assert_called_once()
         self.assertEqual(parts["home"].call_count, 1)  # it stays home
         parts["collector"].start_episode.assert_not_called()
@@ -613,45 +669,70 @@ class HomeBeforeRecordingTest(unittest.TestCase):
             )
 
 
+def _gel_reading(level=0.1, *, valid=True, zeroing=False, reason=""):
+    from fr3_demo.gel import GelReading
+
+    return GelReading(1, 0.0, valid, reason, level, None, zeroing, (1.0, 0.5), np.radians(1.0), 0.001)
+
+
 class WaitForGoTest(unittest.TestCase):
-    def _wait(self, presses, gel_reason=None):
-        from fr3_demo import teleop
-
-        controls = MagicMock()
-        controls.ending.return_value = None
-        controls.pressed.side_effect = presses
-        guard = None if gel_reason is None else MagicMock(**{"check.return_value": gel_reason})
-        robot = MagicMock()
-        with patch.object(teleop.time, "sleep"):
-            reason = teleop._wait_for_go(robot, _replay_args(), controls, guard)
-        return reason, robot, controls
-
-    def test_x_replays_and_b_skips(self) -> None:
-        reason, robot, controls = self._wait([(False, False), (False, False), (True, False)])
-        self.assertIsNone(reason)
-        self.assertEqual(robot.stream_velocity.call_count, 2)  # held still until X
-        self.assertEqual(controls.mark.call_count, 2)  # the X that starts it does not also stop it
-        reason, _, _ = self._wait([(False, True)])
-        self.assertIn("skipped", reason)
-
-    def test_a_tool_turned_in_the_grip_gets_a_heads_up(self) -> None:
+    def _wait(self, presses, readings=None, overload=None):
         import io
         from contextlib import redirect_stdout
 
         from fr3_demo import teleop
-        from fr3_demo.gel import GelReading
 
-        rest = GelReading(1, 0.0, True, "", 0.4, None, False, (1.0, 0.5), np.radians(3.2), 0.001)
-        guard = MagicMock(**{"check.return_value": None, "monitor.latest.return_value": rest})
-        controls = MagicMock(**{"ending.return_value": None, "pressed.return_value": (True, False)})
-        printed = io.StringIO()
+        controls = MagicMock()
+        controls.ending.return_value = None
+        controls.presses.side_effect = presses
+        guard = MagicMock()
+        guard.overload.return_value = overload
+        readings = readings or [_gel_reading()]
+        guard.monitor.latest.side_effect = readings + [readings[-1]] * 20
+        robot, collector, printed = MagicMock(), MagicMock(), io.StringIO()
         with redirect_stdout(printed), patch.object(teleop.time, "sleep"):
-            self.assertIsNone(teleop._wait_for_go(MagicMock(), _replay_args(), controls, guard))
-        self.assertIn("Heads-up", printed.getvalue())
-        self.assertIn("re-grip", printed.getvalue())
+            reason = teleop._wait_for_go(robot, _replay_args(), controls, guard, collector)
+        return reason, robot, controls, guard, printed.getvalue()
+
+    def test_x_replays_and_menu_skips(self) -> None:
+        none, go = ReplayPresses(), ReplayPresses(x=True)
+        reason, robot, controls, _, _ = self._wait([none, none, go])
+        self.assertIsNone(reason)
+        self.assertEqual(robot.stream_velocity.call_count, 2)  # held still until X
+        self.assertEqual(controls.mark.call_count, 2)  # the X that starts it does not also stop it
+        reason, *_ = self._wait([ReplayPresses(menu=True)])
+        self.assertIn("skipped it with Menu", reason)
+
+    def test_b_and_a_re_grip_the_tool_and_re_zero_the_gel(self) -> None:
+        reason, robot, _, guard, _ = self._wait([ReplayPresses(b=True), ReplayPresses(a=True), ReplayPresses(x=True)])
+        self.assertIsNone(reason)
+        robot.open_gripper.assert_called_once_with()
+        robot.close_gripper.assert_called_once_with()
+        self.assertEqual(guard.monitor.suspend.call_count, 2)
+        self.assertEqual(guard.monitor.rezero.call_count, 2)
+
+    def test_x_waits_for_the_gel_to_read_trustworthy(self) -> None:
+        lost = _gel_reading(valid=False, reason="lost track (0.46 s since the last tracked frame)")
+        presses = [ReplayPresses(x=True), ReplayPresses(), ReplayPresses(x=True)]
+        reason, robot, _, _, printed = self._wait(presses, readings=[lost, lost, lost, _gel_reading()])
+        self.assertIsNone(reason)
+        self.assertIn("Not replaying yet", printed)
+        robot.yield_stream.assert_not_called()
+
+    def test_a_gel_that_only_lost_its_markers_does_not_skip_the_replay(self) -> None:
+        lost = _gel_reading(valid=False, reason="lost track")
+        reason, robot, _, _, printed = self._wait([ReplayPresses(), ReplayPresses(menu=True)], readings=[lost])
+        self.assertIn("Menu", reason)  # skipped only because Menu was pressed
+        self.assertIn("re-grip the tool before the replay", printed)
+        robot.yield_stream.assert_not_called()
+
+    def test_a_tool_turned_in_the_grip_gets_a_heads_up(self) -> None:
+        reason, *_, printed = self._wait([ReplayPresses(x=True)], readings=[_gel_reading(0.4)])
+        self.assertIsNone(reason)
+        self.assertIn("Heads-up", printed)
 
     def test_a_gel_loaded_while_waiting_makes_the_arm_go_soft(self) -> None:
-        reason, robot, _ = self._wait([(False, False)], gel_reason="the gel reached level 1.10")
+        reason, robot, *_ = self._wait([ReplayPresses()], overload="the gel reached level 1.10")
         robot.yield_stream.assert_called_once_with("the gel reached level 1.10")
         self.assertIn("keep clear of the tool", reason)
 

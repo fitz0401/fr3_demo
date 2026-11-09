@@ -534,12 +534,22 @@ def restart_guide(
     return heartbeat
 
 
+@dataclass(frozen=True)
+class ReplayPresses:
+    """Which buttons were pressed since the controls were last marked."""
+
+    x: bool = False
+    b: bool = False
+    a: bool = False
+    menu: bool = False
+
+
 class ReplayControls:
     """The joystick while a replay runs: X or B stops it, Back stops it and ends the session.
 
     Only presses made after ``mark`` count, so the X that ended the
-    demonstration does not stop its replay. When waiting at the start pose, X
-    starts the replay and B skips it.
+    demonstration does not stop its replay. While the arm waits at home, X
+    starts the replay, Menu skips it, and B and A open and close the gripper.
     """
 
     def __init__(self, joystick: LinuxJoystick, mapping: Mapping, session_ending: Callable[[], bool]) -> None:
@@ -549,19 +559,21 @@ class ReplayControls:
         self.quit = False
         self.mark()
 
-    def _counts(self, snapshot: JoystickSnapshot) -> tuple[int, int]:
-        return snapshot.press_counts[self._mapping.record_button], snapshot.press_counts[self._mapping.open_button]
+    def _counts(self, snapshot: JoystickSnapshot) -> tuple[int, int, int, int]:
+        mapping = self._mapping
+        buttons = (mapping.record_button, mapping.open_button, mapping.close_button, mapping.home_button)
+        return tuple(snapshot.press_counts[index] for index in buttons)  # type: ignore[return-value]
 
     def mark(self) -> None:
         """Forget the presses made so far."""
 
         self._marks = self._counts(self._joystick.snapshot())
 
-    def pressed(self) -> tuple[bool, bool]:
-        """Whether X and B were pressed since ``mark``."""
+    def presses(self) -> ReplayPresses:
+        """Which of X, B, A and Menu were pressed since ``mark``."""
 
-        x, b = self._counts(self._joystick.snapshot())
-        return x > self._marks[0], b > self._marks[1]
+        now = self._counts(self._joystick.snapshot())
+        return ReplayPresses(*(count > mark for count, mark in zip(now, self._marks, strict=True)))
 
     def ending(self) -> str | None:
         """Why the whole session must stop, if it must."""
@@ -582,7 +594,8 @@ class ReplayControls:
         ending = self.ending()
         if ending is not None:
             return ending
-        return "you pressed X or B" if any(self.pressed()) else None
+        presses = self.presses()
+        return "you pressed X or B" if presses.x or presses.b else None
 
 
 def replay_depth_offset(args: argparse.Namespace) -> np.ndarray:
@@ -630,25 +643,48 @@ def _guarded_move(
     return None
 
 
+def _move_gripper(robot: BambooRobot, close: bool, gel_guard: Any | None, collector: Any | None) -> None:
+    """Open or close the gripper while the arm holds still; the gel re-zeroes after it, as in guide mode."""
+
+    robot.stream_velocity(np.zeros(7))
+    monitor = None if gel_guard is None else gel_guard.monitor
+    if collector is not None:
+        collector.set_gripper_action(0.0 if close else 1.0)
+    if monitor is not None:
+        monitor.suspend("the gripper is moving")
+    try:
+        robot.close_gripper() if close else robot.open_gripper()
+    finally:
+        if monitor is not None:
+            monitor.rezero()
+    if collector is not None:
+        collector.set_gripper_observation(robot.gripper_position())
+
+
 def _wait_for_go(
     robot: BambooRobot,
     args: argparse.Namespace,
     controls: ReplayControls,
     gel_guard: Any | None,
+    collector: Any | None = None,
 ) -> str | None:
-    """Hold the arm where it is until X; None to replay, else why not (B skips, Back quits)."""
+    """Hold the arm at home until X; None to replay, else why not (Menu skips, Back quits).
+
+    B and A open and close the gripper here as in guide mode, so a gel that lost
+    its markers when the tool was let go can be re-zeroed by a re-grip before
+    the replay; X replays only once the gel reads trustworthy.
+    """
 
     print(
-        "Home. Arrange the scene for the replay (turn the fruit, say), keeping clear of the tool, "
-        "then press X to replay it; B skips it.",
+        "Home. Arrange the scene for the replay (turn the fruit, say), keeping clear of the tool. X replays it, "
+        f"Menu skips it. To re-grip the tool first: {REGRIP_HOW}.",
         flush=True,
     )
-    advice = None if gel_guard is None else regrip_advice(gel_guard.monitor.latest())
+    monitor = None if gel_guard is None else gel_guard.monitor
+    advice = None if monitor is None else regrip_advice(monitor.latest())
     if advice is not None:
-        print(
-            f"Heads-up: {advice}, so this replay has less room before the gel guard stops it. "
-            f"Before the next demonstration, re-grip the tool in guide mode: {REGRIP_HOW}."
-        )
+        print(f"Heads-up: {advice}. Re-grip it now for the full margin.")
+    told_untrusted = False
     controls.mark()
     period = 1.0 / args.stream_rate
     while True:
@@ -656,17 +692,35 @@ def _wait_for_go(
         ending = controls.ending()
         if ending is not None:
             return ending
-        go, skip = controls.pressed()
-        if go:
+        presses = controls.presses()
+        if presses.menu:
+            return "you skipped it with Menu"
+        if presses.b or presses.a:
             controls.mark()
-            return None
-        if skip:
-            return "you skipped it with B"
-        reason = None if gel_guard is None else gel_guard.check()
-        if reason is not None:
+            try:
+                _move_gripper(robot, presses.a, gel_guard, collector)
+            except RuntimeError as error:  # a session without the gripper, or the gripper refusing
+                print(f"The gripper did not move: {error}.")
+            else:
+                print("Gripper closed; the gel re-zeroes once it settles." if presses.a else "Gripper open.")
+            told_untrusted = False
+            continue
+        reading = None if monitor is None else monitor.latest()
+        untrusted = reading is not None and (not reading.valid or reading.zeroing)
+        if presses.x:
+            controls.mark()
+            if not untrusted:
+                return None
+            print(f"Not replaying yet: the gel signal is not trustworthy ({reading.reason}). Re-grip the tool, "
+                  "then press X.")
+        elif untrusted and not reading.zeroing and not told_untrusted:
+            print(f"The gel lost its markers ({reading.reason}): re-grip the tool before the replay ({REGRIP_HOW}).")
+            told_untrusted = True
+        overload = None if gel_guard is None else gel_guard.overload()
+        if overload is not None:
             # Something loaded the gel while the arm held still: go soft rather than hold against it.
-            robot.yield_stream(reason)
-            return f"{reason} while waiting; keep clear of the tool"
+            robot.yield_stream(overload)
+            return f"{overload} while waiting; keep clear of the tool"
         robot.stream_velocity(np.zeros(7))  # keeps the stream's watchdog fed
         remaining = period - (time.monotonic() - started)
         if remaining > 0:
@@ -724,15 +778,24 @@ def replay_from_guide(
         reason = controls.stop_reason() or (None if gel_guard is None else gel_guard.check())
         return reason or "it was interrupted"
 
+    # Homing is in free air: a gel that only lost its markers (the tool springing
+    # back when let go) is no reason to stop it and lose the replay; a loaded one is.
+    def homing_interrupted() -> bool:
+        return controls.stop_reason() is not None or (gel_guard is not None and gel_guard.overload() is not None)
+
+    def why_homing_interrupted() -> str:
+        reason = controls.stop_reason() or (None if gel_guard is None else gel_guard.overload())
+        return reason or "it was interrupted"
+
     homed = False
     stopped = True
     try:
         robot.apply_contact_limits(args.contact_limits)
         robot.start_stream(args.watchdog_ms, args.max_joint_speed, args.max_joint_acceleration)
-        reason = _guarded_move(robot, args, HOME_JOINTS, interrupted, why_interrupted)
+        reason = _guarded_move(robot, args, HOME_JOINTS, homing_interrupted, why_homing_interrupted)
         homed = reason is None
         if reason is None:
-            reason = _wait_for_go(robot, args, controls, gel_guard)
+            reason = _wait_for_go(robot, args, controls, gel_guard, collector)
         if reason is None:
             homed = False
             print("Moving to the demonstration's start...")
@@ -745,7 +808,7 @@ def replay_from_guide(
             stopped = not _record_replay(robot, args, path, demo, collector, controls, gel_guard, rumbler)
             if not stopped:
                 print("Homing...")
-                reason = _guarded_move(robot, args, HOME_JOINTS, interrupted, why_interrupted)
+                reason = _guarded_move(robot, args, HOME_JOINTS, homing_interrupted, why_homing_interrupted)
                 homed = reason is None
                 if not homed:
                     print(f"Homing stopped: {reason}.")
@@ -1554,8 +1617,8 @@ def run(args: argparse.Namespace) -> int:
                     + (f"{args.replay_depth_mm:.1f} mm deeper " if args.replay_depth_mm > 0 else "")
                     + "under the contact limits"
                     + (" and the gel guard" if gel is not None else "")
-                    + ", records the replay as its own episode, and homes. B skips a replay; while the arm moves, "
-                    "X or B stops it and Back quits."
+                    + ", records the replay as its own episode, and homes. While it waits at home, B and A re-grip "
+                    "the tool and Menu skips the replay; while the arm moves, X or B stops it and Back quits."
                 )
 
             def pause_stream() -> None:

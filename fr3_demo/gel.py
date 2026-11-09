@@ -350,6 +350,21 @@ class GelStreamGuard:
         self._zero_started = None
         if not reading.valid:
             return f"the GelSight signal is not trustworthy ({reading.reason})"
+        return self._overload(reading)
+
+    def overload(self) -> str | None:
+        """A reason only when the gel reads trustworthy and at its limit: a real load.
+
+        For moves in free air (homing), where a gel that has merely lost its
+        markers is no reason to stop, but a loaded one is.
+        """
+
+        reading = self.monitor.latest()
+        if not reading.valid or reading.zeroing:
+            return None
+        return self._overload(reading)
+
+    def _overload(self, reading: GelReading) -> str | None:
         if reading.level >= self.stop_level:
             return (
                 f"the gel reached level {reading.level:.2f} (shift {np.hypot(*reading.shift_px):.1f} px, "
