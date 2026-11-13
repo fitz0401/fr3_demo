@@ -435,3 +435,25 @@ class CalibrationRunTest(unittest.TestCase):
             {"shear_to_force": [[0.5, 0.0], [0.0, 0.0], [0.0, -0.5]], "twist_to_force": [100.0, 0.0, 0.0]}
         )
         np.testing.assert_allclose(new.load(_estimate(twist=0.02)), [2.0, 0.0, 0.0])
+
+
+class RegripAdviceTest(unittest.TestCase):
+    def _reading(self, level, *, valid=True, zeroing=False):
+        from fr3_demo.gel import GelReading
+
+        return GelReading(1, 0.0, valid, "", level, None, zeroing, (2.0, 1.0), np.radians(3.1), 0.002)
+
+    def test_a_gel_left_loaded_at_rest_asks_for_a_re_grip(self) -> None:
+        from fr3_demo.gel import REGRIP_LEVEL, regrip_advice
+
+        self.assertIsNone(regrip_advice(self._reading(REGRIP_LEVEL - 0.01)))
+        advice = regrip_advice(self._reading(0.39))
+        self.assertIn("39%", advice)
+        self.assertIn("twist +3.1 deg", advice)
+        self.assertIn("turned or slipped in the grip", advice)
+
+    def test_no_advice_while_the_gel_cannot_say(self) -> None:
+        from fr3_demo.gel import regrip_advice
+
+        self.assertIsNone(regrip_advice(self._reading(0.9, valid=False)))
+        self.assertIsNone(regrip_advice(self._reading(0.9, zeroing=True)))

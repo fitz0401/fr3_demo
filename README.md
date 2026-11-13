@@ -251,14 +251,23 @@ fr3-collect --hand-guide --replay --record-tactile
 
 While you guide the arm, Franka's force estimate mixes your hand with the
 contact. With `--replay`, each demonstration is replayed by the robot alone
-right after you record it, and the replay is recorded too:
+after you record it, and the replay is recorded too:
 
-1. **X** starts recording; guide the demonstration; **X** stops it. End with
-   the tool clear of the fruit: the arm next moves straight (in joint space)
-   to where the demonstration started.
-2. Hands off: guide mode stops, the arm streams to the demonstration's start
-   pose and replays it while a new episode records, then homes.
-3. Guide mode comes back on; the next **X** starts the next demonstration.
+1. **X** starts recording, always at home: if the arm is elsewhere (the
+   first demonstration of a session, say), it homes first, hands off, and
+   recording starts once it is there. Guide the demonstration; **X** stops
+   it. End with the tool clear of the fruit: the arm next moves straight (in
+   joint space) home.
+2. Hands off: guide mode stops and the arm homes, then holds there. Arrange
+   the scene for the replay (turn the lemon to fresh skin, say), keeping
+   clear of the tool.
+3. **X** replays it: the arm settles onto where the demonstration started
+   (within 0.003 rad, about 1 mm at the blade) and replays it while a new
+   episode records, then homes. **Menu** skips the replay instead. **B** and
+   **A** open and close the gripper here, as in guide mode, to re-grip the
+   tool (the gel re-zeroes after it); **X** replays only once the gel reads
+   trustworthy.
+4. Guide mode comes back on; the next **X** starts the next demonstration.
 
 Nobody touches the arm during a replay, so Franka's force estimate is the
 force of the task itself; it is recorded as `external_wrench` and
@@ -266,7 +275,15 @@ force of the task itself; it is recorded as `external_wrench` and
 camera views too. The replay follows the joint path the arm actually took.
 Where the blade meets resistance the arm is pushed off that path, so the
 replay presses until the blade is where yours was, up to `[contact]
-max_force_n`. It runs under the streaming limits a policy has
+max_force_n`. Because a replay still came out shallower than the
+demonstration, it replays the path `--replay-depth-mm` deeper (1.5 mm by
+default, 0 to 3; 0 replays it as recorded), along `--replay-depth-direction`
+in the robot base frame (default: straight down). The whole tool moves, without
+turning, so the offset does not depend on where exactly the blade is; it eases
+in over the first second and out over the last, so the start and end poses
+are the demonstration's own. The push cap, the gel guard and Franka's contact
+guard bound the force exactly as before, and the replay's metadata records
+the offset. It runs under the streaming limits a policy has
 (`[teleop] max_joint_speed` and `max_joint_acceleration`), so the fast parts
 of a demonstration come out a little smoother.
 
@@ -278,8 +295,36 @@ reaches its limit, when Bamboo's contact guard trips, or when the arm is
 pushed more than `--replay-max-path-error` (0.08 rad) off the path; these
 yield, so the arm goes soft and the load falls. After any stop, guide mode
 comes back where the arm is: free the blade by hand, then **Menu** homes.
-To reset the scene first (a fresh fruit), add `--replay-wait`: the arm then
-waits at the start pose for **X** (**B** skips that replay).
+While the arm waits at home, anything that loads the gel makes it go soft and
+skips that replay, so keep clear of the tool while you arrange the scene.
+
+**When the gel loses its markers** ("the gel signal is not trustworthy (lost
+track …)"): a tool let go at the end of a stroke can spring back in the grip
+faster than the marker tracker follows. That says nothing about the data
+already recorded, but the tracker cannot find the markers again until the gel
+is re-zeroed, so re-grip the tool: at home while the arm waits to replay
+(**B**, then **A**, then **X**), or in guide mode. Homing does not stop for
+it; only a gel that reads loaded does. Re-gripping between a demonstration
+and its replay is fine: the replay records its own grasp, gel and force.
+
+**Re-grip when the tool has turned in the grip.** The gel guard measures from
+its last zero, taken when the session starts and after every gripper button.
+Peeling slowly turns a round handle in the grip, and the turn stays in the gel
+at rest (a few degrees of twist after a few cycles), so later strokes start
+that much nearer the limit; this is what stopped a replay at the twist limit.
+`fr3-collect` checks the gel at rest:
+
+- When you press **X** to record and the gel rests above 30% of its limit with
+  nothing touching the tool, recording waits and says why. Re-grip: hold the
+  tool, press **B** (the gripper opens), then **A** (it closes, and the gel
+  re-zeroes on the new grasp), then press **X**.
+- While the arm waits at home to replay, the same check gives a heads-up that
+  the replay starts with less room; re-grip before the next demonstration.
+- A replay the gel guard stopped reminds you to re-grip too.
+
+The GelSight panel shows the same reading at any time: at home with nothing
+touching the tool it should be near 0%. Flat faces on the handle where the
+fingers grip (a printed sleeve, say) keep it from turning in the first place.
 
 The replay is an ordinary episode whose actions are the joint velocities the
 robot was commanded (`action_source: replay_joint_velocity_command`). Its

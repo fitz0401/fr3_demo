@@ -160,6 +160,17 @@ class HoldMessageTest(unittest.TestCase):
         gel = hold_message({"guide_phase": "hold", "guide_hold_reason": "gel_invalid"}, "lost track")
         self.assertIn("lost track", gel)
 
+    def test_gel_holds_say_that_a_tool_moved_by_hand_needs_a_re_grip(self) -> None:
+        # A hold latches, so the gel can read fine again by the time it is reported.
+        brief = hold_message({"guide_phase": "hold", "guide_hold_reason": "gel_invalid"}, "")
+        self.assertIn("briefly", brief)
+        limit = hold_message({"guide_phase": "hold", "guide_hold_reason": "gel_limit"})
+        for message in (brief, limit):
+            self.assertIn("RB", message)
+            self.assertIn("re-grip it (B, then A)", message)
+        explained = hold_message({"guide_phase": "hold", "guide_hold_reason": "gel_invalid"}, "lost track")
+        self.assertNotIn("re-grip", explained)  # it already says B re-zeroes
+
 
 class GuideConfigTest(unittest.TestCase):
     def test_guide_and_payload_sections_map_to_flags(self) -> None:

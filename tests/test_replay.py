@@ -19,7 +19,7 @@ from fr3_demo.replay import (
     replay_command,
     run_replay,
 )
-from fr3_demo.teleop import Mapping, ReplayControls, _create_parser, _validate_args
+from fr3_demo.teleop import HOME_JOINTS, Mapping, ReplayControls, ReplayPresses, _create_parser, _validate_args
 
 START = np.array([0.0, -0.7, 0.0, -2.3, 0.0, 1.6, 0.8])
 
@@ -384,10 +384,13 @@ class ExternalForceRecordingTest(unittest.TestCase):
         self.assertEqual(metadata["replay_of"], "episode_000000")
 
 
-def _snapshot(x: int = 0, b: int = 0, back: bool = False, connected: bool = True) -> JoystickSnapshot:
+def _snapshot(
+    x: int = 0, b: int = 0, back: bool = False, connected: bool = True, a: int = 0, menu: int = 0
+) -> JoystickSnapshot:
     mapping = Mapping()
     counts = [0] * 12
     counts[mapping.record_button], counts[mapping.open_button] = x, b
+    counts[mapping.close_button], counts[mapping.home_button] = a, menu
     buttons = [False] * 12
     buttons[mapping.quit_button] = back
     return JoystickSnapshot((0.0,) * 6, tuple(buttons), tuple(counts), connected, "pad", 0.0)
@@ -399,8 +402,8 @@ class ReplayControlsTest(unittest.TestCase):
         joystick.snapshot.return_value = _snapshot(x=1)
         controls = ReplayControls(joystick, Mapping(), lambda: False)
         self.assertIsNone(controls.stop_reason())
-        joystick.snapshot.return_value = _snapshot(x=1, b=1)
-        self.assertEqual(controls.pressed(), (False, True))
+        joystick.snapshot.return_value = _snapshot(x=1, b=1, menu=1)
+        self.assertEqual(controls.presses(), ReplayPresses(x=False, b=True, a=False, menu=True))
         self.assertIsNotNone(controls.stop_reason())
         self.assertFalse(controls.quit)
         controls.mark()
@@ -423,7 +426,7 @@ class ReplayControlsTest(unittest.TestCase):
 
 def _replay_args(**overrides) -> argparse.Namespace:
     values = {
-        "contact_limits": {"max_force_n": 15.0},
+        "contact_limits": {"max_force_n": 15.0, "contact_point": [0.0, 0.0, 0.2]},
         "no_contact_limits": False,
         "home_speed": 0.2,
         "max_joint_speed": 0.35,
@@ -435,7 +438,8 @@ def _replay_args(**overrides) -> argparse.Namespace:
         "guide_max_joint_velocity": 0.35,
         "guide_idle_hold_s": None,
         "guide_max_start_force": None,
-        "replay_wait": False,
+        "replay_depth_mm": 1.5,
+        "replay_depth_direction": (0.0, 0.0, -1.0),
         "replay_max_path_error": 0.08,
     }
     values.update(overrides)
@@ -443,10 +447,13 @@ def _replay_args(**overrides) -> argparse.Namespace:
 
 
 class ReplayFromGuideTest(unittest.TestCase):
-    def _run(self, robot, args, *, outcome=None, homing=None, path_error=None, controls=None, wait=None):
+    def _run(
+        self, robot, args, *, outcome=None, homing=None, path_error=None, controls=None, wait=None, gel_guard=None
+    ):
         from fr3_demo import teleop
 
         path = MagicMock(duration=4.0, start=START)
+        path.deepened.return_value = path
         collector = MagicMock()
         collector.start_episode.return_value = Path("/tmp/session/episode_000001.inprogress")
         collector.stop_episode.return_value = Path("/tmp/session/episode_000001")
@@ -461,7 +468,15 @@ class ReplayFromGuideTest(unittest.TestCase):
             patch.object(teleop.time, "sleep"),
         ):
             result = teleop.replay_from_guide(
-                robot, args, Path("/tmp/session/episode_000000"), collector, old, lambda: new, controls, lambda: False
+                robot,
+                args,
+                Path("/tmp/session/episode_000000"),
+                collector,
+                old,
+                lambda: new,
+                controls,
+                lambda: False,
+                gel_guard,
             )
         return result, {
             "old": old,
@@ -471,6 +486,7 @@ class ReplayFromGuideTest(unittest.TestCase):
             "link": link,
             "collector": collector,
             "wait": waited,
+            "path": path,
         }
 
     def test_replays_records_homes_and_floats_again(self) -> None:
@@ -488,24 +504,42 @@ class ReplayFromGuideTest(unittest.TestCase):
                 "start_guide",
             ],
         )
-        robot.apply_contact_limits.assert_called_once_with({"max_force_n": 15.0})
+        robot.apply_contact_limits.assert_called_once_with({"max_force_n": 15.0, "contact_point": [0.0, 0.0, 0.2]})
         parts["old"].stop.assert_called_once_with()
+        # Home first, wait there for X, then the demonstration's start, and home again after the replay.
         targets = [call.args[1] for call in parts["home"].call_args_list]
-        np.testing.assert_array_equal(targets[0], START)  # to the demonstration's start, then home
-        self.assertEqual(len(targets), 2)
+        self.assertEqual(len(targets), 3)
+        np.testing.assert_array_equal(targets[0], HOME_JOINTS)
+        np.testing.assert_array_equal(targets[1], START)
+        np.testing.assert_array_equal(targets[2], HOME_JOINTS)
+        # It settles closely onto the demonstration's own start before recording.
+        from fr3_demo.teleop import START_POSE_TOLERANCE_RAD
+
+        tolerances = [call.kwargs["tolerance"] for call in parts["home"].call_args_list]
+        self.assertEqual(tolerances, [0.01, START_POSE_TOLERANCE_RAD, 0.01])
+        parts["wait"].assert_called_once()
         parts["collector"].start_episode.assert_called_once_with(
             action_source=REPLAY_ACTION_SOURCE, extra_metadata={"replay_of": "episode_000000"}
         )
         parts["collector"].stop_episode.assert_called_once_with()
         parts["link"].assert_called_once()
-        parts["wait"].assert_not_called()
+        settings = parts["link"].call_args.args[3]
+        np.testing.assert_allclose(settings["depth_offset_m"], [0.0, 0.0, -0.0015])
         self.assertIs(result, parts["new"])
+
+    def test_the_replay_follows_the_demonstration_deepened_at_the_contact_point(self) -> None:
+        _, parts = self._run(MagicMock(), _replay_args())
+        offset, point = parts["path"].deepened.call_args.args
+        np.testing.assert_allclose(offset, [0.0, 0.0, -0.0015])
+        self.assertEqual(point, [0.0, 0.0, 0.2])
+        _, parts = self._run(MagicMock(), _replay_args(replay_depth_mm=0.0))
+        parts["path"].deepened.assert_not_called()
 
     def test_a_stopped_replay_is_kept_and_guide_mode_resumes_where_the_arm_is(self) -> None:
         robot = MagicMock()
         stopped = ReplayOutcome(False, "the gel reached level 1.02", 2.0, 0.01)
         result, parts = self._run(robot, _replay_args(), outcome=stopped)
-        self.assertEqual(parts["home"].call_count, 1)  # only to the start: no homing
+        self.assertEqual(parts["home"].call_count, 2)  # home and the start; no homing after a stopped replay
         parts["collector"].stop_episode.assert_called_once_with()
         parts["link"].assert_called_once()
         robot.clear_contact_limits.assert_called_once_with()
@@ -518,17 +552,62 @@ class ReplayFromGuideTest(unittest.TestCase):
         parts["old"].stop.assert_not_called()
         self.assertIs(result, parts["old"])
 
-    def test_stopping_on_the_way_to_the_start_records_nothing(self) -> None:
+    def test_stopping_the_arm_on_its_way_home_records_nothing(self) -> None:
         robot = MagicMock()
         result, parts = self._run(robot, _replay_args(), homing=InterruptedError("Homing interrupted"))
+        parts["wait"].assert_not_called()
         parts["collector"].start_episode.assert_not_called()
         robot.stop_stream.assert_called_once_with()
         self.assertIs(result, parts["new"])
 
-    def test_waiting_at_the_start_can_skip_the_replay(self) -> None:
+    def test_homing_carries_on_when_the_gel_only_lost_its_markers(self) -> None:
+        from fr3_demo import teleop
+
+        def homing(*_args, stop_requested, **_kwargs):
+            if stop_requested():
+                raise InterruptedError("Homing interrupted")
+
+        for overload, replayed in ((None, True), ("the gel reached level 1.05", False)):
+            guard = MagicMock()
+            regripped = []
+            # Untrustworthy (lost track) until the operator re-grips at home.
+            guard.check.side_effect = lambda regripped=regripped: (
+                None if regripped else "the GelSight signal is not trustworthy"
+            )
+            guard.overload.return_value = overload
+            collector = MagicMock()
+            path = MagicMock(duration=4.0, start=START)
+            path.deepened.return_value = path
+            controls = MagicMock(quit=False, **{"stop_reason.return_value": None})
+            with (
+                patch.object(teleop.ReplayPath, "from_episode", return_value=path),
+                patch.object(teleop, "stream_home", side_effect=homing),
+                patch.object(teleop, "run_replay", return_value=ReplayOutcome(True, None, 4.0, 0.004)),
+                patch.object(teleop, "link_replay"),
+                patch.object(
+                    teleop, "_wait_for_go", side_effect=lambda *_a, regripped=regripped, **_k: regripped.append(1)
+                ),
+                patch.object(teleop.time, "sleep"),
+            ):
+                teleop.replay_from_guide(
+                    MagicMock(),
+                    _replay_args(),
+                    Path("/tmp/s/episode_000000"),
+                    collector,
+                    MagicMock(),
+                    MagicMock,
+                    controls,
+                    lambda: False,
+                    guard,
+                )
+            with self.subTest(overload=overload):
+                self.assertEqual(collector.start_episode.called, replayed)
+
+    def test_menu_at_home_skips_the_replay(self) -> None:
         robot = MagicMock()
-        result, parts = self._run(robot, _replay_args(replay_wait=True), wait="you skipped it with B")
+        result, parts = self._run(robot, _replay_args(), wait="you skipped it with Menu")
         parts["wait"].assert_called_once()
+        self.assertEqual(parts["home"].call_count, 1)  # it stays home
         parts["collector"].start_episode.assert_not_called()
         self.assertIs(result, parts["new"])
 
@@ -549,6 +628,134 @@ class ReplayFromGuideTest(unittest.TestCase):
         robot.stop_stream.assert_called_once_with()
         robot.clear_contact_limits.assert_called_once_with()
         robot.start_guide.assert_not_called()
+
+
+class HomeBeforeRecordingTest(unittest.TestCase):
+    def _robot(self, *poses):
+        robot = MagicMock()
+        robot.state.side_effect = [{"qpos": pose} for pose in poses]
+        return robot
+
+    def _home(self, robot, homed=None):
+        from fr3_demo import teleop
+
+        old = MagicMock()
+        with patch.object(teleop, "home_from_guide", return_value=homed or MagicMock()) as home:
+            result = teleop.home_before_recording(robot, _replay_args(), old, MagicMock, lambda: False)
+        return result, home, old
+
+    def test_an_arm_already_home_records_where_it_is(self) -> None:
+        (heartbeat, ready), home, old = self._home(self._robot(HOME_JOINTS + 0.01))
+        home.assert_not_called()
+        self.assertIs(heartbeat, old)
+        self.assertTrue(ready)
+
+    def test_an_arm_elsewhere_is_homed_first(self) -> None:
+        homed = MagicMock()
+        (heartbeat, ready), home, _ = self._home(self._robot(HOME_JOINTS + 0.3, HOME_JOINTS), homed)
+        home.assert_called_once()
+        self.assertIs(heartbeat, homed)
+        self.assertTrue(ready)
+
+    def test_homing_that_stops_short_does_not_record(self) -> None:
+        (_, ready), _, _ = self._home(self._robot(HOME_JOINTS + 0.3, HOME_JOINTS + 0.2))
+        self.assertFalse(ready)
+        from fr3_demo import teleop
+
+        robot = self._robot(HOME_JOINTS + 0.3)
+        with patch.object(teleop, "home_from_guide", return_value=None):  # the session is ending
+            self.assertEqual(
+                teleop.home_before_recording(robot, _replay_args(), MagicMock(), MagicMock, lambda: True), (None, False)
+            )
+
+
+def _gel_reading(level=0.1, *, valid=True, zeroing=False, reason=""):
+    from fr3_demo.gel import GelReading
+
+    return GelReading(1, 0.0, valid, reason, level, None, zeroing, (1.0, 0.5), np.radians(1.0), 0.001)
+
+
+class WaitForGoTest(unittest.TestCase):
+    def _wait(self, presses, readings=None, overload=None):
+        import io
+        from contextlib import redirect_stdout
+
+        from fr3_demo import teleop
+
+        controls = MagicMock()
+        controls.ending.return_value = None
+        controls.presses.side_effect = presses
+        guard = MagicMock()
+        guard.overload.return_value = overload
+        readings = readings or [_gel_reading()]
+        guard.monitor.latest.side_effect = readings + [readings[-1]] * 20
+        robot, collector, printed = MagicMock(), MagicMock(), io.StringIO()
+        with redirect_stdout(printed), patch.object(teleop.time, "sleep"):
+            reason = teleop._wait_for_go(robot, _replay_args(), controls, guard, collector)
+        return reason, robot, controls, guard, printed.getvalue()
+
+    def test_x_replays_and_menu_skips(self) -> None:
+        none, go = ReplayPresses(), ReplayPresses(x=True)
+        reason, robot, controls, _, _ = self._wait([none, none, go])
+        self.assertIsNone(reason)
+        self.assertEqual(robot.stream_velocity.call_count, 2)  # held still until X
+        self.assertEqual(controls.mark.call_count, 2)  # the X that starts it does not also stop it
+        reason, *_ = self._wait([ReplayPresses(menu=True)])
+        self.assertIn("skipped it with Menu", reason)
+
+    def test_b_and_a_re_grip_the_tool_and_re_zero_the_gel(self) -> None:
+        reason, robot, _, guard, _ = self._wait([ReplayPresses(b=True), ReplayPresses(a=True), ReplayPresses(x=True)])
+        self.assertIsNone(reason)
+        robot.open_gripper.assert_called_once_with()
+        robot.close_gripper.assert_called_once_with()
+        self.assertEqual(guard.monitor.suspend.call_count, 2)
+        self.assertEqual(guard.monitor.rezero.call_count, 2)
+
+    def test_x_waits_for_the_gel_to_read_trustworthy(self) -> None:
+        lost = _gel_reading(valid=False, reason="lost track (0.46 s since the last tracked frame)")
+        presses = [ReplayPresses(x=True), ReplayPresses(), ReplayPresses(x=True)]
+        reason, robot, _, _, printed = self._wait(presses, readings=[lost, lost, lost, _gel_reading()])
+        self.assertIsNone(reason)
+        self.assertIn("Not replaying yet", printed)
+        robot.yield_stream.assert_not_called()
+
+    def test_a_gel_that_only_lost_its_markers_does_not_skip_the_replay(self) -> None:
+        lost = _gel_reading(valid=False, reason="lost track")
+        reason, robot, _, _, printed = self._wait([ReplayPresses(), ReplayPresses(menu=True)], readings=[lost])
+        self.assertIn("Menu", reason)  # skipped only because Menu was pressed
+        self.assertIn("re-grip the tool before the replay", printed)
+        robot.yield_stream.assert_not_called()
+
+    def test_a_tool_turned_in_the_grip_gets_a_heads_up(self) -> None:
+        reason, *_, printed = self._wait([ReplayPresses(x=True)], readings=[_gel_reading(0.4)])
+        self.assertIsNone(reason)
+        self.assertIn("Heads-up", printed)
+
+    def test_a_gel_loaded_while_waiting_makes_the_arm_go_soft(self) -> None:
+        reason, robot, *_ = self._wait([ReplayPresses()], overload="the gel reached level 1.10")
+        robot.yield_stream.assert_called_once_with("the gel reached level 1.10")
+        self.assertIn("keep clear of the tool", reason)
+
+
+class DeepenedPathTest(unittest.TestCase):
+    def test_the_contact_point_moves_by_the_offset_without_turning_the_tool(self) -> None:
+        from fr3_demo.kinematics import forward_kinematics
+
+        times = np.linspace(0.0, 6.0, 1201)
+        positions = START + np.outer(np.sin(times / 2), [0.2, 0.1, -0.1, 0.15, 0.1, -0.1, 0.2])
+        path = ReplayPath.from_samples(Path("demo"), times, positions)
+        deep = path.deepened(np.array([0.0, 0.0, -0.0015]), np.array([0.0, 0.0, 0.2]))
+
+        def contact(q):
+            pose = forward_kinematics(q)
+            return pose[:3, 3] + pose[:3, :3] @ np.array([0.0, 0.0, 0.2]), pose[:3, :3]
+
+        for elapsed, share in ((0.0, 0.0), (0.5, 0.5), (3.0, 1.0), (6.0, 0.0)):
+            (a, turn_a), (b, turn_b) = contact(path.at(elapsed)[0]), contact(deep.at(elapsed)[0])
+            np.testing.assert_allclose(b - a, [0.0, 0.0, -0.0015 * share], atol=2e-5)
+            np.testing.assert_allclose(turn_a.T @ turn_b, np.eye(3), atol=1e-5)
+        np.testing.assert_allclose(deep.start, path.start)
+        self.assertIs(path.deepened(np.zeros(3), np.array([0.0, 0.0, 0.2])), path)
 
 
 class EpisodeSelectionTest(unittest.TestCase):
@@ -598,7 +805,9 @@ class ReplayFlagTest(unittest.TestCase):
             (["--hand-guide", "--replay", "--no-contact-limits"], {}),
             (["--hand-guide", "--replay"], {"tactile": True}),  # GelSight in use, guard off
             (["--hand-guide", "--replay", "--no-gel-guard"], {"gel": {"enabled": True}}),
-            (["--hand-guide", "--replay-wait"], {}),  # tuning without --replay
+            (["--hand-guide", "--replay-depth-mm", "1"], {}),  # tuning without --replay
+            (["--hand-guide", "--replay", "--replay-depth-mm", "4"], {}),
+            (["--hand-guide", "--replay", "--replay-depth-direction", "0", "0", "0"], {}),
             (["--hand-guide", "--replay", "--replay-max-path-error", "0.5"], {}),
         ):
             parser, args = self._args(*extra, **options)
@@ -606,7 +815,9 @@ class ReplayFlagTest(unittest.TestCase):
                 _validate_args(args, parser)
 
     def test_a_guarded_replay_session_is_accepted(self) -> None:
-        parser, args = self._args("--hand-guide", "--replay", "--replay-wait", gel={"enabled": True}, tactile=True)
+        parser, args = self._args(
+            "--hand-guide", "--replay", "--replay-depth-mm", "2", gel={"enabled": True}, tactile=True
+        )
         _validate_args(args, parser)
         parser, args = self._args("--hand-guide", "--replay")  # no GelSight at all
         _validate_args(args, parser)
@@ -614,3 +825,29 @@ class ReplayFlagTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CollectionFailureTest(unittest.TestCase):
+    def test_it_says_what_stopped_and_which_episodes_are_kept_or_lost(self) -> None:
+        from fr3_demo.teleop import describe_collection_failure
+
+        with tempfile.TemporaryDirectory() as temporary:
+            session = Path(temporary)
+            for name in ("episode_000000", "episode_000001", "episode_000002.inprogress"):
+                (session / name).mkdir()
+            error = RuntimeError("Tactile capture failed: Tactile sensor stopped delivering frames")
+            message = describe_collection_failure(session, error)
+        self.assertIn("Tactile capture failed", message)
+        self.assertIn("USB connection most likely dropped", message)
+        self.assertIn("episode_000002.inprogress was being recorded", message)
+        self.assertIn("never converted", message)
+        self.assertIn("2 episode(s), episode_000000 to episode_000001", message)
+
+    def test_a_failure_between_episodes_loses_nothing(self) -> None:
+        from fr3_demo.teleop import describe_collection_failure
+
+        with tempfile.TemporaryDirectory() as temporary:
+            message = describe_collection_failure(Path(temporary), RuntimeError("Joystick disconnected"))
+        self.assertNotIn("being recorded", message)
+        self.assertNotIn("GelSight", message)
+        self.assertIn("0 episode(s)", message)

@@ -59,7 +59,11 @@ camera_pair_reject_ms = 25.0
 # 1 ms sample. Raw force (raw_force_*) lands at this rate; the 15 Hz columns
 # stay interpolated, but bracket within ~1 ms instead of ~17 ms.
 robot_sample_hz = 1000.0
-robot_max_gap_ms = 30.0
+# Refuse a 15 Hz row whose two nearest arm samples are further apart than this.
+# A 35 ms stall in the sampler aborted a 2.5-minute episode at 30 ms; across
+# 50 ms, interpolating a row is still accurate to ~0.002 rad even at the
+# 5 rad/s^2 that hand-guided demonstrations reach.
+robot_max_gap_ms = 50.0
 gripper_sample_hz = 30.0
 # The gripper server can be busy during a blocking close/open command.
 gripper_max_age_ms = 2000.0
@@ -189,7 +193,10 @@ enabled = true
 # fr3-gel-calibrate prints what your pushes reached; at about 7 N along the
 # gripper's closing direction the gel shifted ~10 px.
 shift_limit_px = 15.0
-twist_limit_deg = 6.0
+# Peeling with a round handle twists the gel: demonstrations alone reach about
+# 5.4 deg from where they start, and the tool's resting twist wanders a few
+# degrees between cycles (session 20261109_114512 peaked at 6.0 deg).
+twist_limit_deg = 8.0
 press_limit_percent = 2.0
 # Loading direction, from fr3-gel-calibrate (only its direction is used).
 # Recalibrate after moving the sensor or changing [tactile] rotate_180.
@@ -222,10 +229,10 @@ transport = "zmq"
 # Enable only for a checkpoint trained with exterior_image_2_left.
 use_external2 = true
 # Contract profile; GPU weight paths are selected by the server launcher.
-checkpoint = "wine_hybrid"
+checkpoint = "peel_force"
 # Dedicated inference LAN: GPU enp103s0 ↔ robot workstation eno1.
 server_host = "172.16.0.30"
-server_port = 8002
+server_port = 8005
 # "connect": this workstation connects to the GPU. If that inter-subnet path is
 # filtered, use "bind" and launch the GPU wrapper with CONNECT_ENDPOINT pointing
 # to this workstation.
