@@ -1,4 +1,10 @@
-"""Stand-alone policy server for the peeling checkpoints (pi05_peel_*, 2026-11-06).
+"""Stand-alone policy server for the peeling checkpoints (pi05_peel_*, 2026-11-06; pi05_peel2_*, 2026-11-13).
+
+Round 2 (pi05_peel2_*, fitz0401/fr3_peel2_mix, new peeler / GelSight mount): same inputs and network; the bundle
+ships its own norm stats (found automatically), its own force model (the new mount's payload fit) and the gripper
+value to pin (BUNDLE.json held_gripper, see pinned_gripper). Arms: splice, mix, moddrop, ronly2 (baselines) and twin,
+decl, decl_corr (ours: twin consistency, learned declaration, corrective replay labels); declaration and twins are
+training-time only, so here too every model gets every input.
 
 Six arms trained on fitz0401/fr3_peel_mix (hand-guided peeling demonstrations, their robot replays and the spliced
 pairs; see fr3_train/peel/DEPLOY_PLAN.md), all with the same inputs at deployment:
@@ -67,9 +73,8 @@ from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
 
 
-def _load_force_features():
-    path = pathlib.Path(__file__).resolve().parent / "force_features.py"
-    name = "fr3_peel_force_features"
+def _load_sibling(filename: str, name: str):
+    path = pathlib.Path(__file__).resolve().parent / filename
     if name in sys.modules:
         return sys.modules[name]
     spec = importlib.util.spec_from_file_location(name, path)
@@ -79,19 +84,22 @@ def _load_force_features():
     return module
 
 
-force_features = _load_force_features()
+force_features = _load_sibling("force_features.py", "fr3_peel_force_features")
+peel_bundle = _load_sibling("peel_bundle.py", "fr3_peel_bundle")
+bundle_asset_id = peel_bundle.bundle_asset_id
+pinned_gripper = peel_bundle.pinned_gripper
 
 LOG = logging.getLogger("pi05_peel")
 
 STATE_HISTORY_LAGS = (45, 75)
 NUM_STATE_FRAMES = 1 + len(STATE_HISTORY_LAGS)
 TASKS = ("peel the lemon",)
-DEFAULT_ASSET_ID = "fitz0401/fr3_peel_mix"
+DEFAULT_ASSET_ID = peel_bundle.DEFAULT_ASSET_ID
 MAX_TOKEN_LEN = 256
 FORCE_DIMS = force_features.BINS * 6
 TACTILE_DIMS = 4
 TACTILE_KEY = "observation/tactile"
-GRIPPER_DIMS = (7, 15, 23)  # gripper entries of the State and History segments
+GRIPPER_DIMS = peel_bundle.GRIPPER_DIMS  # gripper entries of the State and History segments
 # Prompt segments in state order, as training's DroidInputsSegmented.segments() with SEGMENT_LABELS.
 SEGMENTS = (("State", 8), ("History", 8 * len(STATE_HISTORY_LAGS)), ("Force", FORCE_DIMS), ("Tactile", TACTILE_DIMS))
 # Client camera key -> pi0.5 image slot, exactly as in training (use_second_exterior=True).
@@ -285,7 +293,8 @@ class PeelPolicy:
         return result
 
 
-def build_policy(checkpoint_dir: str, asset_id: str = DEFAULT_ASSET_ID):
+def build_policy(checkpoint_dir: str, asset_id: str | None = None):
+    asset_id = asset_id or bundle_asset_id(checkpoint_dir)
     path = pathlib.Path(checkpoint_dir) / "force_model.json"
     if not path.is_file():
         raise FileNotFoundError(f"{path} is missing: the bundle must ship the force model it was trained with")
@@ -295,11 +304,7 @@ def build_policy(checkpoint_dir: str, asset_id: str = DEFAULT_ASSET_ID):
     expected_dims = 8 * NUM_STATE_FRAMES + FORCE_DIMS + TACTILE_DIMS
     if q01.shape[-1] != expected_dims:
         raise ValueError(f"norm stats have {q01.shape[-1]} state values, expected {expected_dims}")
-    held = q01[list(GRIPPER_DIMS)]
-    if not (np.all(held == q99[list(GRIPPER_DIMS)]) and np.all(held == held[0])):
-        raise ValueError(f"gripper norm stats are not one constant ({q01[list(GRIPPER_DIMS)]} / {q99[list(GRIPPER_DIMS)]}): "
-                         "pinning the gripper input is only valid for a constant")
-    held_gripper = float(held[0])
+    held_gripper = pinned_gripper(checkpoint_dir, q01, q99)
     config = _config.TrainConfig(
         name="pi05_peel",
         exp_name="deploy",
@@ -330,7 +335,7 @@ def build_policy(checkpoint_dir: str, asset_id: str = DEFAULT_ASSET_ID):
         ],
         metadata=config.policy_metadata,
     )
-    LOG.info(f"gripper input pinned to the training constant {held_gripper!r}")
+    LOG.info(f"gripper input pinned to {held_gripper!r} ({asset_id})")
     return PeelPolicy(policy, force_features.ForceModel.from_json(path), held_gripper)
 
 
@@ -434,7 +439,7 @@ def check_golden(policy, path: str, tolerance: float) -> float:
 @dataclasses.dataclass
 class Args:
     checkpoint_dir: str = "."
-    asset_id: str = DEFAULT_ASSET_ID
+    asset_id: str = ""  # default: the one asset the bundle ships (bundle_asset_id)
     host: str = "0.0.0.0"
     port: int = 8000
     self_test: bool = False
@@ -445,7 +450,7 @@ class Args:
 
 def main(args: Args) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S", force=True)
-    policy = build_policy(args.checkpoint_dir, args.asset_id)
+    policy = build_policy(args.checkpoint_dir, args.asset_id or None)
     if args.self_test or args.golden:
         if args.self_test:
             self_test(policy)

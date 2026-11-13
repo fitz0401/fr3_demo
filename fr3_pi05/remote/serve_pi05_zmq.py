@@ -297,7 +297,9 @@ def load_policy(
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
-        resolved_asset_id = asset_id or module.DEFAULT_ASSET_ID
+        # peel: the bundle's own norm-stats asset (round 1 fr3_peel_mix, round 2 fr3_peel2_mix).
+        resolver = getattr(module, "bundle_asset_id", None) if loader == "peel" else None
+        resolved_asset_id = asset_id or (resolver(checkpoint) if resolver else module.DEFAULT_ASSET_ID)
         bundle = {}
         bundle_path = Path(checkpoint) / "BUNDLE.json"
         if bundle_path.is_file():
@@ -311,7 +313,7 @@ def load_policy(
                 "requires_tactile": True,
                 "tactile_dims": int(module.TACTILE_DIMS),
                 "tactile_names": ["shift_x_px", "shift_y_px", "twist_rad", "spread"],
-                # The clamped peeler: the server feeds this training constant whatever gripper reading arrives.
+                # The clamped peeler: the server feeds this training value whatever gripper reading arrives.
                 "gripper_input_pinned_to": float(policy.held_gripper),
             }
         return policy, {

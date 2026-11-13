@@ -117,5 +117,48 @@ class PeelProtocolTest(unittest.TestCase):
         self.assertEqual(spec["verification"]["training_table"]["max_abs"], 0.0)
 
 
+def _peel_bundle():
+    spec = importlib.util.spec_from_file_location("peel_bundle_test", ROOT / "fr3_train" / "peel_bundle.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class PeelBundleRound2Test(unittest.TestCase):
+    """Round 2 (fr3_peel2_mix): the gripper reading is one of three steps, so the bundle names the pinned value."""
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self.pb = _peel_bundle()
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def stats(self, lo: float, hi: float) -> tuple[np.ndarray, np.ndarray]:
+        q01, q99 = np.zeros(52), np.ones(52)
+        q01[list(self.pb.GRIPPER_DIMS)], q99[list(self.pb.GRIPPER_DIMS)] = lo, hi
+        return q01, q99
+
+    def test_round1_constant_is_fed(self) -> None:
+        self.assertEqual(self.pb.pinned_gripper(str(self.tmp), *self.stats(0.12334802, 0.12334802)), 0.12334802)
+
+    def test_round2_needs_the_bundle_value_inside_the_training_range(self) -> None:
+        import json
+
+        q01, q99 = self.stats(0.2863, 0.2952)
+        with self.assertRaisesRegex(ValueError, "names no held_gripper"):
+            self.pb.pinned_gripper(str(self.tmp), q01, q99)
+        (self.tmp / "BUNDLE.json").write_text(json.dumps({"held_gripper": 0.2863}))
+        self.assertEqual(self.pb.pinned_gripper(str(self.tmp), q01, q99), 0.2863)
+        (self.tmp / "BUNDLE.json").write_text(json.dumps({"held_gripper": 0.0}))
+        with self.assertRaisesRegex(ValueError, "outside the training range"):
+            self.pb.pinned_gripper(str(self.tmp), q01, q99)
+
+    def test_asset_is_the_one_the_bundle_ships(self) -> None:
+        self.assertEqual(self.pb.bundle_asset_id(str(self.tmp)), "fitz0401/fr3_peel_mix")
+        (self.tmp / "assets" / "fitz0401" / "fr3_peel2_mix").mkdir(parents=True)
+        (self.tmp / "assets" / "fitz0401" / "fr3_peel2_mix" / "norm_stats.json").write_text("{}")
+        self.assertEqual(self.pb.bundle_asset_id(str(self.tmp)), "fitz0401/fr3_peel2_mix")
+
+
 if __name__ == "__main__":
     unittest.main()
