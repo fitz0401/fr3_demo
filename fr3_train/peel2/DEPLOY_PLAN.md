@@ -70,6 +70,39 @@ du -sb --apparent-size /mnt/data/yurui/models/pi05_peel2_*
 
 文件数不同是权重分片差异，正常。七个包都在 Leonardo 上通过了自检和 golden 检查（动作差 0，力输入差 0）。
 
+### 2b. 不经过笔记本：直接在 GPU 机上登录 CINECA 并拉取
+
+笔记本连实验室网络时用不了 Leonardo 上的对话，可以全部在 GPU 机上做。需要在 GPU 机上装 `step` 并登录一次 CINECA。
+
+**先在笔记本上**（还连着 Leonardo 时）抄下两项配置：
+
+```bash
+cat "$(step path)/config/defaults.json"    # 抄下 "ca-url" 和 "fingerprint" 两个值
+```
+
+**然后在 GPU 机上**：
+
+```bash
+# 1) 装 step（已装过就跳过：which step 有输出即可）
+wget https://dl.smallstep.com/cli/docs-cli-install/latest/step-cli_amd64.deb && sudo dpkg -i step-cli_amd64.deb
+#    没有 sudo：从 https://github.com/smallstep/cli/releases 下载 step_linux_*_amd64.tar.gz，解压后把 bin/step 放进 ~/bin
+
+# 2) 指向 CINECA 的证书服务（两个值照抄笔记本的 defaults.json），只需做一次
+step ca bootstrap --ca-url <ca-url> --fingerprint <fingerprint>
+
+# 3) 确保有 ssh-agent（ssh-add -l 报 "Could not open a connection" 时才需要）
+eval "$(ssh-agent -s)"
+
+# 4) 登录：会打开浏览器走 CINECA 账号 + 动态码；证书约 12 小时有效
+step ssh login '<CINECA 邮箱>' --provisioner cineca-hpc
+ssh-add -l    # 应看到 CINECA 证书
+
+# 5) 连接测试（第一次会问是否信任主机，输入 yes）
+ssh -o ConnectTimeout=15 ydu00001@data.leonardo.cineca.it ls /leonardo_scratch/large/userexternal/ydu00001/openpi/deploy | grep peel2
+```
+
+之后的 rsync 命令和上面完全一样（在 GPU 机上执行）。GPU 机是共用机器的话，用完可以 `ssh-add -D` 把证书从 agent 里删掉。
+
 ## 3. GPU 机自检（每个包一次，不动机器人）
 
 先在 fr3_demo 里切到这个分支：`git fetch origin && git checkout deploy/peel-v2`。
